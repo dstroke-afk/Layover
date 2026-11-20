@@ -31,27 +31,32 @@ class BleStateController(private val context: Context) {
     }
 
     fun updateState() {
+        refreshPermissionAndAdapterState()
+    }
+
+    fun refreshPermissionAndAdapterState() {
         val isSupported = bluetoothAdapter != null
         val isEnabled = bluetoothAdapter?.isEnabled == true
         val hasPerms = BlePermissionHelper.hasAllRequiredPermissions(context)
 
         _statusState.update { current ->
+            val newError = when {
+                !isSupported -> "Bluetooth hardware is not available on this device"
+                !isEnabled -> "Bluetooth is turned off"
+                !hasPerms -> "Required Bluetooth permissions are missing"
+                else -> null
+            }
             current.copy(
                 isBluetoothSupported = isSupported,
                 isBluetoothEnabled = isEnabled,
                 hasPermissions = hasPerms,
-                lastError = when {
-                    !isSupported -> "Bluetooth hardware is not available on this device"
-                    !isEnabled -> "Bluetooth is turned off"
-                    !hasPerms -> "Required Bluetooth permissions are missing"
-                    else -> null
-                }
+                lastError = newError
             )
         }
     }
 
     fun startScanning() {
-        updateState()
+        refreshPermissionAndAdapterState()
         val (isSupported, isEnabled, hasPerms) = _statusState.value
         if (!isSupported || !isEnabled || !hasPerms) {
             _statusState.update {
@@ -78,7 +83,7 @@ class BleStateController(private val context: Context) {
     }
 
     fun startAdvertising() {
-        updateState()
+        refreshPermissionAndAdapterState()
         val (isSupported, isEnabled, hasPerms) = _statusState.value
         if (!isSupported || !isEnabled || !hasPerms) {
             _statusState.update {

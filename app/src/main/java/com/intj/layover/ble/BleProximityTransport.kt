@@ -51,6 +51,8 @@ class BleProximityTransport(
 
     val diagnosticsTracker = SessionDiagnosticsTracker()
 
+    var onMissingPermissions: (() -> Unit)? = null
+
     private var blockedPeerIds: Set<String> = emptySet()
     private var mutedPeerIds: Set<String> = emptySet()
 
@@ -204,17 +206,21 @@ class BleProximityTransport(
 
     override fun startDiscovery(visible: Boolean) {
         Log.d(TAG, "startDiscovery requested. visible=$visible")
-        bleStateController.updateState()
+        bleStateController.refreshPermissionAndAdapterState()
         val hasPerms = BlePermissionHelper.hasAllRequiredPermissions(context)
         val isEnabled = bluetoothAdapter?.isEnabled == true
 
-        if (!hasPerms || !isEnabled) {
-            val err = if (!hasPerms) {
-                "Bluetooth permissions are required for nearby discovery"
-            } else {
-                "Bluetooth is turned off"
-            }
-            Log.e(TAG, "startDiscovery prerequisite check failed: $err")
+        if (!hasPerms) {
+            val err = "Required Bluetooth permissions are missing"
+            Log.e(TAG, "startDiscovery failed: $err")
+            diagnosticsTracker.updateLastErrorMessage(err)
+            onMissingPermissions?.invoke()
+            return
+        }
+
+        if (!isEnabled) {
+            val err = "Bluetooth is turned off"
+            Log.e(TAG, "startDiscovery failed: $err")
             diagnosticsTracker.updateLastErrorMessage(err)
             return
         }

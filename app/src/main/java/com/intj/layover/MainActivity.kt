@@ -109,11 +109,13 @@ class MainActivity : ComponentActivity() {
                 contract = ActivityResultContracts.RequestMultiplePermissions()
             ) { permsMap ->
                 val allGranted = permsMap.values.all { it }
-                bleStateController.updateState()
-                if (allGranted && uiState.isScanning) {
-                    Log.d(TAG, "Permissions granted. Starting discovery...")
-                    bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
-                } else if (!allGranted) {
+                bleStateController.refreshPermissionAndAdapterState()
+                if (allGranted) {
+                    Log.d(TAG, "Permissions granted via system dialog.")
+                    if (uiState.isScanning) {
+                        bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                    }
+                } else {
                     Log.e(TAG, "Permissions rejected by user.")
                     Toast.makeText(
                         context,
@@ -121,6 +123,12 @@ class MainActivity : ComponentActivity() {
                         Toast.LENGTH_SHORT
                     ).show()
                 }
+            }
+
+            // Bind missing permissions callback to transport
+            bleTransport.onMissingPermissions = {
+                Log.d(TAG, "Transport requested missing permissions. Launching permission dialog...")
+                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
             }
 
             // Check permissions when scanning starts
@@ -147,7 +155,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Lifecycle awareness: stop scanning & advertising on pause/stop
+            // Lifecycle awareness: check permissions on ON_START / ON_RESUME, stop scanning on ON_STOP
             DisposableEffect(lifecycleOwner) {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
@@ -155,8 +163,14 @@ class MainActivity : ComponentActivity() {
                             Log.d(TAG, "App ON_STOP: Stopping BLE discovery.")
                             bleTransport.stopDiscovery()
                         }
-                        Lifecycle.Event.ON_START -> {
-                            bleStateController.updateState()
+                        Lifecycle.Event.ON_START, Lifecycle.Event.ON_RESUME -> {
+                            bleStateController.refreshPermissionAndAdapterState()
+                            if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+                                Log.d(TAG, "Lifecycle $event: Missing permissions detected. Launching prompt.")
+                                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
+                            } else if (uiState.isScanning) {
+                                bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                            }
                         }
                         else -> {}
                     }
