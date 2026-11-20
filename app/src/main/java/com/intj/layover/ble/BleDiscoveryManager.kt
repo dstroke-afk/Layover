@@ -129,12 +129,14 @@ class BleDiscoveryManager(
             isVisible = userProfile.isVisibleToNearby
         )
 
+        // Primary Advertising Data: 18 bytes (128-bit UUID)
         val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(LayoverBleConstants.LAYOVER_SERVICE_UUID)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
+        // Scan Response Data: 25 bytes (18-byte UUID header + 7-byte compact payload)
         val scanResponseData = AdvertiseData.Builder()
             .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, payload)
             .setIncludeDeviceName(false)
@@ -143,7 +145,7 @@ class BleDiscoveryManager(
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                LayoverFileLogger.log("BLE Advertising started successfully (LOW_LATENCY, HIGH_POWER).")
+                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE).")
                 bleStateController.startAdvertising()
             }
 
@@ -156,7 +158,7 @@ class BleDiscoveryManager(
                     ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "ADVERTISE_FAILED_FEATURE_UNSUPPORTED (5)"
                     else -> "ErrorCode $errorCode"
                 }
-                LayoverFileLogger.logError("BLE Advertising failed: $errReason")
+                LayoverFileLogger.logError("BLE Advertising failed with $errReason. Primary bytes: 18, ScanResponse bytes: 25.")
                 bleStateController.stopAdvertising()
             }
         }
@@ -164,7 +166,7 @@ class BleDiscoveryManager(
         advertiseCallback = callback
 
         try {
-            LayoverFileLogger.log("Requesting BluetoothLeAdvertiser.startAdvertising(...)")
+            LayoverFileLogger.log("Requesting BluetoothLeAdvertiser.startAdvertising(...) [Primary: 18B, ScanResponse: 25B]")
             advertiser.startAdvertising(settings, advertiseData, scanResponseData, callback)
         } catch (e: Exception) {
             LayoverFileLogger.logError("Exception starting BLE advertising", e)
@@ -290,8 +292,6 @@ class BleDiscoveryManager(
         val fallbackName = payload?.displayName?.ifEmpty { null }
             ?: deviceName?.ifEmpty { null }
             ?: "Layover Peer (${macAddress.takeLast(4)})"
-
-        LayoverFileLogger.log("Discovered BLE peer: address=$macAddress, name=$fallbackName")
 
         val existingRecord = peerMap[macAddress]
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE

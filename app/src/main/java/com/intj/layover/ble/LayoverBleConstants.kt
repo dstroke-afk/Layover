@@ -27,17 +27,9 @@ object LayoverBlePayloadEncoder {
         val idCopyLen = peerIdBytes.size.coerceAtMost(6)
         System.arraycopy(peerIdBytes, 0, paddedIdBytes, 0, idCopyLen)
 
-        val nameBytes = displayName.toByteArray(Charsets.UTF_8)
-        val truncatedNameBytes = if (nameBytes.size > LayoverBleConstants.MAX_NAME_BYTE_LENGTH) {
-            nameBytes.copyOf(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
-        } else {
-            nameBytes
-        }
-
-        val payload = ByteArray(1 + 6 + truncatedNameBytes.size)
+        val payload = ByteArray(1 + 6)
         payload[0] = flags
         System.arraycopy(paddedIdBytes, 0, payload, 1, 6)
-        System.arraycopy(truncatedNameBytes, 0, payload, 7, truncatedNameBytes.size)
         return payload
     }
 
@@ -47,13 +39,7 @@ object LayoverBlePayloadEncoder {
         val rawPeerId = String(data, 1, 6, Charsets.UTF_8).trim('\u0000', ' ')
         val peerId = if (rawPeerId.isNotBlank()) rawPeerId else "unknown"
 
-        val nameLen = data.size - 7
-        val rawName = if (nameLen > 0) {
-            String(data, 7, nameLen, Charsets.UTF_8).trim('\u0000', ' ')
-        } else {
-            peerId
-        }
-        val displayName = if (rawName.isNotBlank()) rawName else "Nearby Peer"
+        val displayName = "Layover Peer (${peerId.takeLast(4)})"
 
         return DecodedPayload(
             peerId = peerId,

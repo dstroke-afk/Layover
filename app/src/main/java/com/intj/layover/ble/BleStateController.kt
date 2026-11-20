@@ -46,11 +46,18 @@ class BleStateController(private val context: Context) {
                 !hasPerms -> "Required Bluetooth permissions are missing"
                 else -> null
             }
+
+            val finalError = if (hasPerms && isEnabled && current.lastError == "Required Bluetooth permissions are missing") {
+                null
+            } else {
+                newError
+            }
+
             current.copy(
                 isBluetoothSupported = isSupported,
                 isBluetoothEnabled = isEnabled,
                 hasPermissions = hasPerms,
-                lastError = newError
+                lastError = finalError
             )
         }
     }
