@@ -97,7 +97,7 @@ class GattSessionManager(
                     connectedDevice = device
                     isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
-                    flushPendingFrames()
+                    flushQueue()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
                     if (connectedDevice?.address == device?.address) {
@@ -137,10 +137,10 @@ class GattSessionManager(
                     if (responseNeeded) {
                         device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
                     }
-                    LayoverFileLogger.log("GATT Server: Client subscribed to notifications. Triggering server ready...")
+                    LayoverFileLogger.log("GATT Server: Client subscribed to notifications. Triggering server ready & flushing queue...")
                     scope.launch {
                         onGattReady?.invoke()
-                        flushPendingFrames()
+                        flushQueue()
                     }
                 }
             }
@@ -284,7 +284,7 @@ class GattSessionManager(
                     setConnectionState(RfcommConnectionState.CONNECTED)
                     scope.launch {
                         onGattReady?.invoke()
-                        flushPendingFrames()
+                        flushQueue()
                     }
                 } else {
                     LayoverFileLogger.logError("GATT Client failed to write descriptor: status=$status")
@@ -381,11 +381,12 @@ class GattSessionManager(
         }
     }
 
-    private fun flushPendingFrames() {
+    fun flushQueue() {
         if (!isFlushingQueue.compareAndSet(false, true)) return
         scope.launch {
             try {
-                while (pendingOutboundFrames.isNotEmpty() && _connectionState.value == RfcommConnectionState.CONNECTED) {
+                LayoverFileLogger.log("Flushing ${pendingOutboundFrames.size} queued outbound frames...")
+                while (pendingOutboundFrames.isNotEmpty()) {
                     val frame = pendingOutboundFrames.peek() ?: break
                     val success = sendFrameNow(frame)
                     if (success) {
@@ -393,6 +394,7 @@ class GattSessionManager(
                         delay(120) // Serialization write pacing between frames
                     } else {
                         delay(300) // Brief backoff on write failure before retrying
+                        break
                     }
                 }
             } finally {
@@ -451,14 +453,12 @@ class GattSessionManager(
 
     @SuppressLint("MissingPermission")
     fun sendFrame(text: String): Boolean {
-        // Enqueue outbound frame if not connected yet or while flushing queue
-        if (_connectionState.value != RfcommConnectionState.CONNECTED) {
-            LayoverFileLogger.log("GATT not yet connected. Enqueueing outbound frame: ${text.take(30)}...")
-            pendingOutboundFrames.add(text)
-            return true
-        }
         pendingOutboundFrames.add(text)
-        flushPendingFrames()
+        if (_connectionState.value == RfcommConnectionState.CONNECTED) {
+            flushQueue()
+        } else {
+            LayoverFileLogger.log("GATT not yet connected. Enqueued outbound frame: ${text.take(30)}...")
+        }
         return true
     }
 
