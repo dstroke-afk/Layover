@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 class BleProximityTransport(
     private val context: Context,
@@ -62,9 +63,10 @@ class BleProximityTransport(
 
     private var activePeerId: String? = null
 
-    // Debounce tracking for startDiscovery
+    // Debounce tracking for startDiscovery & connection requests
     private var lastDiscoveryStartMs = 0L
     private var lastDiscoveryVisible = !currentUserProfile.isVisibleToNearby
+    private val lastRequestTimeMap = ConcurrentHashMap<String, Long>()
 
     val isE2eeEstablished: Boolean
         get() = sessionCryptoManager.isSessionKeyEstablished
@@ -113,8 +115,13 @@ class BleProximityTransport(
                     return@collect
                 }
 
-                // Rate limiting enforcement
-                if (!rateLimiter.allowMessage(currentPeer)) {
+                // Rate limiting enforcement (exempt handshake and control frames)
+                val isControlFrame = rawFrame.text.startsWith("KEY_EXCHANGE") ||
+                        rawFrame.text.startsWith("CONNECTION_REQUEST") ||
+                        rawFrame.text.startsWith("CONNECTION_ACCEPT") ||
+                        rawFrame.text.startsWith("CONNECTION_DECLINE")
+
+                if (!isControlFrame && !rateLimiter.allowMessage(currentPeer)) {
                     LayoverFileLogger.log("Dropping rate-limited frame from peer: $currentPeer")
                     diagnosticsTracker.incrementRateLimitedDrops()
                     return@collect
@@ -298,6 +305,14 @@ class BleProximityTransport(
     }
 
     override fun sendConnectionRequest(peerId: String) {
+        val lastTime = lastRequestTimeMap[peerId] ?: 0L
+        val now = System.currentTimeMillis()
+        if (now - lastTime < 800L) {
+            LayoverFileLogger.log("Debouncing duplicate sendConnectionRequest for peerId=$peerId within 800ms.")
+            return
+        }
+        lastRequestTimeMap[peerId] = now
+
         LayoverFileLogger.log("sendConnectionRequest to peerId=$peerId")
         if (blockedPeerIds.contains(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
