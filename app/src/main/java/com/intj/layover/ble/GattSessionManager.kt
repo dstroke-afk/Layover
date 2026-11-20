@@ -88,9 +88,6 @@ class GattSessionManager(
                     connectedDevice = device
                     isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
-                    scope.launch {
-                        onGattReady?.invoke()
-                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
                     if (connectedDevice?.address == device?.address) {
@@ -130,7 +127,10 @@ class GattSessionManager(
                     if (responseNeeded) {
                         device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
                     }
-                    LayoverFileLogger.log("GATT Server: Client subscribed to notifications.")
+                    LayoverFileLogger.log("GATT Server: Client subscribed to notifications. Triggering server key exchange...")
+                    scope.launch {
+                        onGattReady?.invoke()
+                    }
                 }
             }
         }
