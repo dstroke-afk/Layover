@@ -185,11 +185,21 @@ class MainActivity : ComponentActivity() {
                 LayoverNavGraph(
                     uiState = uiState,
                     onUpdateUiState = { newState ->
+                        val oldProfile = uiState.userProfile
                         bleTransport.updateProfile(newState.userProfile)
                         bleTransport.updateSafetySettings(
                             blocked = newState.blockedPeerIds,
                             muted = newState.mutedPeerIds
                         )
+                        if (newState.userProfile.displayName != oldProfile.displayName ||
+                            newState.userProfile.handle != oldProfile.handle ||
+                            newState.userProfile.isVisibleToNearby != oldProfile.isVisibleToNearby) {
+                            if (newState.userProfile.isVisibleToNearby) {
+                                bleDiscoveryManager.startAdvertising(newState.userProfile)
+                            } else {
+                                bleDiscoveryManager.stopAdvertising()
+                            }
+                        }
                         uiState = newState.copy(
                             transport = bleTransport,
                             diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
