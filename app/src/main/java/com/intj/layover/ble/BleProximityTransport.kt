@@ -7,6 +7,7 @@ import android.content.Context
 import android.util.Base64
 import com.intj.layover.crypto.EncryptedPayload
 import com.intj.layover.crypto.SessionCryptoManager
+import com.intj.layover.diagnostics.SessionDiagnosticsTracker
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.ProximityTransport
@@ -43,6 +44,8 @@ class BleProximityTransport(
     private val sessionCryptoManager = SessionCryptoManager()
     private val rateLimiter = PeerRateLimiter()
 
+    val diagnosticsTracker = SessionDiagnosticsTracker()
+
     private var blockedPeerIds: Set<String> = emptySet()
     private var mutedPeerIds: Set<String> = emptySet()
 
@@ -61,10 +64,13 @@ class BleProximityTransport(
         // Handle RFCOMM connection lifecycle and E2EE key exchange
         scope.launch {
             rfcommSessionManager.connectionState.collect { state ->
+                diagnosticsTracker.updateRfcommStateLabel(state.name)
                 if (state == RfcommConnectionState.CONNECTED) {
                     initiateE2eeHandshake()
                 } else if (state == RfcommConnectionState.DISCONNECTED || state == RfcommConnectionState.FAILED) {
                     sessionCryptoManager.clearSession()
+                    diagnosticsTracker.updateKeyHandshakeComplete(false)
+                    diagnosticsTracker.updateSessionFingerprint(null)
                 }
             }
         }
@@ -76,35 +82,51 @@ class BleProximityTransport(
 
                 // Block enforcement
                 if (blockedPeerIds.contains(currentPeer)) {
+                    diagnosticsTracker.incrementBlockedDrops()
                     rfcommSessionManager.disconnect()
                     sessionCryptoManager.clearSession()
+                    diagnosticsTracker.updateKeyHandshakeComplete(false)
+                    diagnosticsTracker.updateSessionFingerprint(null)
                     return@collect
                 }
 
                 // Rate limiting enforcement
                 if (!rateLimiter.allowMessage(currentPeer)) {
+                    diagnosticsTracker.incrementRateLimitedDrops()
                     return@collect
                 }
 
-                val frame = WireFrameCodec.decodeFrame(rawFrame.text) ?: return@collect
+                val frame = WireFrameCodec.decodeFrame(rawFrame.text)
+                if (frame == null) {
+                    diagnosticsTracker.updateLastErrorMessage("Failed to decode wire frame")
+                    return@collect
+                }
 
                 when (frame) {
                     is WireFrame.KeyExchange -> {
-                        sessionCryptoManager.establishRemoteKey(
+                        val success = sessionCryptoManager.establishRemoteKey(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
                         )
+                        val isEstablished = sessionCryptoManager.isSessionKeyEstablished
+                        diagnosticsTracker.updateKeyHandshakeComplete(isEstablished)
+                        diagnosticsTracker.updateSessionFingerprint(sessionCryptoManager.sessionFingerprint)
+                        if (!success) {
+                            diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
+                        }
                     }
 
                     is WireFrame.ChatEncrypted -> {
                         val iv = try {
                             Base64.decode(frame.ivBase64, Base64.NO_WRAP)
                         } catch (e: Exception) {
+                            diagnosticsTracker.updateLastErrorMessage("Invalid IV Base64")
                             return@collect
                         }
                         val cipherBytes = try {
                             Base64.decode(frame.ciphertextBase64, Base64.NO_WRAP)
                         } catch (e: Exception) {
+                            diagnosticsTracker.updateLastErrorMessage("Invalid Ciphertext Base64")
                             return@collect
                         }
 
@@ -113,6 +135,7 @@ class BleProximityTransport(
                         )
 
                         if (decryptedText != null) {
+                            diagnosticsTracker.incrementMessagesReceived()
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
                                 senderId = currentPeer,
@@ -121,11 +144,17 @@ class BleProximityTransport(
                                 isOutgoing = false
                             )
                             _incomingMessagesFlow.emit(Pair(currentPeer, newMsg))
+                        } else {
+                            diagnosticsTracker.updateLastErrorMessage("Failed to decrypt chat message")
                         }
                     }
                 }
             }
         }
+    }
+
+    override fun resetDiagnosticsCounters() {
+        diagnosticsTracker.resetCounters()
     }
 
     fun updateSafetySettings(blocked: Set<String>, muted: Set<String>) {
@@ -147,7 +176,12 @@ class BleProximityTransport(
             publicKeyBase64 = pubKeyB64,
             algorithm = algo
         )
-        rfcommSessionManager.sendFrame(keyExchangePayload)
+        val sent = rfcommSessionManager.sendFrame(keyExchangePayload)
+        if (sent) {
+            diagnosticsTracker.incrementMessagesSent()
+        } else {
+            diagnosticsTracker.updateLastErrorMessage("Failed to send key exchange frame")
+        }
     }
 
     fun updateProfile(userProfile: UserProfile) {
@@ -170,7 +204,10 @@ class BleProximityTransport(
     }
 
     override fun sendConnectionRequest(peerId: String) {
-        if (blockedPeerIds.contains(peerId)) return
+        if (blockedPeerIds.contains(peerId)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return
+        }
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.REQUESTED)
         activePeerId = peerId
 
@@ -185,7 +222,10 @@ class BleProximityTransport(
     }
 
     override fun acceptConnectionRequest(peerId: String) {
-        if (blockedPeerIds.contains(peerId)) return
+        if (blockedPeerIds.contains(peerId)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return
+        }
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.ACCEPTED)
         activePeerId = peerId
 
@@ -219,13 +259,16 @@ class BleProximityTransport(
     }
 
     override fun sendMessage(peerId: String, text: String) {
-        if (blockedPeerIds.contains(peerId)) return
+        if (blockedPeerIds.contains(peerId)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return
+        }
         activePeerId = peerId
         val localId = currentUserProfile.handle.ifEmpty { "user" }
         val msgId = "msg_${System.currentTimeMillis()}"
 
         val encryptedPayload = sessionCryptoManager.encryptText(text)
-        if (encryptedPayload != null) {
+        val sent = if (encryptedPayload != null) {
             val wirePayload = WireFrameCodec.encodeChatEncrypted(
                 msgId = msgId,
                 senderId = localId,
@@ -235,6 +278,12 @@ class BleProximityTransport(
             rfcommSessionManager.sendFrame(wirePayload)
         } else {
             rfcommSessionManager.sendFrame(text)
+        }
+
+        if (sent) {
+            diagnosticsTracker.incrementMessagesSent()
+        } else {
+            diagnosticsTracker.updateLastErrorMessage("Failed to send message frame")
         }
     }
 

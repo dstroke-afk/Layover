@@ -55,19 +55,26 @@ class MainActivity : ComponentActivity() {
             val lifecycleOwner = LocalLifecycleOwner.current
             val bleStatus by bleStateController.statusState.collectAsState()
             val liveDiscoveredPeers by bleDiscoveryManager.discoveredPeers.collectAsState()
+            val diagnostics by bleTransport.diagnosticsTracker.diagnosticsState.collectAsState()
 
             var uiState by remember {
                 mutableStateOf(
-                    LayoverUiState(transport = bleTransport)
+                    LayoverUiState(transport = bleTransport, diagnostics = diagnostics)
                 )
             }
 
-            // Sync live discovered BLE peers into uiState when scanned
-            LaunchedEffect(liveDiscoveredPeers) {
-                if (liveDiscoveredPeers.isNotEmpty()) {
-                    val combinedPeers = (liveDiscoveredPeers + uiState.nearbyPeers).distinctBy { it.id }
+            // Sync live diagnostics state into uiState
+            LaunchedEffect(diagnostics) {
+                uiState = uiState.copy(diagnostics = diagnostics)
+            }
+
+            // Sync live discovered BLE peers into uiState and diagnostics tracker
+            LaunchedEffect(liveDiscoveredPeers, uiState.nearbyPeers) {
+                val combinedPeers = (liveDiscoveredPeers + uiState.nearbyPeers).distinctBy { it.id }
+                if (liveDiscoveredPeers.isNotEmpty() && combinedPeers.size != uiState.nearbyPeers.size) {
                     uiState = uiState.copy(nearbyPeers = combinedPeers)
                 }
+                bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(combinedPeers.size)
             }
 
             // Collect incoming P2P RFCOMM messages and append to chat state
@@ -114,6 +121,7 @@ class MainActivity : ComponentActivity() {
             // Display error toasts if BLE state reports issues
             LaunchedEffect(bleStatus.lastError) {
                 bleStatus.lastError?.let { err ->
+                    bleTransport.diagnosticsTracker.updateLastErrorMessage(err)
                     if (uiState.isScanning) {
                         Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
                     }
@@ -149,7 +157,10 @@ class MainActivity : ComponentActivity() {
                             blocked = newState.blockedPeerIds,
                             muted = newState.mutedPeerIds
                         )
-                        uiState = newState.copy(transport = bleTransport)
+                        uiState = newState.copy(
+                            transport = bleTransport,
+                            diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
+                        )
                     },
                     modifier = Modifier.fillMaxSize()
                 )

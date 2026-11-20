@@ -1,5 +1,7 @@
 package com.intj.layover.model
 
+import com.intj.layover.diagnostics.Phase1Diagnostics
+
 /**
  * Decoupled transport layer interface for P2P BLE / Wi-Fi Direct operations.
  */
@@ -9,6 +11,7 @@ interface ProximityTransport {
     fun sendConnectionRequest(peerId: String)
     fun acceptConnectionRequest(peerId: String)
     fun sendMessage(peerId: String, text: String)
+    fun resetDiagnosticsCounters() {}
 }
 
 /**
@@ -161,5 +164,6 @@ data class LayoverUiState(
     val isScanning: Boolean = false,
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,
-    val transport: ProximityTransport = NoOpProximityTransport()
+    val transport: ProximityTransport = NoOpProximityTransport(),
+    val diagnostics: Phase1Diagnostics = Phase1Diagnostics()
 )

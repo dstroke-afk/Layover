@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Radar
@@ -152,6 +153,7 @@ fun ScanScreen(
 ) {
     var showMenu by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
 
     val infiniteTransition = rememberInfiniteTransition(label = "ScanPulse")
     val scale1 by infiniteTransition.animateFloat(
@@ -176,6 +178,10 @@ fun ScanScreen(
 
     if (showAboutDialog) {
         AboutDialog(onDismiss = { showAboutDialog = false })
+    }
+
+    if (showDiagnosticsDialog) {
+        DiagnosticsDialog(uiState = uiState, onDismiss = { showDiagnosticsDialog = false })
     }
 
     LayoverBackground {
@@ -237,6 +243,20 @@ fun ScanScreen(
                                 onClick = {
                                     showMenu = false
                                     onNavigateToProfile()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Diagnostics", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.BugReport,
+                                        contentDescription = null,
+                                        tint = CyanPrimary
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    showDiagnosticsDialog = true
                                 }
                             )
                             DropdownMenuItem(
@@ -424,3 +444,110 @@ fun AboutDialog(onDismiss: () -> Unit) {
         }
     )
 }
+
+@Composable
+fun DiagnosticsDialog(
+    uiState: LayoverUiState,
+    onDismiss: () -> Unit
+) {
+    val diag = uiState.diagnostics
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ElevatedCardSurface,
+        titleContentColor = LightText,
+        textContentColor = LightText,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.BugReport,
+                    contentDescription = null,
+                    tint = CyanPrimary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Session Diagnostics",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            }
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                DiagnosticMetricRow("Discovered Peers", "${diag.discoveredPeersCount}")
+                DiagnosticMetricRow("RFCOMM State", diag.rfcommStateLabel)
+                DiagnosticMetricRow(
+                    "Key Handshake",
+                    if (diag.isKeyHandshakeComplete) "Complete" else "Pending"
+                )
+                DiagnosticMetricRow(
+                    "Session Fingerprint",
+                    diag.sessionFingerprint ?: "N/A"
+                )
+                DiagnosticMetricRow("Messages Sent", "${diag.messagesSent}")
+                DiagnosticMetricRow("Messages Received", "${diag.messagesReceived}")
+                DiagnosticMetricRow("Rate Limited Drops", "${diag.rateLimitedDrops}")
+                DiagnosticMetricRow("Blocked Drops", "${diag.blockedDrops}")
+                DiagnosticMetricRow(
+                    "Last Error",
+                    diag.lastErrorMessage ?: "None",
+                    isError = diag.lastErrorMessage != null
+                )
+            }
+        },
+        confirmButton = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        uiState.transport.resetDiagnosticsCounters()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CyanPrimary,
+                        contentColor = DarkNavyBackground
+                    ),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("Reset", fontWeight = FontWeight.Bold)
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun DiagnosticMetricRow(
+    label: String,
+    value: String,
+    isError: Boolean = false
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            fontSize = 13.sp,
+            color = MutedText
+        )
+        Text(
+            text = value,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (isError) androidx.compose.ui.graphics.Color(0xFFFF5252) else CyanAccent,
+            modifier = Modifier.padding(start = 8.dp)
+        )
+    }
+}
+

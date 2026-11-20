@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeMute
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
@@ -83,9 +84,14 @@ fun PeopleAroundScreen(
     var searchQuery by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
+    var showDiagnosticsDialog by remember { mutableStateOf(false) }
 
     if (showAboutDialog) {
         AboutDialog(onDismiss = { showAboutDialog = false })
+    }
+
+    if (showDiagnosticsDialog) {
+        DiagnosticsDialog(uiState = uiState, onDismiss = { showDiagnosticsDialog = false })
     }
 
     val filteredPeers = remember(uiState.nearbyPeers, searchQuery, uiState.blockedPeerIds) {
@@ -164,6 +170,20 @@ fun PeopleAroundScreen(
                                 onClick = {
                                     showMenu = false
                                     onNavigateToProfile()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Diagnostics", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.BugReport,
+                                        contentDescription = null,
+                                        tint = CyanPrimary
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    showDiagnosticsDialog = true
                                 }
                             )
                             DropdownMenuItem(
