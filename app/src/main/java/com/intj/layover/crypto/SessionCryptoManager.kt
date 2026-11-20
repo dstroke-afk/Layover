@@ -2,6 +2,7 @@ package com.intj.layover.crypto
 
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -45,6 +46,9 @@ enum class KeyAlgorithm(val algorithmName: String, val agreementName: String) {
 }
 
 class SessionCryptoManager {
+    companion object {
+        private const val TAG = "LayoverBLE"
+    }
 
     private var currentAlgorithm: KeyAlgorithm = KeyAlgorithm.EC_P256
     private var localKeyPair: KeyPair? = null
@@ -65,8 +69,11 @@ class SessionCryptoManager {
             try {
                 currentAlgorithm = KeyAlgorithm.X25519
                 val kpg = KeyPairGenerator.getInstance("X25519")
-                kpg.generateKeyPair()
+                val generated = kpg.generateKeyPair()
+                Log.d(TAG, "Generated ephemeral X25519 key pair.")
+                generated
             } catch (e: Exception) {
+                Log.d(TAG, "X25519 key gen failed, falling back to EC secp256r1", e)
                 generateEcFallback()
             }
         } else {
@@ -81,7 +88,9 @@ class SessionCryptoManager {
         currentAlgorithm = KeyAlgorithm.EC_P256
         val kpg = KeyPairGenerator.getInstance("EC")
         kpg.initialize(ECGenParameterSpec("secp256r1"))
-        return kpg.generateKeyPair()
+        val generated = kpg.generateKeyPair()
+        Log.d(TAG, "Generated ephemeral EC secp256r1 key pair.")
+        return generated
     }
 
     fun getLocalPublicKeyBase64(): String? {
@@ -116,8 +125,10 @@ class SessionCryptoManager {
 
             secretKey = SecretKeySpec(sessionKeyBytes, "AES")
             sessionFingerprint = computeFingerprint(localPair.public.encoded, pubKey.encoded)
+            Log.d(TAG, "E2EE AES-256 session key established successfully. Fingerprint=$sessionFingerprint")
             true
         } catch (e: Exception) {
+            Log.e(TAG, "Failed to establish remote key for E2EE", e)
             clearSession()
             false
         }
@@ -163,6 +174,7 @@ class SessionCryptoManager {
             val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
             EncryptedPayload(iv = iv, ciphertext = ciphertext)
         } catch (e: Exception) {
+            Log.e(TAG, "AES-GCM Encryption failed", e)
             null
         }
     }
@@ -177,6 +189,7 @@ class SessionCryptoManager {
             val plaintextBytes = cipher.doFinal(payload.ciphertext)
             String(plaintextBytes, Charsets.UTF_8)
         } catch (e: Exception) {
+            Log.e(TAG, "AES-GCM Decryption failed", e)
             null
         }
     }

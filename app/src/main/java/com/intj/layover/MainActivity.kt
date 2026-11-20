@@ -1,6 +1,7 @@
 package com.intj.layover
 
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,12 +25,16 @@ import com.intj.layover.ble.BleDiscoveryManager
 import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
+import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.p2p.RfcommSessionManager
 import com.intj.layover.ui.theme.LayoverTheme
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val TAG = "LayoverBLE"
+    }
 
     private lateinit var bleStateController: BleStateController
     private lateinit var bleDiscoveryManager: BleDiscoveryManager
@@ -59,7 +64,11 @@ class MainActivity : ComponentActivity() {
 
             var uiState by remember {
                 mutableStateOf(
-                    LayoverUiState(transport = bleTransport, diagnostics = diagnostics)
+                    LayoverUiState(
+                        nearbyPeers = emptyList(),
+                        transport = bleTransport,
+                        diagnostics = diagnostics
+                    )
                 )
             }
 
@@ -68,13 +77,20 @@ class MainActivity : ComponentActivity() {
                 uiState = uiState.copy(diagnostics = diagnostics)
             }
 
-            // Sync live discovered BLE peers into uiState and diagnostics tracker
-            LaunchedEffect(liveDiscoveredPeers, uiState.nearbyPeers) {
-                val combinedPeers = (liveDiscoveredPeers + uiState.nearbyPeers).distinctBy { it.id }
-                if (liveDiscoveredPeers.isNotEmpty() && combinedPeers.size != uiState.nearbyPeers.size) {
-                    uiState = uiState.copy(nearbyPeers = combinedPeers)
+            // Sync live discovered BLE peers into uiState and preserve local connection status (REQUESTED / ACCEPTED)
+            LaunchedEffect(liveDiscoveredPeers) {
+                val existingMap = uiState.nearbyPeers.associateBy { it.id }
+                val merged = liveDiscoveredPeers.map { discovered ->
+                    val existing = existingMap[discovered.id]
+                    if (existing != null && existing.status != ConnectionStatus.NONE) {
+                        discovered.copy(status = existing.status)
+                    } else {
+                        discovered
+                    }
                 }
-                bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(combinedPeers.size)
+                uiState = uiState.copy(nearbyPeers = merged)
+                bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(merged.size)
+                Log.d(TAG, "UI State updated with ${merged.size} real BLE discovered peers.")
             }
 
             // Collect incoming P2P RFCOMM messages and append to chat state
@@ -95,8 +111,10 @@ class MainActivity : ComponentActivity() {
                 val allGranted = permsMap.values.all { it }
                 bleStateController.updateState()
                 if (allGranted && uiState.isScanning) {
+                    Log.d(TAG, "Permissions granted. Starting discovery...")
                     bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
                 } else if (!allGranted) {
+                    Log.e(TAG, "Permissions rejected by user.")
                     Toast.makeText(
                         context,
                         "Bluetooth permissions are required for nearby scanning",
@@ -109,6 +127,7 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(uiState.isScanning) {
                 if (uiState.isScanning) {
                     if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+                        Log.d(TAG, "Requesting missing BLE runtime permissions...")
                         permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
                     } else {
                         bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
@@ -133,6 +152,7 @@ class MainActivity : ComponentActivity() {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
                         Lifecycle.Event.ON_STOP -> {
+                            Log.d(TAG, "App ON_STOP: Stopping BLE discovery.")
                             bleTransport.stopDiscovery()
                         }
                         Lifecycle.Event.ON_START -> {

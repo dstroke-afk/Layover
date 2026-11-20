@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.Context
+import android.util.Log
 import com.intj.layover.ble.BlePermissionHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +42,7 @@ class RfcommSessionManager(
     private val context: Context
 ) {
     companion object {
+        private const val TAG = "LayoverBLE"
         val LAYOVER_RFCOMM_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7042")
     }
 
@@ -65,18 +67,21 @@ class RfcommSessionManager(
     @SuppressLint("MissingPermission")
     fun startServer() {
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+            Log.e(TAG, "RFCOMM startServer failed: permissions missing.")
             _connectionState.value = RfcommConnectionState.FAILED
             return
         }
 
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
+            Log.e(TAG, "RFCOMM startServer failed: bluetooth off or null.")
             _connectionState.value = RfcommConnectionState.FAILED
             return
         }
 
         disconnect()
         _connectionState.value = RfcommConnectionState.CONNECTING
+        Log.d(TAG, "RFCOMM Server listening for incoming connection on UUID $LAYOVER_RFCOMM_UUID...")
 
         scope.launch {
             try {
@@ -84,11 +89,13 @@ class RfcommSessionManager(
                 activeServerSocket = serverSocket
 
                 val socket = serverSocket.accept()
+                Log.d(TAG, "RFCOMM Server accepted socket connection from device ${socket.remoteDevice?.address}")
                 serverSocket.close()
                 activeServerSocket = null
 
                 handleConnectedSocket(socket)
             } catch (e: Exception) {
+                Log.e(TAG, "RFCOMM Server exception during accept()", e)
                 if (_connectionState.value == RfcommConnectionState.CONNECTING) {
                     _connectionState.value = RfcommConnectionState.FAILED
                 }
@@ -99,20 +106,24 @@ class RfcommSessionManager(
     @SuppressLint("MissingPermission")
     fun connectToDevice(device: BluetoothDevice) {
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+            Log.e(TAG, "RFCOMM connectToDevice failed: permissions missing.")
             _connectionState.value = RfcommConnectionState.FAILED
             return
         }
 
         disconnect()
         _connectionState.value = RfcommConnectionState.CONNECTING
+        Log.d(TAG, "RFCOMM Client connecting to device address=${device.address}...")
 
         scope.launch {
             try {
                 val socket = device.createRfcommSocketToServiceRecord(LAYOVER_RFCOMM_UUID)
                 activeClientSocket = socket
                 socket.connect()
+                Log.d(TAG, "RFCOMM Client socket connected successfully to ${device.address}")
                 handleConnectedSocket(socket)
             } catch (e: Exception) {
+                Log.e(TAG, "RFCOMM Client connection failed to ${device.address}", e)
                 disconnect()
                 _connectionState.value = RfcommConnectionState.FAILED
             }
@@ -125,9 +136,11 @@ class RfcommSessionManager(
             dataOutputStream = DataOutputStream(socket.outputStream)
             dataInputStream = DataInputStream(socket.inputStream)
             _connectionState.value = RfcommConnectionState.CONNECTED
+            Log.d(TAG, "RFCOMM Session CONNECTED. Streams initialized.")
 
             startReadingLoop(socket.remoteDevice?.address ?: "remote_peer")
         } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize DataStreams on RFCOMM socket", e)
             disconnect()
             _connectionState.value = RfcommConnectionState.FAILED
         }
@@ -141,6 +154,7 @@ class RfcommSessionManager(
                 while (isActive && _connectionState.value == RfcommConnectionState.CONNECTED) {
                     val frameLength = dis.readInt()
                     if (frameLength <= 0 || frameLength > 65536) {
+                        Log.e(TAG, "Invalid RFCOMM frame length: $frameLength. Terminating loop.")
                         break
                     }
 
@@ -148,6 +162,7 @@ class RfcommSessionManager(
                     dis.readFully(buffer)
 
                     val text = String(buffer, Charsets.UTF_8)
+                    Log.d(TAG, "RFCOMM frame received: length=$frameLength")
                     _incomingMessages.emit(
                         P2PMessageFrame(
                             senderId = remoteAddress,
@@ -156,7 +171,7 @@ class RfcommSessionManager(
                     )
                 }
             } catch (e: IOException) {
-                // Connection broken
+                Log.d(TAG, "RFCOMM reading loop disconnected (IOException)", e)
             } finally {
                 disconnect()
             }
@@ -170,8 +185,10 @@ class RfcommSessionManager(
             dos.writeInt(payload.size)
             dos.write(payload)
             dos.flush()
+            Log.d(TAG, "RFCOMM frame sent successfully: size=${payload.size}")
             true
         } catch (e: Exception) {
+            Log.e(TAG, "RFCOMM sendFrame failed", e)
             disconnect()
             false
         }
