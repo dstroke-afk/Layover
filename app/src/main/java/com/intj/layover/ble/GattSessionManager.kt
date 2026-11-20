@@ -18,6 +18,7 @@ import com.intj.layover.p2p.RfcommConnectionState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -213,12 +214,20 @@ class GattSessionManager(
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val service = gatt?.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
-                    val rxChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) }
-                    val txChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_TX_CHAR_UUID) }
-                    LayoverFileLogger.log("GATT Services discovered. Service found: ${service != null}, RX found: ${rxChar != null}, TX found: ${txChar != null}")
-                    gatt?.requestMtu(512)
+                if (status == BluetoothGatt.GATT_SUCCESS && gatt != null) {
+                    val service = gatt.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: gatt.getService(LAYOVER_GATT_SERVICE_UUID)
+                    if (service == null) {
+                        LayoverFileLogger.logError("GATT Services discovered but Layover service not visible yet. Retrying discoverServices in 300ms...")
+                        scope.launch {
+                            delay(300)
+                            gatt.discoverServices()
+                        }
+                        return
+                    }
+                    val rxChar = service.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) }
+                    val txChar = service.characteristics?.find { it.uuid.equals(LAYOVER_TX_CHAR_UUID) }
+                    LayoverFileLogger.log("GATT Services discovered successfully. Service found: true, RX found: ${rxChar != null}, TX found: ${txChar != null}")
+                    gatt.requestMtu(512)
                 } else {
                     LayoverFileLogger.logError("GATT Services discovery failed with status: $status")
                     setConnectionState(RfcommConnectionState.FAILED, "Services discovery status $status")
