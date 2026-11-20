@@ -13,9 +13,7 @@ import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.ProximityTransport
 import com.intj.layover.model.UserProfile
-import com.intj.layover.p2p.ConnectionTieBreaker
 import com.intj.layover.p2p.RfcommConnectionState
-import com.intj.layover.p2p.RfcommSessionManager
 import com.intj.layover.p2p.WireFrame
 import com.intj.layover.p2p.WireFrameCodec
 import com.intj.layover.safety.PeerRateLimiter
@@ -31,7 +29,7 @@ class BleProximityTransport(
     private val context: Context,
     private val discoveryManager: BleDiscoveryManager,
     private val bleStateController: BleStateController,
-    private val rfcommSessionManager: RfcommSessionManager,
+    private val gattSessionManager: GattSessionManager,
     private var currentUserProfile: UserProfile = UserProfile()
 ) : ProximityTransport {
 
@@ -67,13 +65,13 @@ class BleProximityTransport(
         get() = sessionCryptoManager.sessionFingerprint
 
     init {
-        // Always keep RFCOMM server listener running in the background
-        rfcommSessionManager.startServerLoop()
+        // Start GATT Server listener
+        gattSessionManager.startServer()
 
-        // Handle RFCOMM connection lifecycle and E2EE key exchange
+        // Handle GATT connection lifecycle and E2EE key exchange
         scope.launch {
-            rfcommSessionManager.connectionState.collect { state ->
-                LayoverFileLogger.log("RFCOMM state changed: ${state.name}")
+            gattSessionManager.connectionState.collect { state ->
+                LayoverFileLogger.log("GATT connection state changed: ${state.name}")
                 diagnosticsTracker.updateRfcommStateLabel(state.name)
                 if (state == RfcommConnectionState.CONNECTED) {
                     initiateE2eeHandshake()
@@ -82,7 +80,7 @@ class BleProximityTransport(
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
                     if (state == RfcommConnectionState.FAILED) {
-                        diagnosticsTracker.updateLastErrorMessage("RFCOMM connection failed")
+                        diagnosticsTracker.updateLastErrorMessage("GATT connection failed")
                     }
                 }
             }
@@ -90,14 +88,14 @@ class BleProximityTransport(
 
         // Handle incoming wire frames with safety, block, and rate-limiting enforcement
         scope.launch {
-            rfcommSessionManager.incomingMessages.collect { rawFrame ->
+            gattSessionManager.incomingMessages.collect { rawFrame ->
                 val currentPeer = activePeerId ?: rawFrame.senderId
 
                 // Block enforcement
                 if (blockedPeerIds.contains(currentPeer)) {
                     LayoverFileLogger.log("Dropping frame from blocked peer: $currentPeer")
                     diagnosticsTracker.incrementBlockedDrops()
-                    rfcommSessionManager.disconnect()
+                    gattSessionManager.disconnect()
                     sessionCryptoManager.clearSession()
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
@@ -131,6 +129,8 @@ class BleProximityTransport(
                         if (!success) {
                             LayoverFileLogger.logError("Key exchange establishment failed.")
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
+                        } else {
+                            LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed via BLE GATT.")
                         }
                     }
 
@@ -181,13 +181,13 @@ class BleProximityTransport(
         blockedPeerIds = blocked
         mutedPeerIds = muted
         if (activePeerId != null && blockedPeerIds.contains(activePeerId)) {
-            rfcommSessionManager.disconnect()
+            gattSessionManager.disconnect()
             sessionCryptoManager.clearSession()
         }
     }
 
     private fun initiateE2eeHandshake() {
-        LayoverFileLogger.log("Initiating E2EE key exchange handshake...")
+        LayoverFileLogger.log("Initiating E2EE key exchange handshake over GATT...")
         val pubKeyB64 = sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
         val localId = currentUserProfile.handle.ifEmpty { "local" }
@@ -197,7 +197,7 @@ class BleProximityTransport(
             publicKeyBase64 = pubKeyB64,
             algorithm = algo
         )
-        val sent = rfcommSessionManager.sendFrame(keyExchangePayload)
+        val sent = gattSessionManager.sendFrame(keyExchangePayload)
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
         } else {
@@ -239,6 +239,7 @@ class BleProximityTransport(
         }
 
         discoveryManager.startScanning()
+        gattSessionManager.startServer()
 
         if (visible) {
             discoveryManager.startAdvertising(currentUserProfile.copy(isVisibleToNearby = true))
@@ -262,11 +263,7 @@ class BleProximityTransport(
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.REQUESTED)
         activePeerId = peerId
 
-        val localId = currentUserProfile.handle.ifEmpty { "local" }
-        val role = ConnectionTieBreaker.determineRole(localId, peerId)
-        LayoverFileLogger.log("Tie-breaker role determined for request ($localId vs $peerId): $role")
-
-        connectRfcommDevice(peerId)
+        connectGattDevice(peerId)
     }
 
     override fun acceptConnectionRequest(peerId: String) {
@@ -278,29 +275,22 @@ class BleProximityTransport(
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.ACCEPTED)
         activePeerId = peerId
 
-        val localId = currentUserProfile.handle.ifEmpty { "local" }
-        val role = ConnectionTieBreaker.determineRole(localId, peerId)
-        LayoverFileLogger.log("Tie-breaker role determined for accept ($localId vs $peerId): $role")
-
-        connectRfcommDevice(peerId)
+        connectGattDevice(peerId)
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectRfcommDevice(peerId: String) {
+    private fun connectGattDevice(peerId: String) {
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-            LayoverFileLogger.logError("Cannot connect RFCOMM device: permissions missing.")
+            LayoverFileLogger.logError("Cannot connect GATT device: permissions missing.")
             return
         }
-        val adapter = bluetoothAdapter
-        if (adapter == null) {
-            rfcommSessionManager.startServerLoop()
-            return
-        }
+        val adapter = bluetoothAdapter ?: return
 
         val targetDevice = discoveryManager.getDiscoveredDevice(peerId)
         if (targetDevice != null) {
-            LayoverFileLogger.log("Connecting to discovered BluetoothDevice: address=${targetDevice.address}")
-            rfcommSessionManager.connectToDevice(targetDevice)
+            LayoverFileLogger.log("Connecting GATT client to discovered BluetoothDevice: address=${targetDevice.address}")
+            discoveryManager.stopScanning()
+            gattSessionManager.connectToDevice(targetDevice)
             return
         }
 
@@ -314,13 +304,14 @@ class BleProximityTransport(
             }
 
             if (device != null) {
-                rfcommSessionManager.connectToDevice(device)
+                discoveryManager.stopScanning()
+                gattSessionManager.connectToDevice(device)
             } else {
-                rfcommSessionManager.startServerLoop()
+                gattSessionManager.startServer()
             }
         } else {
-            LayoverFileLogger.log("PeerId $peerId is not a Bluetooth MAC address. Ensuring RFCOMM server listener is active.")
-            rfcommSessionManager.startServerLoop()
+            LayoverFileLogger.log("PeerId $peerId is not a Bluetooth MAC address. Ensuring GATT server is listening.")
+            gattSessionManager.startServer()
         }
     }
 
@@ -342,9 +333,9 @@ class BleProximityTransport(
                 timestamp = System.currentTimeMillis(),
                 payload = encryptedPayload
             )
-            rfcommSessionManager.sendFrame(wirePayload)
+            gattSessionManager.sendFrame(wirePayload)
         } else {
-            rfcommSessionManager.sendFrame(text)
+            gattSessionManager.sendFrame(text)
         }
 
         if (sent) {
@@ -358,6 +349,6 @@ class BleProximityTransport(
         stopDiscovery()
         rateLimiter.clearAll()
         sessionCryptoManager.clearSession()
-        rfcommSessionManager.cleanup()
+        gattSessionManager.cleanup()
     }
 }

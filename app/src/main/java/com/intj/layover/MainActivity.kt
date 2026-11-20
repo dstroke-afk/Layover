@@ -25,10 +25,10 @@ import com.intj.layover.ble.BleDiscoveryManager
 import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
+import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverNavGraph
-import com.intj.layover.p2p.RfcommSessionManager
 import com.intj.layover.ui.theme.LayoverTheme
 
 class MainActivity : ComponentActivity() {
@@ -38,7 +38,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var bleStateController: BleStateController
     private lateinit var bleDiscoveryManager: BleDiscoveryManager
-    private lateinit var rfcommSessionManager: RfcommSessionManager
+    private lateinit var gattSessionManager: GattSessionManager
     private lateinit var bleTransport: BleProximityTransport
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -47,12 +47,12 @@ class MainActivity : ComponentActivity() {
 
         bleStateController = BleStateController(applicationContext)
         bleDiscoveryManager = BleDiscoveryManager(applicationContext, bleStateController)
-        rfcommSessionManager = RfcommSessionManager(applicationContext)
+        gattSessionManager = GattSessionManager(applicationContext)
         bleTransport = BleProximityTransport(
             context = applicationContext,
             discoveryManager = bleDiscoveryManager,
             bleStateController = bleStateController,
-            rfcommSessionManager = rfcommSessionManager
+            gattSessionManager = gattSessionManager
         )
 
         setContent {
@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
                 Log.d(TAG, "UI State updated with ${merged.size} real BLE discovered peers.")
             }
 
-            // Collect incoming P2P RFCOMM messages and append to chat state
+            // Collect incoming P2P GATT messages and append to chat state
             LaunchedEffect(Unit) {
                 bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
                     val updatedMap = uiState.chatMessages.toMutableMap()
