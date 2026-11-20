@@ -26,12 +26,14 @@ import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverNavGraph
+import com.intj.layover.p2p.RfcommSessionManager
 import com.intj.layover.ui.theme.LayoverTheme
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var bleStateController: BleStateController
     private lateinit var bleDiscoveryManager: BleDiscoveryManager
+    private lateinit var rfcommSessionManager: RfcommSessionManager
     private lateinit var bleTransport: BleProximityTransport
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -40,7 +42,13 @@ class MainActivity : ComponentActivity() {
 
         bleStateController = BleStateController(applicationContext)
         bleDiscoveryManager = BleDiscoveryManager(applicationContext, bleStateController)
-        bleTransport = BleProximityTransport(bleDiscoveryManager, bleStateController)
+        rfcommSessionManager = RfcommSessionManager(applicationContext)
+        bleTransport = BleProximityTransport(
+            context = applicationContext,
+            discoveryManager = bleDiscoveryManager,
+            bleStateController = bleStateController,
+            rfcommSessionManager = rfcommSessionManager
+        )
 
         setContent {
             val context = LocalContext.current
@@ -59,6 +67,17 @@ class MainActivity : ComponentActivity() {
                 if (liveDiscoveredPeers.isNotEmpty()) {
                     val combinedPeers = (liveDiscoveredPeers + uiState.nearbyPeers).distinctBy { it.id }
                     uiState = uiState.copy(nearbyPeers = combinedPeers)
+                }
+            }
+
+            // Collect incoming P2P RFCOMM messages and append to chat state
+            LaunchedEffect(Unit) {
+                bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
+                    val updatedMap = uiState.chatMessages.toMutableMap()
+                    val currentList = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
+                    currentList.add(message)
+                    updatedMap[peerId] = currentList
+                    uiState = uiState.copy(chatMessages = updatedMap)
                 }
             }
 
@@ -117,7 +136,7 @@ class MainActivity : ComponentActivity() {
                 lifecycleOwner.lifecycle.addObserver(observer)
                 onDispose {
                     lifecycleOwner.lifecycle.removeObserver(observer)
-                    bleDiscoveryManager.cleanup()
+                    bleTransport.cleanup()
                 }
             }
 
@@ -136,6 +155,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        bleDiscoveryManager.cleanup()
+        bleTransport.cleanup()
     }
 }
