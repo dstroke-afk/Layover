@@ -23,7 +23,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeMute
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
@@ -58,11 +65,18 @@ import com.intj.layover.ui.theme.OutgoingCyanBubble
 fun ChatScreen(
     peer: NearbyPeer?,
     messages: List<ChatMessage>,
+    isBlocked: Boolean = false,
+    isMuted: Boolean = false,
     onSendMessage: (text: String, replyToText: String?) -> Unit,
+    onToggleBlockPeer: (String) -> Unit,
+    onToggleMutePeer: (String) -> Unit,
     onNavigateBack: () -> Unit
 ) {
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
+    var showChatMenu by remember { mutableStateOf(false) }
+
+    val peerId = peer?.id ?: ""
 
     LayoverBackground {
         Column(
@@ -90,13 +104,17 @@ fun ChatScreen(
                         .size(40.dp)
                         .clip(CircleShape)
                         .background(IncomingBubbleSurface)
-                        .border(1.5.dp, CyanPrimary, CircleShape),
+                        .border(
+                            1.5.dp,
+                            if (isBlocked) MutedText else CyanPrimary,
+                            CircleShape
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = peer?.avatar?.initials ?: "?",
                         fontWeight = FontWeight.Bold,
-                        color = CyanPrimary,
+                        color = if (isBlocked) MutedText else CyanPrimary,
                         fontSize = 15.sp
                     )
                 }
@@ -104,54 +122,135 @@ fun ChatScreen(
                 Spacer(modifier = Modifier.width(12.dp))
 
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = peer?.displayName ?: "Unknown Peer",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = LightText
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = peer?.displayName ?: "Unknown Peer",
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = LightText
+                        )
+                        if (isMuted) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.VolumeOff,
+                                contentDescription = "Muted",
+                                tint = MutedText,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
                     if (!peer?.handle.isNullOrEmpty()) {
                         Text(
-                            text = "@${peer.handle}",
+                            text = if (isBlocked) "[BLOCKED]" else "@${peer.handle}",
                             fontSize = 12.sp,
                             color = MutedText
                         )
                     }
                 }
 
-                Surface(
-                    color = Color(0xFF10B981).copy(alpha = 0.2f),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(
-                        text = "Accepted",
-                        color = Color(0xFF10B981),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
+                Box {
+                    IconButton(onClick = { showChatMenu = true }) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "Menu",
+                            tint = LightText
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = showChatMenu,
+                        onDismissRequest = { showChatMenu = false },
+                        modifier = Modifier.background(ElevatedCardSurface)
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(if (isMuted) "Unmute Chat" else "Mute Chat", color = LightText) },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeMute else Icons.AutoMirrored.Filled.VolumeOff,
+                                    contentDescription = null,
+                                    tint = CyanAccent
+                                )
+                            },
+                            onClick = {
+                                showChatMenu = false
+                                if (peerId.isNotEmpty()) onToggleMutePeer(peerId)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Block,
+                                    contentDescription = null,
+                                    tint = Color(0xFFFF5252)
+                                )
+                            },
+                            onClick = {
+                                showChatMenu = false
+                                if (peerId.isNotEmpty()) onToggleBlockPeer(peerId)
+                            }
+                        )
+                    }
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(8.dp))
 
-            // Date divider placeholder
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 6.dp),
-                contentAlignment = Alignment.Center
-            ) {
+            // Security / E2EE & Block Status Banners
+            if (isBlocked) {
                 Surface(
-                    color = ElevatedCardSurface,
-                    shape = RoundedCornerShape(12.dp)
+                    color = Color(0xFFFF5252).copy(alpha = 0.15f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
                 ) {
-                    Text(
-                        text = "Today",
-                        fontSize = 11.sp,
-                        color = MutedText,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Block,
+                            contentDescription = null,
+                            tint = Color(0xFFFF5252),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Peer is blocked. Unblock to send or receive messages.",
+                            fontSize = 12.sp,
+                            color = Color(0xFFFF5252),
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            } else {
+                Surface(
+                    color = Color(0xFF10B981).copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = null,
+                            tint = Color(0xFF10B981),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "End-to-End Encrypted (AES-GCM-256)",
+                            fontSize = 11.sp,
+                            color = Color(0xFF10B981),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
             }
 
@@ -166,7 +265,9 @@ fun ChatScreen(
                 items(messages, key = { it.id }) { message ->
                     ChatMessageBubble(
                         message = message,
-                        onReplyClick = { replyingToMessage = message }
+                        onReplyClick = {
+                            if (!isBlocked) replyingToMessage = message
+                        }
                     )
                 }
             }
@@ -230,16 +331,24 @@ fun ChatScreen(
             ) {
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { inputText = it },
-                    placeholder = { Text(text = "Type message...", color = MutedText) },
+                    onValueChange = { if (!isBlocked) inputText = it },
+                    placeholder = {
+                        Text(
+                            text = if (isBlocked) "Unblock peer to message..." else "Type message...",
+                            color = MutedText
+                        )
+                    },
+                    enabled = !isBlocked,
                     modifier = Modifier.weight(1f),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedContainerColor = ElevatedCardSurface,
                         unfocusedContainerColor = ElevatedCardSurface,
+                        disabledContainerColor = ElevatedCardSurface.copy(alpha = 0.5f),
                         focusedBorderColor = CyanPrimary,
                         unfocusedBorderColor = IncomingBubbleSurface,
                         focusedTextColor = LightText,
-                        unfocusedTextColor = LightText
+                        unfocusedTextColor = LightText,
+                        disabledTextColor = MutedText
                     ),
                     shape = RoundedCornerShape(24.dp)
                 )
@@ -248,21 +357,22 @@ fun ChatScreen(
 
                 IconButton(
                     onClick = {
-                        if (inputText.isNotBlank()) {
+                        if (!isBlocked && inputText.isNotBlank()) {
                             onSendMessage(inputText.trim(), replyingToMessage?.text)
                             inputText = ""
                             replyingToMessage = null
                         }
                     },
+                    enabled = !isBlocked && inputText.isNotBlank(),
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .background(CyanPrimary)
+                        .background(if (!isBlocked && inputText.isNotBlank()) CyanPrimary else IncomingBubbleSurface)
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send",
-                        tint = DarkNavyBackground
+                        tint = if (!isBlocked && inputText.isNotBlank()) DarkNavyBackground else MutedText
                     )
                 }
             }

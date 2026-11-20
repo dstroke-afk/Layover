@@ -17,6 +17,7 @@ import com.intj.layover.p2p.RfcommConnectionState
 import com.intj.layover.p2p.RfcommSessionManager
 import com.intj.layover.p2p.WireFrame
 import com.intj.layover.p2p.WireFrameCodec
+import com.intj.layover.safety.PeerRateLimiter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -40,6 +41,10 @@ class BleProximityTransport(
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
 
     private val sessionCryptoManager = SessionCryptoManager()
+    private val rateLimiter = PeerRateLimiter()
+
+    private var blockedPeerIds: Set<String> = emptySet()
+    private var mutedPeerIds: Set<String> = emptySet()
 
     private val _incomingMessagesFlow = MutableSharedFlow<Pair<String, ChatMessage>>()
     val incomingMessagesFlow: SharedFlow<Pair<String, ChatMessage>> = _incomingMessagesFlow.asSharedFlow()
@@ -64,11 +69,24 @@ class BleProximityTransport(
             }
         }
 
-        // Handle incoming wire frames
+        // Handle incoming wire frames with safety, block, and rate-limiting enforcement
         scope.launch {
             rfcommSessionManager.incomingMessages.collect { rawFrame ->
-                val frame = WireFrameCodec.decodeFrame(rawFrame.text) ?: return@collect
                 val currentPeer = activePeerId ?: rawFrame.senderId
+
+                // Block enforcement
+                if (blockedPeerIds.contains(currentPeer)) {
+                    rfcommSessionManager.disconnect()
+                    sessionCryptoManager.clearSession()
+                    return@collect
+                }
+
+                // Rate limiting enforcement
+                if (!rateLimiter.allowMessage(currentPeer)) {
+                    return@collect
+                }
+
+                val frame = WireFrameCodec.decodeFrame(rawFrame.text) ?: return@collect
 
                 when (frame) {
                     is WireFrame.KeyExchange -> {
@@ -110,6 +128,15 @@ class BleProximityTransport(
         }
     }
 
+    fun updateSafetySettings(blocked: Set<String>, muted: Set<String>) {
+        blockedPeerIds = blocked
+        mutedPeerIds = muted
+        if (activePeerId != null && blockedPeerIds.contains(activePeerId)) {
+            rfcommSessionManager.disconnect()
+            sessionCryptoManager.clearSession()
+        }
+    }
+
     private fun initiateE2eeHandshake() {
         val pubKeyB64 = sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
@@ -143,6 +170,7 @@ class BleProximityTransport(
     }
 
     override fun sendConnectionRequest(peerId: String) {
+        if (blockedPeerIds.contains(peerId)) return
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.REQUESTED)
         activePeerId = peerId
 
@@ -157,6 +185,7 @@ class BleProximityTransport(
     }
 
     override fun acceptConnectionRequest(peerId: String) {
+        if (blockedPeerIds.contains(peerId)) return
         discoveryManager.updatePeerStatus(peerId, ConnectionStatus.ACCEPTED)
         activePeerId = peerId
 
@@ -190,6 +219,7 @@ class BleProximityTransport(
     }
 
     override fun sendMessage(peerId: String, text: String) {
+        if (blockedPeerIds.contains(peerId)) return
         activePeerId = peerId
         val localId = currentUserProfile.handle.ifEmpty { "user" }
         val msgId = "msg_${System.currentTimeMillis()}"
@@ -204,13 +234,13 @@ class BleProximityTransport(
             )
             rfcommSessionManager.sendFrame(wirePayload)
         } else {
-            // Unencrypted fallback if session key not established yet
             rfcommSessionManager.sendFrame(text)
         }
     }
 
     fun cleanup() {
         stopDiscovery()
+        rateLimiter.clearAll()
         sessionCryptoManager.clearSession()
         rfcommSessionManager.disconnect()
     }

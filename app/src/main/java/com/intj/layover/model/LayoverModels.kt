@@ -155,6 +155,9 @@ data class LayoverUiState(
             )
         )
     ),
+    val blockedPeerIds: Set<String> = emptySet(),
+    val mutedPeerIds: Set<String> = emptySet(),
+    val rateLimitedPeerIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,
     val searchQuery: String = "",
     val isSearchActive: Boolean = false,

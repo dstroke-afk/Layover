@@ -145,6 +145,10 @@ class MainActivity : ComponentActivity() {
                     uiState = uiState,
                     onUpdateUiState = { newState ->
                         bleTransport.updateProfile(newState.userProfile)
+                        bleTransport.updateSafetySettings(
+                            blocked = newState.blockedPeerIds,
+                            muted = newState.mutedPeerIds
+                        )
                         uiState = newState.copy(transport = bleTransport)
                     },
                     modifier = Modifier.fillMaxSize()

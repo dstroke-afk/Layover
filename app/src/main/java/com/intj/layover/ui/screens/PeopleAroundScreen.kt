@@ -22,13 +22,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.VolumeMute
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -71,6 +74,8 @@ fun PeopleAroundScreen(
     initialSearchActive: Boolean = false,
     onConnectPeer: (String) -> Unit,
     onOpenChat: (String) -> Unit,
+    onToggleBlockPeer: (String) -> Unit,
+    onToggleMutePeer: (String) -> Unit,
     onNavigateToProfile: () -> Unit,
     onNavigateBack: () -> Unit
 ) {
@@ -83,14 +88,12 @@ fun PeopleAroundScreen(
         AboutDialog(onDismiss = { showAboutDialog = false })
     }
 
-    val filteredPeers = remember(uiState.nearbyPeers, searchQuery) {
-        if (searchQuery.isBlank()) {
-            uiState.nearbyPeers
-        } else {
-            uiState.nearbyPeers.filter {
-                it.displayName.contains(searchQuery, ignoreCase = true) ||
-                        it.handle.contains(searchQuery, ignoreCase = true)
-            }
+    val filteredPeers = remember(uiState.nearbyPeers, searchQuery, uiState.blockedPeerIds) {
+        uiState.nearbyPeers.filter { peer ->
+            val matchesQuery = searchQuery.isBlank() ||
+                    peer.displayName.contains(searchQuery, ignoreCase = true) ||
+                    peer.handle.contains(searchQuery, ignoreCase = true)
+            matchesQuery
         }
     }
 
@@ -182,7 +185,7 @@ fun PeopleAroundScreen(
                 }
             }
 
-            // Live Search Bar if searchActive
+            // Live Search Bar
             if (searchActive) {
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedTextField(
@@ -232,11 +235,15 @@ fun PeopleAroundScreen(
                 items(filteredPeers, key = { it.id }) { peer ->
                     PeerListItemCard(
                         peer = peer,
+                        isBlocked = uiState.blockedPeerIds.contains(peer.id),
+                        isMuted = uiState.mutedPeerIds.contains(peer.id),
                         onConnect = {
                             uiState.transport.sendConnectionRequest(peer.id)
                             onConnectPeer(peer.id)
                         },
-                        onChat = { onOpenChat(peer.id) }
+                        onChat = { onOpenChat(peer.id) },
+                        onToggleBlock = { onToggleBlockPeer(peer.id) },
+                        onToggleMute = { onToggleMutePeer(peer.id) }
                     )
                 }
             }
@@ -247,12 +254,20 @@ fun PeopleAroundScreen(
 @Composable
 fun PeerListItemCard(
     peer: NearbyPeer,
+    isBlocked: Boolean,
+    isMuted: Boolean,
     onConnect: () -> Unit,
-    onChat: () -> Unit
+    onChat: () -> Unit,
+    onToggleBlock: () -> Unit,
+    onToggleMute: () -> Unit
 ) {
+    var showCardMenu by remember { mutableStateOf(false) }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = ElevatedCardSurface),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isBlocked) ElevatedCardSurface.copy(alpha = 0.6f) else ElevatedCardSurface
+        ),
         shape = RoundedCornerShape(16.dp)
     ) {
         Row(
@@ -271,13 +286,17 @@ fun PeerListItemCard(
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(IncomingBubbleSurface)
-                        .border(1.5.dp, CyanPrimary, CircleShape),
+                        .border(
+                            1.5.dp,
+                            if (isBlocked) MutedText else CyanPrimary,
+                            CircleShape
+                        ),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = peer.avatar.initials,
                         fontWeight = FontWeight.Bold,
-                        color = CyanPrimary,
+                        color = if (isBlocked) MutedText else CyanPrimary,
                         fontSize = 17.sp
                     )
                 }
@@ -285,15 +304,26 @@ fun PeerListItemCard(
                 Spacer(modifier = Modifier.width(14.dp))
 
                 Column {
-                    Text(
-                        text = peer.displayName,
-                        fontWeight = FontWeight.SemiBold,
-                        color = LightText,
-                        fontSize = 16.sp
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = peer.displayName,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (isBlocked) MutedText else LightText,
+                            fontSize = 16.sp
+                        )
+                        if (isMuted) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.VolumeOff,
+                                contentDescription = "Muted",
+                                tint = MutedText,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
                     if (peer.handle.isNotEmpty()) {
                         Text(
-                            text = "@${peer.handle}",
+                            text = if (isBlocked) "[BLOCKED]" else "@${peer.handle}",
                             color = MutedText,
                             fontSize = 13.sp
                         )
@@ -303,74 +333,136 @@ fun PeerListItemCard(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            // Action Pill
-            when (peer.status) {
-                ConnectionStatus.NONE -> {
+            // Action Pill & Menu
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isBlocked) {
                     Surface(
-                        modifier = Modifier.clickable { onConnect() },
-                        color = CyanPrimary,
-                        shape = RoundedCornerShape(20.dp)
-                    ) {
-                        Text(
-                            text = "Request",
-                            color = DarkNavyBackground,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                        )
-                    }
-                }
-
-                ConnectionStatus.REQUESTED -> {
-                    Surface(
+                        modifier = Modifier.clickable { onToggleBlock() },
                         color = IncomingBubbleSurface,
                         shape = RoundedCornerShape(20.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = null,
-                                tint = MutedText,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Requested",
-                                color = MutedText,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 13.sp
-                            )
+                        Text(
+                            text = "Unblock",
+                            color = LightText,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        )
+                    }
+                } else {
+                    when (peer.status) {
+                        ConnectionStatus.NONE -> {
+                            Surface(
+                                modifier = Modifier.clickable { onConnect() },
+                                color = CyanPrimary,
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Text(
+                                    text = "Request",
+                                    color = DarkNavyBackground,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                )
+                            }
+                        }
+
+                        ConnectionStatus.REQUESTED -> {
+                            Surface(
+                                color = IncomingBubbleSurface,
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Check,
+                                        contentDescription = null,
+                                        tint = MutedText,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Requested",
+                                        color = MutedText,
+                                        fontWeight = FontWeight.Medium,
+                                        fontSize = 13.sp
+                                    )
+                                }
+                            }
+                        }
+
+                        ConnectionStatus.ACCEPTED -> {
+                            Surface(
+                                modifier = Modifier.clickable { onChat() },
+                                color = Color(0xFF10B981),
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.Chat,
+                                        contentDescription = null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Accepted",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp
+                                    )
+                                }
+                            }
                         }
                     }
                 }
 
-                ConnectionStatus.ACCEPTED -> {
-                    Surface(
-                        modifier = Modifier.clickable { onChat() },
-                        color = Color(0xFF10B981),
-                        shape = RoundedCornerShape(20.dp)
+                Box {
+                    IconButton(onClick = { showCardMenu = true }) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "Options",
+                            tint = MutedText
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = showCardMenu,
+                        onDismissRequest = { showCardMenu = false },
+                        modifier = Modifier.background(ElevatedCardSurface)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Chat,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Accepted",
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 13.sp
-                            )
-                        }
+                        DropdownMenuItem(
+                            text = { Text(if (isMuted) "Unmute Peer" else "Mute Peer", color = LightText) },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeMute else Icons.AutoMirrored.Filled.VolumeOff,
+                                    contentDescription = null,
+                                    tint = CyanAccent
+                                )
+                            },
+                            onClick = {
+                                showCardMenu = false
+                                onToggleMute()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.Block,
+                                    contentDescription = null,
+                                    tint = Color(0xFFFF5252)
+                                )
+                            },
+                            onClick = {
+                                showCardMenu = false
+                                onToggleBlock()
+                            }
+                        )
                     }
                 }
             }

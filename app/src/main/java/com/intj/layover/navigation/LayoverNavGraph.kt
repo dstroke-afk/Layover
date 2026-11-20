@@ -85,6 +85,26 @@ fun LayoverNavGraph(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController()
 ) {
+    val toggleBlockPeer = { peerId: String ->
+        val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
+        if (updatedBlocked.contains(peerId)) {
+            updatedBlocked.remove(peerId)
+        } else {
+            updatedBlocked.add(peerId)
+        }
+        onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
+    }
+
+    val toggleMutePeer = { peerId: String ->
+        val updatedMuted = uiState.mutedPeerIds.toMutableSet()
+        if (updatedMuted.contains(peerId)) {
+            updatedMuted.remove(peerId)
+        } else {
+            updatedMuted.add(peerId)
+        }
+        onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
+    }
+
     NavHost(
         navController = navController,
         startDestination = LayoverRoute.Splash.route,
@@ -129,6 +149,8 @@ fun LayoverNavGraph(
                 onOpenChat = { peerId ->
                     navController.navigate(LayoverRoute.Chat.createRoute(peerId))
                 },
+                onToggleBlockPeer = toggleBlockPeer,
+                onToggleMutePeer = toggleMutePeer,
                 onNavigateToProfile = {
                     navController.navigate(LayoverRoute.Profile.route)
                 },
@@ -157,10 +179,14 @@ fun LayoverNavGraph(
             val peerId = backStackEntry.arguments?.getString("peerId") ?: ""
             val peer = uiState.nearbyPeers.find { it.id == peerId }
             val messages = uiState.chatMessages[peerId] ?: emptyList()
+            val isBlocked = uiState.blockedPeerIds.contains(peerId)
+            val isMuted = uiState.mutedPeerIds.contains(peerId)
 
             ChatScreen(
                 peer = peer,
                 messages = messages,
+                isBlocked = isBlocked,
+                isMuted = isMuted,
                 onSendMessage = { text, replyTo ->
                     uiState.transport.sendMessage(peerId, text)
                     val newMsg = ChatMessage(
@@ -177,6 +203,8 @@ fun LayoverNavGraph(
                     updatedMap[peerId] = currentList
                     onUpdateUiState(uiState.copy(chatMessages = updatedMap))
                 },
+                onToggleBlockPeer = toggleBlockPeer,
+                onToggleMutePeer = toggleMutePeer,
                 onNavigateBack = {
                     navController.popBackStack()
                 }
