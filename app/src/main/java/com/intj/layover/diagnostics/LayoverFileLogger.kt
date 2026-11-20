@@ -11,12 +11,14 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 
 object LayoverFileLogger {
     private const val TAG = "LayoverBLE"
-    private const val MAX_LOG_ENTRIES = 200
+    private const val MAX_LOG_ENTRIES = 500
     private val logBuffer = ConcurrentLinkedQueue<String>()
+    private val throttleMap = ConcurrentHashMap<String, Long>()
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
     fun log(message: String) {
@@ -26,6 +28,15 @@ object LayoverFileLogger {
         logBuffer.add(entry)
         while (logBuffer.size > MAX_LOG_ENTRIES) {
             logBuffer.poll()
+        }
+    }
+
+    fun logThrottled(key: String, message: String, windowMs: Long = 3000L) {
+        val now = System.currentTimeMillis()
+        val lastTime = throttleMap[key] ?: 0L
+        if (now - lastTime >= windowMs) {
+            throttleMap[key] = now
+            log(message)
         }
     }
 

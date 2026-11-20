@@ -5,9 +5,9 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.util.Base64
-import android.util.Log
 import com.intj.layover.crypto.EncryptedPayload
 import com.intj.layover.crypto.SessionCryptoManager
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.diagnostics.SessionDiagnosticsTracker
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
@@ -35,10 +35,6 @@ class BleProximityTransport(
     private val rfcommSessionManager: RfcommSessionManager,
     private var currentUserProfile: UserProfile = UserProfile()
 ) : ProximityTransport {
-
-    companion object {
-        private const val TAG = "LayoverBLE"
-    }
 
     private val scope = CoroutineScope(Dispatchers.Default + Job())
 
@@ -71,7 +67,7 @@ class BleProximityTransport(
         // Handle RFCOMM connection lifecycle and E2EE key exchange
         scope.launch {
             rfcommSessionManager.connectionState.collect { state ->
-                Log.d(TAG, "RFCOMM state changed: ${state.name}")
+                LayoverFileLogger.log("RFCOMM state changed: ${state.name}")
                 diagnosticsTracker.updateRfcommStateLabel(state.name)
                 if (state == RfcommConnectionState.CONNECTED) {
                     initiateE2eeHandshake()
@@ -79,6 +75,9 @@ class BleProximityTransport(
                     sessionCryptoManager.clearSession()
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
+                    if (state == RfcommConnectionState.FAILED) {
+                        diagnosticsTracker.updateLastErrorMessage("RFCOMM connection failed")
+                    }
                 }
             }
         }
@@ -90,7 +89,7 @@ class BleProximityTransport(
 
                 // Block enforcement
                 if (blockedPeerIds.contains(currentPeer)) {
-                    Log.d(TAG, "Dropping frame from blocked peer: $currentPeer")
+                    LayoverFileLogger.log("Dropping frame from blocked peer: $currentPeer")
                     diagnosticsTracker.incrementBlockedDrops()
                     rfcommSessionManager.disconnect()
                     sessionCryptoManager.clearSession()
@@ -101,21 +100,21 @@ class BleProximityTransport(
 
                 // Rate limiting enforcement
                 if (!rateLimiter.allowMessage(currentPeer)) {
-                    Log.d(TAG, "Dropping rate-limited frame from peer: $currentPeer")
+                    LayoverFileLogger.log("Dropping rate-limited frame from peer: $currentPeer")
                     diagnosticsTracker.incrementRateLimitedDrops()
                     return@collect
                 }
 
                 val frame = WireFrameCodec.decodeFrame(rawFrame.text)
                 if (frame == null) {
-                    Log.e(TAG, "Failed to decode incoming wire frame payload.")
+                    LayoverFileLogger.logError("Failed to decode incoming wire frame payload.")
                     diagnosticsTracker.updateLastErrorMessage("Failed to decode wire frame")
                     return@collect
                 }
 
                 when (frame) {
                     is WireFrame.KeyExchange -> {
-                        Log.d(TAG, "Received KeyExchange frame from ${frame.senderId}. Algorithm=${frame.algorithm}")
+                        LayoverFileLogger.log("Received KeyExchange frame from ${frame.senderId}. Algorithm=${frame.algorithm}")
                         val success = sessionCryptoManager.establishRemoteKey(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
@@ -124,7 +123,7 @@ class BleProximityTransport(
                         diagnosticsTracker.updateKeyHandshakeComplete(isEstablished)
                         diagnosticsTracker.updateSessionFingerprint(sessionCryptoManager.sessionFingerprint)
                         if (!success) {
-                            Log.e(TAG, "Key exchange establishment failed.")
+                            LayoverFileLogger.logError("Key exchange establishment failed.")
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
                         }
                     }
@@ -148,7 +147,7 @@ class BleProximityTransport(
                         )
 
                         if (decryptedText != null) {
-                            Log.d(TAG, "Successfully decrypted chat message from $currentPeer")
+                            LayoverFileLogger.log("Successfully decrypted chat message from $currentPeer")
                             diagnosticsTracker.incrementMessagesReceived()
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
@@ -159,7 +158,7 @@ class BleProximityTransport(
                             )
                             _incomingMessagesFlow.emit(Pair(currentPeer, newMsg))
                         } else {
-                            Log.e(TAG, "Failed to decrypt incoming chat message from $currentPeer")
+                            LayoverFileLogger.logError("Failed to decrypt incoming chat message from $currentPeer")
                             diagnosticsTracker.updateLastErrorMessage("Failed to decrypt chat message")
                         }
                     }
@@ -182,7 +181,7 @@ class BleProximityTransport(
     }
 
     private fun initiateE2eeHandshake() {
-        Log.d(TAG, "Initiating E2EE key exchange handshake...")
+        LayoverFileLogger.log("Initiating E2EE key exchange handshake...")
         val pubKeyB64 = sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
         val localId = currentUserProfile.handle.ifEmpty { "local" }
@@ -205,14 +204,14 @@ class BleProximityTransport(
     }
 
     override fun startDiscovery(visible: Boolean) {
-        Log.d(TAG, "startDiscovery requested. visible=$visible")
+        LayoverFileLogger.log("startDiscovery requested. visible=$visible")
         bleStateController.refreshPermissionAndAdapterState()
         val hasPerms = BlePermissionHelper.hasAllRequiredPermissions(context)
         val isEnabled = bluetoothAdapter?.isEnabled == true
 
         if (!hasPerms) {
             val err = "Required Bluetooth permissions are missing"
-            Log.e(TAG, "startDiscovery failed: $err")
+            LayoverFileLogger.logError("startDiscovery failed: $err")
             diagnosticsTracker.updateLastErrorMessage(err)
             onMissingPermissions?.invoke()
             return
@@ -220,15 +219,13 @@ class BleProximityTransport(
 
         if (!isEnabled) {
             val err = "Bluetooth is turned off"
-            Log.e(TAG, "startDiscovery failed: $err")
+            LayoverFileLogger.logError("startDiscovery failed: $err")
             diagnosticsTracker.updateLastErrorMessage(err)
             return
         }
 
-        // Scanner starts whenever discovery is requested (even if visible == false)
         discoveryManager.startScanning()
 
-        // Advertiser starts only when visible == true
         if (visible) {
             discoveryManager.startAdvertising(currentUserProfile.copy(isVisibleToNearby = true))
         } else {
@@ -237,13 +234,13 @@ class BleProximityTransport(
     }
 
     override fun stopDiscovery() {
-        Log.d(TAG, "stopDiscovery requested.")
+        LayoverFileLogger.log("stopDiscovery requested.")
         discoveryManager.stopScanning()
         discoveryManager.stopAdvertising()
     }
 
     override fun sendConnectionRequest(peerId: String) {
-        Log.d(TAG, "sendConnectionRequest to peerId=$peerId")
+        LayoverFileLogger.log("sendConnectionRequest to peerId=$peerId")
         if (blockedPeerIds.contains(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
@@ -253,7 +250,7 @@ class BleProximityTransport(
 
         val localId = currentUserProfile.handle.ifEmpty { "local" }
         val role = ConnectionTieBreaker.determineRole(localId, peerId)
-        Log.d(TAG, "Tie-breaker role determined for request: $role")
+        LayoverFileLogger.log("Tie-breaker role determined for request ($localId vs $peerId): $role")
 
         if (role == ConnectionRole.LISTENER) {
             rfcommSessionManager.startServer()
@@ -263,7 +260,7 @@ class BleProximityTransport(
     }
 
     override fun acceptConnectionRequest(peerId: String) {
-        Log.d(TAG, "acceptConnectionRequest for peerId=$peerId")
+        LayoverFileLogger.log("acceptConnectionRequest for peerId=$peerId")
         if (blockedPeerIds.contains(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
@@ -273,7 +270,7 @@ class BleProximityTransport(
 
         val localId = currentUserProfile.handle.ifEmpty { "local" }
         val role = ConnectionTieBreaker.determineRole(localId, peerId)
-        Log.d(TAG, "Tie-breaker role determined for accept: $role")
+        LayoverFileLogger.log("Tie-breaker role determined for accept ($localId vs $peerId): $role")
 
         if (role == ConnectionRole.INITIATOR) {
             connectRfcommDevice(peerId)
@@ -285,26 +282,37 @@ class BleProximityTransport(
     @SuppressLint("MissingPermission")
     private fun connectRfcommDevice(peerId: String) {
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-            Log.e(TAG, "Cannot connect RFCOMM device: permissions missing.")
+            LayoverFileLogger.logError("Cannot connect RFCOMM device: permissions missing.")
             return
         }
-        val adapter = bluetoothAdapter ?: return
-        val device = try {
-            adapter.getRemoteDevice(peerId)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get remote device for MAC/peerId=$peerId", e)
-            null
+        val adapter = bluetoothAdapter
+        if (adapter == null) {
+            rfcommSessionManager.startServer()
+            return
         }
 
-        if (device != null) {
-            rfcommSessionManager.connectToDevice(device)
+        val isMacAddress = BluetoothAdapter.checkBluetoothAddress(peerId)
+        if (isMacAddress) {
+            val device = try {
+                adapter.getRemoteDevice(peerId)
+            } catch (e: Exception) {
+                LayoverFileLogger.logError("Failed to get remote device for MAC=$peerId", e)
+                null
+            }
+
+            if (device != null) {
+                rfcommSessionManager.connectToDevice(device)
+            } else {
+                rfcommSessionManager.startServer()
+            }
         } else {
+            LayoverFileLogger.log("PeerId $peerId is not a MAC address string. Falling back to RFCOMM Server Listener.")
             rfcommSessionManager.startServer()
         }
     }
 
     override fun sendMessage(peerId: String, text: String) {
-        Log.d(TAG, "sendMessage to peerId=$peerId")
+        LayoverFileLogger.log("sendMessage to peerId=$peerId")
         if (blockedPeerIds.contains(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
             return

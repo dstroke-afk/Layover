@@ -317,7 +317,7 @@ class BleDiscoveryManager(
         )
 
         _discoveredPeers.value = peerMap.values.map { it.peer }
-        LayoverFileLogger.log("BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
+        LayoverFileLogger.logThrottled("scan_$macAddress", "BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
     }
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {

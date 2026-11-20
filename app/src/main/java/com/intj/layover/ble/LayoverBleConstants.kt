@@ -7,7 +7,7 @@ object LayoverBleConstants {
     val LAYOVER_SERVICE_UUID: ParcelUuid = ParcelUuid.fromString(LAYOVER_SERVICE_UUID_STRING)
 
     const val PEER_STALE_TIMEOUT_MS = 60_000L
-    const val MAX_NAME_BYTE_LENGTH = 12
+    const val MAX_NAME_BYTE_LENGTH = 8
 }
 
 object LayoverBlePayloadEncoder {
@@ -23,27 +23,41 @@ object LayoverBlePayloadEncoder {
 
         val cleanPeerId = peerId.ifEmpty { "node_${System.currentTimeMillis() % 10000}" }
         val peerIdBytes = cleanPeerId.toByteArray(Charsets.UTF_8)
-        val paddedIdBytes = ByteArray(6)
-        val idCopyLen = peerIdBytes.size.coerceAtMost(6)
-        System.arraycopy(peerIdBytes, 0, paddedIdBytes, 0, idCopyLen)
+        val shortIdBytes = ByteArray(4)
+        val idCopyLen = peerIdBytes.size.coerceAtMost(4)
+        System.arraycopy(peerIdBytes, 0, shortIdBytes, 0, idCopyLen)
 
-        val payload = ByteArray(1 + 6)
+        val nameBytes = displayName.toByteArray(Charsets.UTF_8)
+        var nameLen = nameBytes.size.coerceAtMost(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
+        while (nameLen > 0 && (nameBytes[nameLen - 1].toInt() and 0xC0) == 0x80) {
+            nameLen--
+        }
+
+        val payload = ByteArray(1 + 4 + nameLen)
         payload[0] = flags
-        System.arraycopy(paddedIdBytes, 0, payload, 1, 6)
+        System.arraycopy(shortIdBytes, 0, payload, 1, 4)
+        if (nameLen > 0) {
+            System.arraycopy(nameBytes, 0, payload, 5, nameLen)
+        }
         return payload
     }
 
     fun decodePayload(data: ByteArray?): DecodedPayload? {
-        if (data == null || data.size < 7) return null
+        if (data == null || data.size < 5) return null
         val isVisible = (data[0].toInt() and 0x01) != 0
-        val rawPeerId = String(data, 1, 6, Charsets.UTF_8).trim('\u0000', ' ')
+        val rawPeerId = String(data, 1, 4, Charsets.UTF_8).trim('\u0000', ' ')
         val peerId = if (rawPeerId.isNotBlank()) rawPeerId else "unknown"
 
-        val displayName = "Layover Peer (${peerId.takeLast(4)})"
+        val nameLen = data.size - 5
+        val rawName = if (nameLen > 0) {
+            String(data, 5, nameLen, Charsets.UTF_8).trim('\u0000', ' ')
+        } else {
+            ""
+        }
 
         return DecodedPayload(
             peerId = peerId,
-            displayName = displayName,
+            displayName = rawName,
             isVisible = isVisible
         )
     }
