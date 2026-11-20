@@ -96,10 +96,9 @@ fun PeopleAroundScreen(
 
     val filteredPeers = remember(uiState.nearbyPeers, searchQuery, uiState.blockedPeerIds) {
         uiState.nearbyPeers.filter { peer ->
-            val matchesQuery = searchQuery.isBlank() ||
+            searchQuery.isBlank() ||
                     peer.displayName.contains(searchQuery, ignoreCase = true) ||
-                    peer.handle.contains(searchQuery, ignoreCase = true)
-            matchesQuery
+                    (peer.handle.isNotEmpty() && peer.handle.contains(searchQuery, ignoreCase = true))
         }
     }
 
@@ -341,9 +340,15 @@ fun PeerListItemCard(
                             )
                         }
                     }
-                    if (peer.handle.isNotEmpty()) {
+                    if (isBlocked) {
                         Text(
-                            text = if (isBlocked) "[BLOCKED]" else "@${peer.handle}",
+                            text = "[BLOCKED]",
+                            color = MutedText,
+                            fontSize = 13.sp
+                        )
+                    } else if (peer.handle.isNotEmpty()) {
+                        Text(
+                            text = "@${peer.handle}",
                             color = MutedText,
                             fontSize = 13.sp
                         )
