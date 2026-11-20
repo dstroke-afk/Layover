@@ -10,7 +10,6 @@ import com.intj.layover.crypto.SessionCryptoManager
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.diagnostics.SessionDiagnosticsTracker
 import com.intj.layover.model.ChatMessage
-import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.ProximityTransport
 import com.intj.layover.model.UserProfile
 import com.intj.layover.p2p.RfcommConnectionState
@@ -51,6 +50,15 @@ class BleProximityTransport(
 
     private val _incomingMessagesFlow = MutableSharedFlow<Pair<String, ChatMessage>>()
     val incomingMessagesFlow: SharedFlow<Pair<String, ChatMessage>> = _incomingMessagesFlow.asSharedFlow()
+
+    private val _incomingConnectionRequestFlow = MutableSharedFlow<Pair<String, String>>()
+    val incomingConnectionRequestFlow: SharedFlow<Pair<String, String>> = _incomingConnectionRequestFlow.asSharedFlow()
+
+    private val _incomingConnectionAcceptFlow = MutableSharedFlow<String>()
+    val incomingConnectionAcceptFlow: SharedFlow<String> = _incomingConnectionAcceptFlow.asSharedFlow()
+
+    private val _incomingConnectionDeclineFlow = MutableSharedFlow<String>()
+    val incomingConnectionDeclineFlow: SharedFlow<String> = _incomingConnectionDeclineFlow.asSharedFlow()
 
     private var activePeerId: String? = null
 
@@ -122,20 +130,49 @@ class BleProximityTransport(
                 when (frame) {
                     is WireFrame.KeyExchange -> {
                         LayoverFileLogger.log("Received KeyExchange frame from ${frame.senderId}. Algorithm=${frame.algorithm}")
+                        if (sessionCryptoManager.getLocalPublicKeyBase64() == null) {
+                            sessionCryptoManager.generateKeyPair()
+                        }
                         val success = sessionCryptoManager.establishRemoteKey(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
                         )
+                        if (success && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
+                            val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
+                            val localId = currentUserProfile.handle.ifEmpty { "local" }
+                            val responsePayload = WireFrameCodec.encodeKeyExchange(
+                                senderId = localId,
+                                publicKeyBase64 = localPub,
+                                algorithm = sessionCryptoManager.getAlgorithmName()
+                            )
+                            gattSessionManager.sendFrame(responsePayload)
+                        }
+
                         val isEstablished = sessionCryptoManager.isSessionKeyEstablished
                         diagnosticsTracker.updateKeyHandshakeComplete(isEstablished)
                         diagnosticsTracker.updateSessionFingerprint(sessionCryptoManager.sessionFingerprint)
-                        if (!success) {
+                        if (isEstablished) {
+                            LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed successfully. Fingerprint=${sessionCryptoManager.sessionFingerprint}")
+                            diagnosticsTracker.updateLastErrorMessage(null)
+                        } else {
                             LayoverFileLogger.logError("Key exchange establishment failed.")
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
-                        } else {
-                            LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed via BLE GATT.")
-                            diagnosticsTracker.updateLastErrorMessage(null)
                         }
+                    }
+
+                    is WireFrame.ConnectionRequest -> {
+                        LayoverFileLogger.log("Received ConnectionRequest from ${frame.senderId} (${frame.displayName})")
+                        _incomingConnectionRequestFlow.emit(Pair(frame.senderId, frame.displayName))
+                    }
+
+                    is WireFrame.ConnectionAccept -> {
+                        LayoverFileLogger.log("Received ConnectionAccept from ${frame.senderId}")
+                        _incomingConnectionAcceptFlow.emit(frame.senderId)
+                    }
+
+                    is WireFrame.ConnectionDecline -> {
+                        LayoverFileLogger.log("Received ConnectionDecline from ${frame.senderId}")
+                        _incomingConnectionDeclineFlow.emit(frame.senderId)
                     }
 
                     is WireFrame.ChatEncrypted -> {
@@ -159,6 +196,7 @@ class BleProximityTransport(
                         if (decryptedText != null) {
                             LayoverFileLogger.log("Successfully decrypted chat message from $currentPeer")
                             diagnosticsTracker.incrementMessagesReceived()
+                            diagnosticsTracker.updateLastErrorMessage(null)
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
                                 senderId = currentPeer,
@@ -265,10 +303,15 @@ class BleProximityTransport(
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
-        discoveryManager.updatePeerStatus(peerId, ConnectionStatus.REQUESTED)
         activePeerId = peerId
-
         connectGattDevice(peerId)
+
+        val localName = currentUserProfile.displayName.ifEmpty { "Layover User" }
+        val reqFrame = WireFrameCodec.encodeConnectionRequest(
+            senderId = currentUserProfile.handle.ifEmpty { "user" },
+            displayName = localName
+        )
+        gattSessionManager.sendFrame(reqFrame)
     }
 
     override fun acceptConnectionRequest(peerId: String) {
@@ -277,10 +320,21 @@ class BleProximityTransport(
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
-        discoveryManager.updatePeerStatus(peerId, ConnectionStatus.ACCEPTED)
         activePeerId = peerId
-
         connectGattDevice(peerId)
+
+        val acceptFrame = WireFrameCodec.encodeConnectionAccept(
+            senderId = currentUserProfile.handle.ifEmpty { "user" }
+        )
+        gattSessionManager.sendFrame(acceptFrame)
+    }
+
+    override fun declineConnectionRequest(peerId: String) {
+        LayoverFileLogger.log("declineConnectionRequest for peerId=$peerId")
+        val declineFrame = WireFrameCodec.encodeConnectionDecline(
+            senderId = currentUserProfile.handle.ifEmpty { "user" }
+        )
+        gattSessionManager.sendFrame(declineFrame)
     }
 
     @SuppressLint("MissingPermission")

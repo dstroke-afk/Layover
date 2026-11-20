@@ -9,6 +9,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -29,7 +32,9 @@ import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverNavGraph
+import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.ui.theme.LayoverTheme
+import kotlinx.coroutines.flow.collectLatest
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -73,12 +78,15 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            var incomingRequestPeer by remember { mutableStateOf<Pair<String, String>?>(null) } // peerId, displayName
+            var acceptedRequestPeer by remember { mutableStateOf<String?>(null) } // peerId
+
             // Sync live diagnostics state into uiState
             LaunchedEffect(diagnostics) {
                 uiState = uiState.copy(diagnostics = diagnostics)
             }
 
-            // Sync live discovered BLE peers into uiState and preserve local connection status (REQUESTED / ACCEPTED)
+            // Sync live discovered BLE peers into uiState and preserve local connection status
             LaunchedEffect(liveDiscoveredPeers) {
                 val existingMap = uiState.nearbyPeers.associateBy { it.id }
                 val merged = liveDiscoveredPeers.map { discovered ->
@@ -94,14 +102,57 @@ class MainActivity : ComponentActivity() {
                 Log.d(TAG, "UI State updated with ${merged.size} real BLE discovered peers.")
             }
 
-            // Collect incoming P2P GATT messages and append to chat state
+            // Collect incoming P2P GATT messages and store under both raw peerId and mapped peer entries
             LaunchedEffect(Unit) {
                 bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
                     val updatedMap = uiState.chatMessages.toMutableMap()
-                    val currentList = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
-                    currentList.add(message)
-                    updatedMap[peerId] = currentList
+                    val list1 = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
+                    if (!list1.any { it.id == message.id }) {
+                        list1.add(message)
+                        updatedMap[peerId] = list1
+                    }
+
+                    uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }?.let { peer ->
+                        val list2 = updatedMap[peer.id]?.toMutableList() ?: mutableListOf()
+                        if (!list2.any { it.id == message.id }) {
+                            list2.add(message)
+                            updatedMap[peer.id] = list2
+                        }
+                    }
+
                     uiState = uiState.copy(chatMessages = updatedMap)
+                }
+            }
+
+            // Collect incoming connection requests
+            LaunchedEffect(Unit) {
+                bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
+                    incomingRequestPeer = Pair(peerId, displayName)
+                    val updatedPeers = uiState.nearbyPeers.map { p ->
+                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.REQUESTED) else p
+                    }
+                    uiState = uiState.copy(nearbyPeers = updatedPeers)
+                }
+            }
+
+            // Collect incoming connection accepts
+            LaunchedEffect(Unit) {
+                bleTransport.incomingConnectionAcceptFlow.collectLatest { peerId ->
+                    acceptedRequestPeer = peerId
+                    val updatedPeers = uiState.nearbyPeers.map { p ->
+                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                    }
+                    uiState = uiState.copy(nearbyPeers = updatedPeers)
+                }
+            }
+
+            // Collect incoming connection declines
+            LaunchedEffect(Unit) {
+                bleTransport.incomingConnectionDeclineFlow.collectLatest { peerId ->
+                    val updatedPeers = uiState.nearbyPeers.map { p ->
+                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.DECLINED) else p
+                    }
+                    uiState = uiState.copy(nearbyPeers = updatedPeers)
                 }
             }
 
@@ -154,7 +205,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Lifecycle awareness: check permissions on ON_START / ON_RESUME, stop scanning on ON_STOP
+            // Lifecycle awareness
             DisposableEffect(lifecycleOwner) {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
@@ -182,6 +233,72 @@ class MainActivity : ComponentActivity() {
             }
 
             LayoverTheme {
+                val navController = androidx.navigation.compose.rememberNavController()
+
+                // Incoming Connection Request Dialog
+                incomingRequestPeer?.let { (peerId, displayName) ->
+                    AlertDialog(
+                        onDismissRequest = { incomingRequestPeer = null },
+                        title = { Text("Connection Request") },
+                        text = { Text("$displayName would like to connect with you.") },
+                        confirmButton = {
+                            Button(onClick = {
+                                incomingRequestPeer = null
+                                bleTransport.acceptConnectionRequest(peerId)
+                                val updatedPeers = uiState.nearbyPeers.map { p ->
+                                    if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                                }
+                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                                navController.navigate(LayoverRoute.Chat.createRoute(peerId))
+                            }) {
+                                Text("Accept")
+                            }
+                        },
+                        dismissButton = {
+                            Button(onClick = {
+                                incomingRequestPeer = null
+                                bleTransport.declineConnectionRequest(peerId)
+                                val updatedPeers = uiState.nearbyPeers.map { p ->
+                                    if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.DECLINED) else p
+                                }
+                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                            }) {
+                                Text("Decline")
+                            }
+                        }
+                    )
+                }
+
+                // Incoming Connection Accepted Dialog
+                acceptedRequestPeer?.let { peerId ->
+                    val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+                    val name = peer?.displayName ?: "Peer"
+                    AlertDialog(
+                        onDismissRequest = { acceptedRequestPeer = null },
+                        title = { Text("Request Accepted") },
+                        text = { Text("$name accepted your connection request!") },
+                        confirmButton = {
+                            Button(onClick = {
+                                acceptedRequestPeer = null
+                                navController.navigate(LayoverRoute.Chat.createRoute(peerId))
+                            }) {
+                                Text("Message")
+                            }
+                        },
+                        dismissButton = {
+                            Button(onClick = {
+                                acceptedRequestPeer = null
+                                val updatedPeers = uiState.nearbyPeers.map { p ->
+                                    if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                                }
+                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                            }) {
+                                Text("Close")
+                            }
+                        }
+                    )
+                }
+
                 LayoverNavGraph(
                     uiState = uiState,
                     onUpdateUiState = { newState ->
@@ -205,7 +322,8 @@ class MainActivity : ComponentActivity() {
                             diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
                         )
                     },
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    navController = navController
                 )
             }
         }

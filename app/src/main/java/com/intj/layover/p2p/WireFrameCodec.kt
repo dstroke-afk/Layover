@@ -10,6 +10,19 @@ sealed class WireFrame {
         val algorithm: String
     ) : WireFrame()
 
+    data class ConnectionRequest(
+        val senderId: String,
+        val displayName: String
+    ) : WireFrame()
+
+    data class ConnectionAccept(
+        val senderId: String
+    ) : WireFrame()
+
+    data class ConnectionDecline(
+        val senderId: String
+    ) : WireFrame()
+
     data class ChatEncrypted(
         val msgId: String,
         val senderId: String,
@@ -23,6 +36,18 @@ object WireFrameCodec {
 
     fun encodeKeyExchange(senderId: String, publicKeyBase64: String, algorithm: String): String {
         return "KEY_EXCHANGE|$senderId|$publicKeyBase64|$algorithm"
+    }
+
+    fun encodeConnectionRequest(senderId: String, displayName: String): String {
+        return "CONNECTION_REQUEST|$senderId|$displayName"
+    }
+
+    fun encodeConnectionAccept(senderId: String): String {
+        return "CONNECTION_ACCEPT|$senderId"
+    }
+
+    fun encodeConnectionDecline(senderId: String): String {
+        return "CONNECTION_DECLINE|$senderId"
     }
 
     fun encodeChatEncrypted(
@@ -47,6 +72,31 @@ object WireFrameCodec {
                         senderId = parts[1],
                         publicKeyBase64 = parts[2],
                         algorithm = parts[3]
+                    )
+                } else null
+            }
+
+            "CONNECTION_REQUEST" -> {
+                if (parts.size >= 3) {
+                    WireFrame.ConnectionRequest(
+                        senderId = parts[1],
+                        displayName = parts[2]
+                    )
+                } else null
+            }
+
+            "CONNECTION_ACCEPT" -> {
+                if (parts.size >= 2) {
+                    WireFrame.ConnectionAccept(
+                        senderId = parts[1]
+                    )
+                } else null
+            }
+
+            "CONNECTION_DECLINE" -> {
+                if (parts.size >= 2) {
+                    WireFrame.ConnectionDecline(
+                        senderId = parts[1]
                     )
                 } else null
             }

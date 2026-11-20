@@ -443,6 +443,20 @@ fun PeerListItemCard(
                                 }
                             }
                         }
+
+                        ConnectionStatus.DECLINED -> {
+                            Surface(
+                                color = IncomingBubbleSurface,
+                                shape = RoundedCornerShape(20.dp)
+                            ) {
+                                Text(
+                                    text = "Declined",
+                                    color = MutedText,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
                     }
                 }
 

@@ -10,6 +10,7 @@ interface ProximityTransport {
     fun stopDiscovery()
     fun sendConnectionRequest(peerId: String)
     fun acceptConnectionRequest(peerId: String)
+    fun declineConnectionRequest(peerId: String) {}
     fun sendMessage(peerId: String, text: String)
     fun resetDiagnosticsCounters() {}
 }
@@ -22,13 +23,15 @@ class NoOpProximityTransport : ProximityTransport {
     override fun stopDiscovery() {}
     override fun sendConnectionRequest(peerId: String) {}
     override fun acceptConnectionRequest(peerId: String) {}
+    override fun declineConnectionRequest(peerId: String) {}
     override fun sendMessage(peerId: String, text: String) {}
 }
 
 enum class ConnectionStatus {
     NONE,
     REQUESTED,
-    ACCEPTED
+    ACCEPTED,
+    DECLINED
 }
 
 data class PeerAvatar(
@@ -104,25 +107,21 @@ val SampleMockPeers = listOf(
     NearbyPeer(
         id = "peer_1",
         displayName = "Alex Rivera",
-        handle = "arivera",
         status = ConnectionStatus.ACCEPTED
     ),
     NearbyPeer(
         id = "peer_2",
         displayName = "Sarah Chen",
-        handle = "sarahc",
         status = ConnectionStatus.REQUESTED
     ),
     NearbyPeer(
         id = "peer_3",
         displayName = "David Kim",
-        handle = "dkim",
         status = ConnectionStatus.NONE
     ),
     NearbyPeer(
         id = "peer_4",
         displayName = "Elena Rostova",
-        handle = "elena_r",
         status = ConnectionStatus.ACCEPTED
     )
 )

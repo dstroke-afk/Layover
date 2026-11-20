@@ -199,6 +199,8 @@ class GattSessionManager(
         connectedDevice = device
         isServerRole = false
 
+        var serviceDiscoveryRetryCount = 0
+
         val clientCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
@@ -217,18 +219,27 @@ class GattSessionManager(
                 if (status == BluetoothGatt.GATT_SUCCESS && gatt != null) {
                     val service = gatt.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: gatt.getService(LAYOVER_GATT_SERVICE_UUID)
                     if (service == null) {
-                        LayoverFileLogger.logError("GATT Services discovered but Layover service not visible yet. Retrying discoverServices in 300ms...")
-                        scope.launch {
-                            delay(300)
-                            gatt.discoverServices()
+                        serviceDiscoveryRetryCount++
+                        if (serviceDiscoveryRetryCount <= 2) {
+                            LayoverFileLogger.logError("GATT Services discovered but Layover service not visible (attempt $serviceDiscoveryRetryCount). Retrying in 400ms...")
+                            scope.launch {
+                                delay(400)
+                                gatt.discoverServices()
+                            }
+                            return
+                        } else {
+                            LayoverFileLogger.logError("GATT Services discovery failed: Layover service not found after retries.")
+                            setConnectionState(RfcommConnectionState.FAILED, "Layover service not found")
+                            return
                         }
-                        return
                     }
+                    serviceDiscoveryRetryCount = 0
                     val rxChar = service.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) }
                     val txChar = service.characteristics?.find { it.uuid.equals(LAYOVER_TX_CHAR_UUID) }
                     LayoverFileLogger.log("GATT Services discovered successfully. Service found: true, RX found: ${rxChar != null}, TX found: ${txChar != null}")
                     gatt.requestMtu(512)
                 } else {
+                    serviceDiscoveryRetryCount = 0
                     LayoverFileLogger.logError("GATT Services discovery failed with status: $status")
                     setConnectionState(RfcommConnectionState.FAILED, "Services discovery status $status")
                 }
