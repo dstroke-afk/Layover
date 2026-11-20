@@ -141,12 +141,16 @@ fun LayoverNavGraph(
                 uiState = uiState,
                 initialSearchActive = uiState.isSearchActive,
                 onConnectPeer = { peerId ->
+                    uiState.transport.sendConnectionRequest(peerId)
+                    uiState.transport.acceptConnectionRequest(peerId)
                     val updatedPeers = uiState.nearbyPeers.map { peer ->
-                        if (peer.id == peerId) peer.copy(status = ConnectionStatus.REQUESTED) else peer
+                        if (peer.id == peerId) peer.copy(status = ConnectionStatus.ACCEPTED) else peer
                     }
                     onUpdateUiState(uiState.copy(nearbyPeers = updatedPeers))
+                    navController.navigate(LayoverRoute.Chat.createRoute(peerId))
                 },
                 onOpenChat = { peerId ->
+                    uiState.transport.acceptConnectionRequest(peerId)
                     navController.navigate(LayoverRoute.Chat.createRoute(peerId))
                 },
                 onToggleBlockPeer = toggleBlockPeer,
