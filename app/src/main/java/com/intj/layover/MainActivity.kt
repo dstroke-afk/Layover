@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
                 mutableStateOf(
                     LayoverUiState(
                         nearbyPeers = emptyList(),
+                        isScanning = true, // Auto-start discovery by default on launch
                         transport = bleTransport,
                         diagnostics = diagnostics
                     )
@@ -112,9 +113,7 @@ class MainActivity : ComponentActivity() {
                 bleStateController.refreshPermissionAndAdapterState()
                 if (allGranted) {
                     Log.d(TAG, "Permissions granted via system dialog.")
-                    if (uiState.isScanning) {
-                        bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
-                    }
+                    bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
                 } else {
                     Log.e(TAG, "Permissions rejected by user.")
                     Toast.makeText(
@@ -131,7 +130,7 @@ class MainActivity : ComponentActivity() {
                 permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
             }
 
-            // Check permissions when scanning starts
+            // Check permissions when scanning starts / uiState changes
             LaunchedEffect(uiState.isScanning) {
                 if (uiState.isScanning) {
                     if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
@@ -168,7 +167,7 @@ class MainActivity : ComponentActivity() {
                             if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
                                 Log.d(TAG, "Lifecycle $event: Missing permissions detected. Launching prompt.")
                                 permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
-                            } else if (uiState.isScanning) {
+                            } else {
                                 bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
                             }
                         }

@@ -13,7 +13,6 @@ import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.ProximityTransport
 import com.intj.layover.model.UserProfile
-import com.intj.layover.p2p.ConnectionRole
 import com.intj.layover.p2p.ConnectionTieBreaker
 import com.intj.layover.p2p.RfcommConnectionState
 import com.intj.layover.p2p.RfcommSessionManager
@@ -57,6 +56,10 @@ class BleProximityTransport(
 
     private var activePeerId: String? = null
 
+    // Debounce tracking for startDiscovery
+    private var lastDiscoveryStartMs = 0L
+    private var lastDiscoveryVisible = !currentUserProfile.isVisibleToNearby
+
     val isE2eeEstablished: Boolean
         get() = sessionCryptoManager.isSessionKeyEstablished
 
@@ -64,6 +67,9 @@ class BleProximityTransport(
         get() = sessionCryptoManager.sessionFingerprint
 
     init {
+        // Always keep RFCOMM server listener running in the background
+        rfcommSessionManager.startServerLoop()
+
         // Handle RFCOMM connection lifecycle and E2EE key exchange
         scope.launch {
             rfcommSessionManager.connectionState.collect { state ->
@@ -204,6 +210,14 @@ class BleProximityTransport(
     }
 
     override fun startDiscovery(visible: Boolean) {
+        val now = System.currentTimeMillis()
+        if (now - lastDiscoveryStartMs < 1000L && lastDiscoveryVisible == visible) {
+            LayoverFileLogger.log("Debouncing duplicate startDiscovery(visible=$visible) call within 1s.")
+            return
+        }
+        lastDiscoveryStartMs = now
+        lastDiscoveryVisible = visible
+
         LayoverFileLogger.log("startDiscovery requested. visible=$visible")
         bleStateController.refreshPermissionAndAdapterState()
         val hasPerms = BlePermissionHelper.hasAllRequiredPermissions(context)
@@ -252,11 +266,7 @@ class BleProximityTransport(
         val role = ConnectionTieBreaker.determineRole(localId, peerId)
         LayoverFileLogger.log("Tie-breaker role determined for request ($localId vs $peerId): $role")
 
-        if (role == ConnectionRole.LISTENER) {
-            rfcommSessionManager.startServer()
-        } else {
-            connectRfcommDevice(peerId)
-        }
+        connectRfcommDevice(peerId)
     }
 
     override fun acceptConnectionRequest(peerId: String) {
@@ -272,11 +282,7 @@ class BleProximityTransport(
         val role = ConnectionTieBreaker.determineRole(localId, peerId)
         LayoverFileLogger.log("Tie-breaker role determined for accept ($localId vs $peerId): $role")
 
-        if (role == ConnectionRole.INITIATOR) {
-            connectRfcommDevice(peerId)
-        } else {
-            rfcommSessionManager.startServer()
-        }
+        connectRfcommDevice(peerId)
     }
 
     @SuppressLint("MissingPermission")
@@ -287,7 +293,14 @@ class BleProximityTransport(
         }
         val adapter = bluetoothAdapter
         if (adapter == null) {
-            rfcommSessionManager.startServer()
+            rfcommSessionManager.startServerLoop()
+            return
+        }
+
+        val targetDevice = discoveryManager.getDiscoveredDevice(peerId)
+        if (targetDevice != null) {
+            LayoverFileLogger.log("Connecting to discovered BluetoothDevice: address=${targetDevice.address}")
+            rfcommSessionManager.connectToDevice(targetDevice)
             return
         }
 
@@ -303,11 +316,11 @@ class BleProximityTransport(
             if (device != null) {
                 rfcommSessionManager.connectToDevice(device)
             } else {
-                rfcommSessionManager.startServer()
+                rfcommSessionManager.startServerLoop()
             }
         } else {
-            LayoverFileLogger.log("PeerId $peerId is not a MAC address string. Falling back to RFCOMM Server Listener.")
-            rfcommSessionManager.startServer()
+            LayoverFileLogger.log("PeerId $peerId is not a Bluetooth MAC address. Ensuring RFCOMM server listener is active.")
+            rfcommSessionManager.startServerLoop()
         }
     }
 
@@ -345,6 +358,6 @@ class BleProximityTransport(
         stopDiscovery()
         rateLimiter.clearAll()
         sessionCryptoManager.clearSession()
-        rfcommSessionManager.disconnect()
+        rfcommSessionManager.cleanup()
     }
 }

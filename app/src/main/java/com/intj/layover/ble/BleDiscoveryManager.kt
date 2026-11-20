@@ -2,6 +2,7 @@ package com.intj.layover.ble
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
@@ -31,6 +32,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 data class DiscoveredPeerRecord(
     val peer: NearbyPeer,
+    val device: BluetoothDevice,
     val lastSeenTimestamp: Long
 )
 
@@ -85,6 +87,12 @@ class BleDiscoveryManager(
         }
     }
 
+    fun getDiscoveredDevice(peerId: String): BluetoothDevice? {
+        // peerId could be MAC address or instanceId key
+        val record = peerMap[peerId] ?: peerMap.values.find { it.peer.id == peerId }
+        return record?.device
+    }
+
     @SuppressLint("MissingPermission")
     fun startAdvertising(userProfile: UserProfile) {
         if (!userProfile.isVisibleToNearby) {
@@ -124,7 +132,6 @@ class BleDiscoveryManager(
             .build()
 
         val payload = LayoverBlePayloadEncoder.encodePayload(
-            peerId = userProfile.handle.ifEmpty { "user" },
             displayName = userProfile.displayName,
             isVisible = userProfile.isVisibleToNearby
         )
@@ -145,7 +152,7 @@ class BleDiscoveryManager(
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE).")
+                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE). InstanceId=${LayoverBleConstants.LOCAL_INSTANCE_ID_HEX}")
                 bleStateController.startAdvertising()
             }
 
@@ -293,13 +300,14 @@ class BleDiscoveryManager(
             ?: deviceName?.ifEmpty { null }
             ?: "Layover Peer (${macAddress.takeLast(4)})"
 
-        val existingRecord = peerMap[macAddress]
+        val mapKey = payload?.instanceIdHex?.ifBlank { macAddress } ?: macAddress
+
+        val existingRecord = peerMap[mapKey]
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
 
         val updatedPeer = NearbyPeer(
             id = macAddress,
             displayName = fallbackName,
-            handle = payload?.peerId ?: macAddress.takeLast(6),
             status = currentStatus,
             avatar = PeerAvatar(
                 peerId = macAddress,
@@ -311,20 +319,22 @@ class BleDiscoveryManager(
             )
         )
 
-        peerMap[macAddress] = DiscoveredPeerRecord(
+        peerMap[mapKey] = DiscoveredPeerRecord(
             peer = updatedPeer,
+            device = result.device,
             lastSeenTimestamp = System.currentTimeMillis()
         )
 
         _discoveredPeers.value = peerMap.values.map { it.peer }
-        LayoverFileLogger.logThrottled("scan_$macAddress", "BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
+        LayoverFileLogger.logThrottled("scan_$mapKey", "BLE scan result emitted: Key=$mapKey, MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
     }
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {
-        val record = peerMap[peerId]
+        val record = peerMap[peerId] ?: peerMap.values.find { it.peer.id == peerId }
         if (record != null) {
             val updated = record.peer.copy(status = newStatus)
-            peerMap[peerId] = record.copy(peer = updated)
+            val key = peerMap.entries.find { it.value.peer.id == record.peer.id }?.key ?: peerId
+            peerMap[key] = record.copy(peer = updated)
             _discoveredPeers.value = peerMap.values.map { it.peer }
         }
     }

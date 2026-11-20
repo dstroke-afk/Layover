@@ -12,6 +12,7 @@ import com.intj.layover.diagnostics.LayoverFileLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -62,6 +63,7 @@ class RfcommSessionManager(
     private var dataOutputStream: DataOutputStream? = null
     private var dataInputStream: DataInputStream? = null
     private var readJob: Job? = null
+    private var serverLoopJob: Job? = null
 
     private fun setConnectionState(newState: RfcommConnectionState, errorDetail: String? = null) {
         _connectionState.value = newState
@@ -73,39 +75,39 @@ class RfcommSessionManager(
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun startServer() {
-        if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-            setConnectionState(RfcommConnectionState.FAILED, "Bluetooth permissions missing")
-            return
-        }
-
-        val adapter = bluetoothAdapter
-        if (adapter == null || !adapter.isEnabled) {
-            setConnectionState(RfcommConnectionState.FAILED, "Bluetooth adapter null or disabled")
-            return
-        }
-
-        disconnect()
-        setConnectionState(RfcommConnectionState.CONNECTING, "Server listening on UUID $LAYOVER_RFCOMM_UUID")
-
-        scope.launch {
-            try {
-                val serverSocket = adapter.listenUsingRfcommWithServiceRecord("Layover", LAYOVER_RFCOMM_UUID)
-                activeServerSocket = serverSocket
-
-                val socket = serverSocket.accept()
-                LayoverFileLogger.log("RFCOMM Server accepted socket connection from device ${socket.remoteDevice?.address}")
-                serverSocket.close()
-                activeServerSocket = null
-
-                handleConnectedSocket(socket)
-            } catch (e: Exception) {
-                LayoverFileLogger.logError("RFCOMM Server exception during accept()", e)
-                if (_connectionState.value == RfcommConnectionState.CONNECTING) {
-                    setConnectionState(RfcommConnectionState.FAILED, e.message)
-                }
+    fun startServerLoop() {
+        serverLoopJob?.cancel()
+        serverLoopJob = scope.launch {
+            while (isActive) {
+                runServerListenerOnce()
+                delay(2000) // Brief delay before restarting listener if closed
             }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun runServerListenerOnce() {
+        if (!BlePermissionHelper.hasAllRequiredPermissions(context)) return
+        val adapter = bluetoothAdapter ?: return
+        if (!adapter.isEnabled) return
+
+        try {
+            LayoverFileLogger.log("RFCOMM Server listener starting on UUID $LAYOVER_RFCOMM_UUID...")
+            val serverSocket = adapter.listenUsingRfcommWithServiceRecord("Layover", LAYOVER_RFCOMM_UUID)
+            activeServerSocket = serverSocket
+
+            val socket = serverSocket.accept()
+            LayoverFileLogger.log("RFCOMM Server accepted incoming socket from device ${socket.remoteDevice?.address}")
+            try {
+                serverSocket.close()
+            } catch (e: Exception) {
+                // Ignore
+            }
+            activeServerSocket = null
+
+            handleConnectedSocket(socket)
+        } catch (e: Exception) {
+            LayoverFileLogger.logError("RFCOMM Server listener exception: ${e.message}", e)
         }
     }
 
@@ -120,16 +122,45 @@ class RfcommSessionManager(
         setConnectionState(RfcommConnectionState.CONNECTING, "Connecting to device MAC ${device.address}")
 
         scope.launch {
+            var connected = false
             try {
+                LayoverFileLogger.log("RFCOMM client cancelling discovery before connect...")
+                bluetoothAdapter?.cancelDiscovery()
+                delay(150)
+
+                LayoverFileLogger.log("RFCOMM client attempting secure connect to ${device.address}...")
                 val socket = device.createRfcommSocketToServiceRecord(LAYOVER_RFCOMM_UUID)
                 activeClientSocket = socket
                 socket.connect()
-                LayoverFileLogger.log("RFCOMM Client socket connected successfully to ${device.address}")
+
+                LayoverFileLogger.log("RFCOMM Client SECURE socket connected successfully to ${device.address}")
+                connected = true
                 handleConnectedSocket(socket)
             } catch (e: Exception) {
-                LayoverFileLogger.logError("RFCOMM Client connection failed to ${device.address}", e)
-                disconnect()
-                setConnectionState(RfcommConnectionState.FAILED, e.message)
+                LayoverFileLogger.logError("RFCOMM secure connect failed to ${device.address}: ${e.message}. Retrying insecure fallback after 400ms...", e)
+                try {
+                    activeClientSocket?.close()
+                } catch (ex: Exception) {
+                    // Ignore
+                }
+                activeClientSocket = null
+
+                delay(400)
+
+                try {
+                    LayoverFileLogger.log("RFCOMM client attempting INSECURE connect fallback to ${device.address}...")
+                    val insecureSocket = device.createInsecureRfcommSocketToServiceRecord(LAYOVER_RFCOMM_UUID)
+                    activeClientSocket = insecureSocket
+                    insecureSocket.connect()
+
+                    LayoverFileLogger.log("RFCOMM Client INSECURE socket connected successfully to ${device.address}")
+                    connected = true
+                    handleConnectedSocket(insecureSocket)
+                } catch (ex: Exception) {
+                    LayoverFileLogger.logError("RFCOMM INSECURE connect fallback failed to ${device.address}: ${ex.message}", ex)
+                    disconnect()
+                    setConnectionState(RfcommConnectionState.FAILED, ex.message)
+                }
             }
         }
     }
@@ -231,5 +262,10 @@ class RfcommSessionManager(
         activeServerSocket = null
 
         _connectionState.value = RfcommConnectionState.DISCONNECTED
+    }
+
+    fun cleanup() {
+        serverLoopJob?.cancel()
+        disconnect()
     }
 }
