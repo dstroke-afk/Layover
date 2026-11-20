@@ -71,12 +71,15 @@ class BleDiscoveryManager(
                 var updated = false
 
                 peerMap.entries.removeIf { entry ->
+                    val peer = entry.value.peer
+                    val hasActiveStatus = peer.status != ConnectionStatus.NONE
                     val isStale = (now - entry.value.lastSeenTimestamp) > LayoverBleConstants.PEER_STALE_TIMEOUT_MS
-                    if (isStale) {
+                    val shouldPrune = isStale && !hasActiveStatus
+                    if (shouldPrune) {
                         LayoverFileLogger.log("Pruning stale BLE peer: ${entry.key}")
                         updated = true
                     }
-                    isStale
+                    shouldPrune
                 }
 
                 if (updated) {
@@ -88,7 +91,6 @@ class BleDiscoveryManager(
     }
 
     fun getDiscoveredDevice(peerId: String): BluetoothDevice? {
-        // peerId could be MAC address or instanceId key
         val record = peerMap[peerId] ?: peerMap.values.find { it.peer.id == peerId }
         return record?.device
     }
