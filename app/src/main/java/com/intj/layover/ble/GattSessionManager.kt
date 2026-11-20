@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Build
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.p2p.P2PMessageFrame
 import com.intj.layover.p2p.RfcommConnectionState
@@ -49,6 +50,8 @@ class GattSessionManager(
     private val _incomingMessages = MutableSharedFlow<P2PMessageFrame>()
     val incomingMessages: SharedFlow<P2PMessageFrame> = _incomingMessages.asSharedFlow()
 
+    var onGattReady: (() -> Unit)? = null
+
     private var gattServer: BluetoothGattServer? = null
     private var activeGattClient: BluetoothGatt? = null
     private var connectedDevice: BluetoothDevice? = null
@@ -85,6 +88,10 @@ class GattSessionManager(
                     connectedDevice = device
                     isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
+                    // Server is ready immediately upon connection for key exchange
+                    scope.launch {
+                        onGattReady?.invoke()
+                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
                     if (connectedDevice?.address == device?.address) {
@@ -208,9 +215,8 @@ class GattSessionManager(
 
             override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    LayoverFileLogger.log("GATT Services discovered successfully.")
+                    LayoverFileLogger.log("GATT Services discovered successfully. Requesting MTU 512...")
                     gatt?.requestMtu(512)
-                    enableNotifications(gatt)
                 } else {
                     LayoverFileLogger.logError("GATT Services discovery failed with status: $status")
                     setConnectionState(RfcommConnectionState.FAILED, "Services discovery status $status")
@@ -218,8 +224,20 @@ class GattSessionManager(
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-                LayoverFileLogger.log("GATT MTU updated to $mtu (status=$status)")
-                setConnectionState(RfcommConnectionState.CONNECTED)
+                LayoverFileLogger.log("GATT MTU updated to $mtu (status=$status). Enabling notifications...")
+                enableNotifications(gatt)
+            }
+
+            override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && descriptor?.uuid == CLIENT_CONFIG_DESCRIPTOR_UUID) {
+                    LayoverFileLogger.log("GATT Client successfully subscribed to notifications (onDescriptorWrite SUCCESS).")
+                    setConnectionState(RfcommConnectionState.CONNECTED)
+                    scope.launch {
+                        onGattReady?.invoke()
+                    }
+                } else {
+                    LayoverFileLogger.logError("GATT Client failed to write descriptor: status=$status")
+                }
             }
 
             @Deprecated("Deprecated in Java")
@@ -250,10 +268,16 @@ class GattSessionManager(
             val desc = rxChar.getDescriptor(CLIENT_CONFIG_DESCRIPTOR_UUID)
             if (desc != null) {
                 desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                @Suppress("DEPRECATION")
-                gatt.writeDescriptor(desc)
-                LayoverFileLogger.log("GATT Client enabled notifications on RX characteristic.")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    gatt.writeDescriptor(desc)
+                }
+                LayoverFileLogger.log("GATT Client initiated writeDescriptor for notifications.")
             }
+        } else {
+            LayoverFileLogger.logError("GATT RX characteristic not found for enabling notifications.")
         }
     }
 
@@ -296,13 +320,19 @@ class GattSessionManager(
         val fullPacket = ByteBuffer.allocate(4 + payload.size).putInt(payload.size).put(payload).array()
 
         if (isServerRole) {
-            val server = gattServer ?: return false
-            val device = connectedDevice ?: return false
+            val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
+            val device = connectedDevice ?: return false.also { LayoverFileLogger.logError("GATT Server connectedDevice is null when sending frame.") }
             val service = server.getService(LAYOVER_GATT_SERVICE_UUID)
-            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: return false
-            rxChar.value = fullPacket
-            @Suppress("DEPRECATION")
-            val success = server.notifyCharacteristicChanged(device, rxChar, false)
+            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
+
+            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                server.notifyCharacteristicChanged(device, rxChar, false, fullPacket) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+            } else {
+                rxChar.value = fullPacket
+                @Suppress("DEPRECATION")
+                server.notifyCharacteristicChanged(device, rxChar, false)
+            }
+
             if (success) {
                 LayoverFileLogger.log("GATT Server sent notification frame: size=${payload.size}")
             } else {
@@ -310,13 +340,19 @@ class GattSessionManager(
             }
             return success
         } else {
-            val client = activeGattClient ?: return false
+            val client = activeGattClient ?: return false.also { LayoverFileLogger.logError("GATT Client is null when sending frame.") }
             val service = client.getService(LAYOVER_GATT_SERVICE_UUID)
-            val txChar = service?.getCharacteristic(LAYOVER_TX_CHAR_UUID) ?: return false
-            txChar.value = fullPacket
-            txChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            @Suppress("DEPRECATION")
-            val success = client.writeCharacteristic(txChar)
+            val txChar = service?.getCharacteristic(LAYOVER_TX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT TX characteristic null on client.") }
+
+            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                client.writeCharacteristic(txChar, fullPacket, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+            } else {
+                txChar.value = fullPacket
+                txChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                @Suppress("DEPRECATION")
+                client.writeCharacteristic(txChar)
+            }
+
             if (success) {
                 LayoverFileLogger.log("GATT Client wrote TX frame: size=${payload.size}")
             } else {

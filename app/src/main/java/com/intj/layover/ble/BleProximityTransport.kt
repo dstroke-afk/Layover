@@ -68,14 +68,17 @@ class BleProximityTransport(
         // Start GATT Server listener
         gattSessionManager.startServer()
 
+        // Bind GATT ready callback so handshake occurs after services, MTU, and notification descriptors are fully negotiated
+        gattSessionManager.onGattReady = {
+            initiateE2eeHandshake()
+        }
+
         // Handle GATT connection lifecycle and E2EE key exchange
         scope.launch {
             gattSessionManager.connectionState.collect { state ->
                 LayoverFileLogger.log("GATT connection state changed: ${state.name}")
                 diagnosticsTracker.updateRfcommStateLabel(state.name)
-                if (state == RfcommConnectionState.CONNECTED) {
-                    initiateE2eeHandshake()
-                } else if (state == RfcommConnectionState.DISCONNECTED || state == RfcommConnectionState.FAILED) {
+                if (state == RfcommConnectionState.DISCONNECTED || state == RfcommConnectionState.FAILED) {
                     sessionCryptoManager.clearSession()
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
@@ -131,6 +134,7 @@ class BleProximityTransport(
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
                         } else {
                             LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed via BLE GATT.")
+                            diagnosticsTracker.updateLastErrorMessage(null)
                         }
                     }
 
@@ -200,6 +204,7 @@ class BleProximityTransport(
         val sent = gattSessionManager.sendFrame(keyExchangePayload)
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
+            diagnosticsTracker.updateLastErrorMessage(null)
         } else {
             diagnosticsTracker.updateLastErrorMessage("Failed to send key exchange frame")
         }
@@ -340,6 +345,7 @@ class BleProximityTransport(
 
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
+            diagnosticsTracker.updateLastErrorMessage(null)
         } else {
             diagnosticsTracker.updateLastErrorMessage("Failed to send message frame")
         }
