@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Radar
@@ -40,6 +41,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -53,6 +55,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -60,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverBackground
 import com.intj.layover.ui.theme.CyanAccent
@@ -457,6 +461,7 @@ fun DiagnosticsDialog(
 ) {
     val diag = uiState.diagnostics
     val context = LocalContext.current
+    var exportStatusText by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -504,6 +509,16 @@ fun DiagnosticsDialog(
                     isError = diag.lastErrorMessage != null
                 )
 
+                if (exportStatusText != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = exportStatusText!!,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = CyanAccent
+                    )
+                }
+
                 if (diag.lastErrorMessage?.contains("permission", ignoreCase = true) == true) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Button(
@@ -533,25 +548,49 @@ fun DiagnosticsDialog(
             }
         },
         confirmButton = {
-            Row(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Button(
-                    onClick = {
-                        uiState.transport.resetDiagnosticsCounters()
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = CyanPrimary,
-                        contentColor = DarkNavyBackground
-                    ),
-                    shape = RoundedCornerShape(8.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Reset", fontWeight = FontWeight.Bold)
-                }
-                TextButton(onClick = onDismiss) {
-                    Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold)
+                    OutlinedButton(
+                        onClick = {
+                            val result = LayoverFileLogger.exportLogToDownloads(context, diag)
+                            exportStatusText = result.getOrElse { e -> e.message ?: "Export failed" }
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = CyanPrimary),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Save to Downloads", fontSize = 12.sp)
+                    }
+
+                    Button(
+                        onClick = {
+                            uiState.transport.resetDiagnosticsCounters()
+                            exportStatusText = null
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = CyanPrimary,
+                            contentColor = DarkNavyBackground
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Reset", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+
+                    TextButton(onClick = onDismiss) {
+                        Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
                 }
             }
         }
@@ -578,7 +617,7 @@ private fun DiagnosticMetricRow(
             text = value,
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            color = if (isError) androidx.compose.ui.graphics.Color(0xFFFF5252) else CyanAccent,
+            color = if (isError) Color(0xFFFF5252) else CyanAccent,
             modifier = Modifier.padding(start = 8.dp)
         )
     }

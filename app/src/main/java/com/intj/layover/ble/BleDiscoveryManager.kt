@@ -13,7 +13,7 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
-import android.util.Log
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.PeerAvatar
@@ -38,10 +38,6 @@ class BleDiscoveryManager(
     private val context: Context,
     private val bleStateController: BleStateController
 ) {
-    companion object {
-        private const val TAG = "LayoverBLE"
-    }
-
     private val scope = CoroutineScope(Dispatchers.Main + Job())
 
     private val bluetoothManager: BluetoothManager? =
@@ -75,7 +71,7 @@ class BleDiscoveryManager(
                 peerMap.entries.removeIf { entry ->
                     val isStale = (now - entry.value.lastSeenTimestamp) > LayoverBleConstants.PEER_STALE_TIMEOUT_MS
                     if (isStale) {
-                        Log.d(TAG, "Pruning stale BLE peer: ${entry.key}")
+                        LayoverFileLogger.log("Pruning stale BLE peer: ${entry.key}")
                         updated = true
                     }
                     isStale
@@ -83,7 +79,7 @@ class BleDiscoveryManager(
 
                 if (updated) {
                     _discoveredPeers.value = peerMap.values.map { it.peer }
-                    Log.d(TAG, "Discovered peers list updated after pruning. Total count: ${_discoveredPeers.value.size}")
+                    LayoverFileLogger.log("Discovered peers list updated after pruning. Total count: ${_discoveredPeers.value.size}")
                 }
             }
         }
@@ -92,27 +88,27 @@ class BleDiscoveryManager(
     @SuppressLint("MissingPermission")
     fun startAdvertising(userProfile: UserProfile) {
         if (!userProfile.isVisibleToNearby) {
-            Log.d(TAG, "User opted out of visibility. Stopping BLE advertising.")
+            LayoverFileLogger.log("User opted out of visibility. Stopping BLE advertising.")
             stopAdvertising()
             return
         }
 
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-            Log.e(TAG, "Cannot start BLE advertising: permissions missing.")
+            LayoverFileLogger.logError("Cannot start BLE advertising: permissions missing.")
             bleStateController.updateState()
             return
         }
 
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
-            Log.e(TAG, "Cannot start BLE advertising: Bluetooth hardware null or disabled.")
+            LayoverFileLogger.logError("Cannot start BLE advertising: Bluetooth hardware null or disabled.")
             bleStateController.updateState()
             return
         }
 
         val advertiser = adapter.bluetoothLeAdvertiser
         if (advertiser == null) {
-            Log.e(TAG, "Cannot start BLE advertising: BluetoothLeAdvertiser unavailable.")
+            LayoverFileLogger.logError("Cannot start BLE advertising: BluetoothLeAdvertiser unavailable.")
             bleStateController.updateState()
             return
         }
@@ -133,14 +129,12 @@ class BleDiscoveryManager(
             isVisible = userProfile.isVisibleToNearby
         )
 
-        // Primary advertising packet: includes only Service UUID to guarantee payload fits < 31 bytes
         val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(LayoverBleConstants.LAYOVER_SERVICE_UUID)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
-        // Scan response packet: includes Service Data payload safely
         val scanResponseData = AdvertiseData.Builder()
             .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, payload)
             .setIncludeDeviceName(false)
@@ -149,7 +143,7 @@ class BleDiscoveryManager(
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                Log.d(TAG, "BLE Advertising started successfully (LOW_LATENCY, HIGH_POWER).")
+                LayoverFileLogger.log("BLE Advertising started successfully (LOW_LATENCY, HIGH_POWER).")
                 bleStateController.startAdvertising()
             }
 
@@ -162,7 +156,7 @@ class BleDiscoveryManager(
                     ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "ADVERTISE_FAILED_FEATURE_UNSUPPORTED (5)"
                     else -> "ErrorCode $errorCode"
                 }
-                Log.e(TAG, "BLE Advertising failed: $errReason")
+                LayoverFileLogger.logError("BLE Advertising failed: $errReason")
                 bleStateController.stopAdvertising()
             }
         }
@@ -170,10 +164,10 @@ class BleDiscoveryManager(
         advertiseCallback = callback
 
         try {
-            Log.d(TAG, "Requesting BluetoothLeAdvertiser.startAdvertising(...)")
+            LayoverFileLogger.log("Requesting BluetoothLeAdvertiser.startAdvertising(...)")
             advertiser.startAdvertising(settings, advertiseData, scanResponseData, callback)
         } catch (e: Exception) {
-            Log.e(TAG, "Exception starting BLE advertising", e)
+            LayoverFileLogger.logError("Exception starting BLE advertising", e)
             bleStateController.stopAdvertising()
         }
     }
@@ -184,10 +178,10 @@ class BleDiscoveryManager(
         val advertiser = currentAdvertiser
         if (advertiser != null && callback != null) {
             try {
-                Log.d(TAG, "Stopping BLE advertising...")
+                LayoverFileLogger.log("Stopping BLE advertising...")
                 advertiser.stopAdvertising(callback)
             } catch (e: Exception) {
-                Log.e(TAG, "Exception stopping BLE advertising", e)
+                LayoverFileLogger.logError("Exception stopping BLE advertising", e)
             }
         }
         advertiseCallback = null
@@ -198,21 +192,21 @@ class BleDiscoveryManager(
     @SuppressLint("MissingPermission")
     fun startScanning() {
         if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-            Log.e(TAG, "Cannot start BLE scanning: missing runtime permissions.")
+            LayoverFileLogger.logError("Cannot start BLE scanning: missing runtime permissions.")
             bleStateController.updateState()
             return
         }
 
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
-            Log.e(TAG, "Cannot start BLE scanning: Bluetooth adapter null or off.")
+            LayoverFileLogger.logError("Cannot start BLE scanning: Bluetooth adapter null or off.")
             bleStateController.updateState()
             return
         }
 
         val scanner = adapter.bluetoothLeScanner
         if (scanner == null) {
-            Log.e(TAG, "Cannot start BLE scanning: BluetoothLeScanner null.")
+            LayoverFileLogger.logError("Cannot start BLE scanning: BluetoothLeScanner null.")
             bleStateController.updateState()
             return
         }
@@ -239,7 +233,7 @@ class BleDiscoveryManager(
             }
 
             override fun onScanFailed(errorCode: Int) {
-                Log.e(TAG, "BLE Scanning failed with errorCode: $errorCode")
+                LayoverFileLogger.logError("BLE Scanning failed with errorCode: $errorCode")
                 bleStateController.stopScanning()
             }
         }
@@ -247,11 +241,11 @@ class BleDiscoveryManager(
         scanCallback = callback
 
         try {
-            Log.d(TAG, "Starting BluetoothLeScanner.startScan(...) with Layover UUID filter & LOW_LATENCY.")
+            LayoverFileLogger.log("Starting BluetoothLeScanner.startScan(...) with Layover UUID filter & LOW_LATENCY.")
             scanner.startScan(listOf(filter), settings, callback)
             bleStateController.startScanning()
         } catch (e: Exception) {
-            Log.e(TAG, "Exception starting BLE scan", e)
+            LayoverFileLogger.logError("Exception starting BLE scan", e)
             bleStateController.stopScanning()
         }
     }
@@ -262,10 +256,10 @@ class BleDiscoveryManager(
         val scanner = currentScanner
         if (scanner != null && callback != null) {
             try {
-                Log.d(TAG, "Stopping BLE scanner...")
+                LayoverFileLogger.log("Stopping BLE scanner...")
                 scanner.stopScan(callback)
             } catch (e: Exception) {
-                Log.e(TAG, "Exception stopping BLE scan", e)
+                LayoverFileLogger.logError("Exception stopping BLE scan", e)
             }
         }
         scanCallback = null
@@ -283,7 +277,7 @@ class BleDiscoveryManager(
         val payload = LayoverBlePayloadEncoder.decodePayload(serviceData)
 
         if (payload != null && !payload.isVisible) {
-            Log.d(TAG, "Peer $macAddress sent payload with isVisible=false. Ignoring.")
+            LayoverFileLogger.log("Peer $macAddress sent payload with isVisible=false. Ignoring.")
             return
         }
 
@@ -296,6 +290,8 @@ class BleDiscoveryManager(
         val fallbackName = payload?.displayName?.ifEmpty { null }
             ?: deviceName?.ifEmpty { null }
             ?: "Layover Peer (${macAddress.takeLast(4)})"
+
+        LayoverFileLogger.log("Discovered BLE peer: address=$macAddress, name=$fallbackName")
 
         val existingRecord = peerMap[macAddress]
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
@@ -321,7 +317,7 @@ class BleDiscoveryManager(
         )
 
         _discoveredPeers.value = peerMap.values.map { it.peer }
-        Log.d(TAG, "BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
+        LayoverFileLogger.log("BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
     }
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {
