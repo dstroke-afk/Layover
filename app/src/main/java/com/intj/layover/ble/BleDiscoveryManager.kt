@@ -42,7 +42,7 @@ class BleDiscoveryManager(
         private const val TAG = "LayoverBLE"
     }
 
-    private val scope = CoroutineScope(Dispatchers.Default + Job())
+    private val scope = CoroutineScope(Dispatchers.Main + Job())
 
     private val bluetoothManager: BluetoothManager? =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -68,7 +68,7 @@ class BleDiscoveryManager(
         pruneJob?.cancel()
         pruneJob = scope.launch {
             while (isActive) {
-                delay(5000)
+                delay(10000)
                 val now = System.currentTimeMillis()
                 var updated = false
 
@@ -83,6 +83,7 @@ class BleDiscoveryManager(
 
                 if (updated) {
                     _discoveredPeers.value = peerMap.values.map { it.peer }
+                    Log.d(TAG, "Discovered peers list updated after pruning. Total count: ${_discoveredPeers.value.size}")
                 }
             }
         }
@@ -123,6 +124,7 @@ class BleDiscoveryManager(
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .setConnectable(true)
+            .setTimeout(0)
             .build()
 
         val payload = LayoverBlePayloadEncoder.encodePayload(
@@ -131,8 +133,15 @@ class BleDiscoveryManager(
             isVisible = userProfile.isVisibleToNearby
         )
 
+        // Primary advertising packet: includes only Service UUID to guarantee payload fits < 31 bytes
         val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(LayoverBleConstants.LAYOVER_SERVICE_UUID)
+            .setIncludeDeviceName(false)
+            .setIncludeTxPowerLevel(false)
+            .build()
+
+        // Scan response packet: includes Service Data payload safely
+        val scanResponseData = AdvertiseData.Builder()
             .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, payload)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
@@ -140,12 +149,20 @@ class BleDiscoveryManager(
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                Log.d(TAG, "BLE Advertising started successfully.")
+                Log.d(TAG, "BLE Advertising started successfully (LOW_LATENCY, HIGH_POWER).")
                 bleStateController.startAdvertising()
             }
 
             override fun onStartFailure(errorCode: Int) {
-                Log.e(TAG, "BLE Advertising failed with errorCode: $errorCode")
+                val errReason = when (errorCode) {
+                    ADVERTISE_FAILED_DATA_TOO_LARGE -> "ADVERTISE_FAILED_DATA_TOO_LARGE (1)"
+                    ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "ADVERTISE_FAILED_TOO_MANY_ADVERTISERS (2)"
+                    ADVERTISE_FAILED_ALREADY_STARTED -> "ADVERTISE_FAILED_ALREADY_STARTED (3)"
+                    ADVERTISE_FAILED_INTERNAL_ERROR -> "ADVERTISE_FAILED_INTERNAL_ERROR (4)"
+                    ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "ADVERTISE_FAILED_FEATURE_UNSUPPORTED (5)"
+                    else -> "ErrorCode $errorCode"
+                }
+                Log.e(TAG, "BLE Advertising failed: $errReason")
                 bleStateController.stopAdvertising()
             }
         }
@@ -154,7 +171,7 @@ class BleDiscoveryManager(
 
         try {
             Log.d(TAG, "Requesting BluetoothLeAdvertiser.startAdvertising(...)")
-            advertiser.startAdvertising(settings, advertiseData, callback)
+            advertiser.startAdvertising(settings, advertiseData, scanResponseData, callback)
         } catch (e: Exception) {
             Log.e(TAG, "Exception starting BLE advertising", e)
             bleStateController.stopAdvertising()
@@ -209,6 +226,7 @@ class BleDiscoveryManager(
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
 
         val callback = object : ScanCallback() {
@@ -229,7 +247,7 @@ class BleDiscoveryManager(
         scanCallback = callback
 
         try {
-            Log.d(TAG, "Starting BluetoothLeScanner.startScan(...) with Layover UUID filter.")
+            Log.d(TAG, "Starting BluetoothLeScanner.startScan(...) with Layover UUID filter & LOW_LATENCY.")
             scanner.startScan(listOf(filter), settings, callback)
             bleStateController.startScanning()
         } catch (e: Exception) {
@@ -259,28 +277,25 @@ class BleDiscoveryManager(
     private fun processScanResult(result: ScanResult?) {
         if (result == null) return
         val scanRecord = result.scanRecord ?: return
+        val macAddress = result.device?.address ?: return
+
         val serviceData = scanRecord.getServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID)
         val payload = LayoverBlePayloadEncoder.decodePayload(serviceData)
 
-        val macAddress = result.device?.address ?: payload?.peerId ?: return
+        if (payload != null && !payload.isVisible) {
+            Log.d(TAG, "Peer $macAddress sent payload with isVisible=false. Ignoring.")
+            return
+        }
 
-        // Device name fallback logic
         val deviceName = try {
             result.device?.name ?: scanRecord.deviceName
         } catch (e: Exception) {
             null
         }
 
-        val fallbackName = payload?.displayName
-            ?: deviceName
-            ?: "Nearby Node ${macAddress.takeLast(4)}"
-
-        if (payload != null && !payload.isVisible) {
-            Log.d(TAG, "Peer $macAddress sent payload with isVisible=false. Skipping.")
-            return
-        }
-
-        Log.d(TAG, "Discovered BLE peer: address=$macAddress, name=$fallbackName")
+        val fallbackName = payload?.displayName?.ifEmpty { null }
+            ?: deviceName?.ifEmpty { null }
+            ?: "Layover Peer (${macAddress.takeLast(4)})"
 
         val existingRecord = peerMap[macAddress]
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
@@ -306,6 +321,7 @@ class BleDiscoveryManager(
         )
 
         _discoveredPeers.value = peerMap.values.map { it.peer }
+        Log.d(TAG, "BLE scan result emitted: MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
     }
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {

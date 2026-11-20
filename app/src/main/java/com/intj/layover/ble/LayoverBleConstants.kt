@@ -6,8 +6,8 @@ object LayoverBleConstants {
     const val LAYOVER_SERVICE_UUID_STRING = "7f41a0d8-5526-4b6a-9f5b-6147e4b2a8d1"
     val LAYOVER_SERVICE_UUID: ParcelUuid = ParcelUuid.fromString(LAYOVER_SERVICE_UUID_STRING)
 
-    const val PEER_STALE_TIMEOUT_MS = 25_000L
-    const val MAX_NAME_BYTE_LENGTH = 14
+    const val PEER_STALE_TIMEOUT_MS = 60_000L
+    const val MAX_NAME_BYTE_LENGTH = 12
 }
 
 object LayoverBlePayloadEncoder {
