@@ -1,0 +1,379 @@
+package com.intj.layover.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.intj.layover.model.ConnectionStatus
+import com.intj.layover.model.LayoverUiState
+import com.intj.layover.model.NearbyPeer
+import com.intj.layover.navigation.LayoverBackground
+import com.intj.layover.ui.theme.CyanAccent
+import com.intj.layover.ui.theme.CyanPrimary
+import com.intj.layover.ui.theme.DarkNavyBackground
+import com.intj.layover.ui.theme.ElevatedCardSurface
+import com.intj.layover.ui.theme.IncomingBubbleSurface
+import com.intj.layover.ui.theme.LightText
+import com.intj.layover.ui.theme.MutedText
+
+@Composable
+fun PeopleAroundScreen(
+    uiState: LayoverUiState,
+    initialSearchActive: Boolean = false,
+    onConnectPeer: (String) -> Unit,
+    onOpenChat: (String) -> Unit,
+    onNavigateToProfile: () -> Unit,
+    onNavigateBack: () -> Unit
+) {
+    var searchActive by remember { mutableStateOf(initialSearchActive) }
+    var searchQuery by remember { mutableStateOf("") }
+    var showMenu by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+
+    if (showAboutDialog) {
+        AboutDialog(onDismiss = { showAboutDialog = false })
+    }
+
+    val filteredPeers = remember(uiState.nearbyPeers, searchQuery) {
+        if (searchQuery.isBlank()) {
+            uiState.nearbyPeers
+        } else {
+            uiState.nearbyPeers.filter {
+                it.displayName.contains(searchQuery, ignoreCase = true) ||
+                        it.handle.contains(searchQuery, ignoreCase = true)
+            }
+        }
+    }
+
+    LayoverBackground {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
+            // Top Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = LightText
+                        )
+                    }
+                    Text(
+                        text = "Layover",
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontStyle = FontStyle.Italic,
+                        fontFamily = FontFamily.Serif,
+                        color = LightText
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { searchActive = !searchActive }) {
+                        Icon(
+                            imageVector = if (searchActive) Icons.Default.Close else Icons.Default.Search,
+                            contentDescription = "Toggle Search",
+                            tint = if (searchActive) CyanPrimary else LightText
+                        )
+                    }
+
+                    Box {
+                        IconButton(onClick = { showMenu = true }) {
+                            Icon(
+                                imageVector = Icons.Default.Menu,
+                                contentDescription = "Menu",
+                                tint = LightText
+                            )
+                        }
+
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false },
+                            modifier = Modifier.background(ElevatedCardSurface)
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Your Profile", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = null,
+                                        tint = CyanPrimary
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    onNavigateToProfile()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("About", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Info,
+                                        contentDescription = null,
+                                        tint = CyanAccent
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    showAboutDialog = true
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Live Search Bar if searchActive
+            if (searchActive) {
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Filter nearby people...", color = MutedText) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedContainerColor = ElevatedCardSurface,
+                        unfocusedContainerColor = ElevatedCardSurface,
+                        focusedBorderColor = CyanPrimary,
+                        unfocusedBorderColor = IncomingBubbleSurface,
+                        focusedTextColor = LightText,
+                        unfocusedTextColor = LightText
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Clear",
+                                    tint = MutedText
+                                )
+                            }
+                        }
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Section Header
+            Text(
+                text = "People Around (${filteredPeers.size})",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = LightText,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                contentPadding = PaddingValues(bottom = 16.dp)
+            ) {
+                items(filteredPeers, key = { it.id }) { peer ->
+                    PeerListItemCard(
+                        peer = peer,
+                        onConnect = {
+                            uiState.transport.sendConnectionRequest(peer.id)
+                            onConnectPeer(peer.id)
+                        },
+                        onChat = { onOpenChat(peer.id) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun PeerListItemCard(
+    peer: NearbyPeer,
+    onConnect: () -> Unit,
+    onChat: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = ElevatedCardSurface),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(IncomingBubbleSurface)
+                        .border(1.5.dp, CyanPrimary, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = peer.avatar.initials,
+                        fontWeight = FontWeight.Bold,
+                        color = CyanPrimary,
+                        fontSize = 17.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(14.dp))
+
+                Column {
+                    Text(
+                        text = peer.displayName,
+                        fontWeight = FontWeight.SemiBold,
+                        color = LightText,
+                        fontSize = 16.sp
+                    )
+                    if (peer.handle.isNotEmpty()) {
+                        Text(
+                            text = "@${peer.handle}",
+                            color = MutedText,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Action Pill
+            when (peer.status) {
+                ConnectionStatus.NONE -> {
+                    Surface(
+                        modifier = Modifier.clickable { onConnect() },
+                        color = CyanPrimary,
+                        shape = RoundedCornerShape(20.dp)
+                    ) {
+                        Text(
+                            text = "Request",
+                            color = DarkNavyBackground,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+
+                ConnectionStatus.REQUESTED -> {
+                    Surface(
+                        color = IncomingBubbleSurface,
+                        shape = RoundedCornerShape(20.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                tint = MutedText,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Requested",
+                                color = MutedText,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+
+                ConnectionStatus.ACCEPTED -> {
+                    Surface(
+                        modifier = Modifier.clickable { onChat() },
+                        color = Color(0xFF10B981),
+                        shape = RoundedCornerShape(20.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Chat,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Accepted",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

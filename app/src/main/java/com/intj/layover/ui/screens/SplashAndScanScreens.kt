@@ -1,0 +1,426 @@
+package com.intj.layover.ui.screens
+
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.intj.layover.model.LayoverUiState
+import com.intj.layover.navigation.LayoverBackground
+import com.intj.layover.ui.theme.CyanAccent
+import com.intj.layover.ui.theme.CyanPrimary
+import com.intj.layover.ui.theme.DarkNavyBackground
+import com.intj.layover.ui.theme.ElevatedCardSurface
+import com.intj.layover.ui.theme.IncomingBubbleSurface
+import com.intj.layover.ui.theme.LightText
+import com.intj.layover.ui.theme.MutedText
+
+@Composable
+fun SplashScreen(
+    onNavigateToScan: () -> Unit
+) {
+    var hasNavigated by remember { mutableStateOf(false) }
+
+    val navigateNext = {
+        if (!hasNavigated) {
+            hasNavigated = true
+            onNavigateToScan()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(1200)
+        navigateNext()
+    }
+
+    LayoverBackground(
+        modifier = Modifier
+            .fillMaxSize()
+            .clickable { navigateNext() }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(90.dp)
+                    .clip(CircleShape)
+                    .background(ElevatedCardSurface)
+                    .border(2.dp, CyanPrimary, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Radar,
+                    contentDescription = null,
+                    tint = CyanPrimary,
+                    modifier = Modifier.size(48.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            Text(
+                text = "Layover",
+                fontSize = 42.sp,
+                fontWeight = FontWeight.Bold,
+                fontStyle = FontStyle.Italic,
+                fontFamily = FontFamily.Serif,
+                color = LightText,
+                letterSpacing = 2.sp
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Offline Nearby Social Mesh",
+                fontSize = 14.sp,
+                color = MutedText,
+                letterSpacing = 1.sp,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(64.dp))
+
+            Text(
+                text = "Tap anywhere to skip",
+                fontSize = 12.sp,
+                color = MutedText.copy(alpha = 0.6f)
+            )
+        }
+    }
+}
+
+@Composable
+fun ScanScreen(
+    uiState: LayoverUiState,
+    onToggleScan: () -> Unit,
+    onNavigateToPeople: (Boolean) -> Unit,
+    onNavigateToProfile: () -> Unit
+) {
+    var showMenu by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "ScanPulse")
+    val scale1 by infiniteTransition.animateFloat(
+        initialValue = 0.85f,
+        targetValue = 1.45f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "RingScale1"
+    )
+
+    val scale2 by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = 1.7f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "RingScale2"
+    )
+
+    if (showAboutDialog) {
+        AboutDialog(onDismiss = { showAboutDialog = false })
+    }
+
+    LayoverBackground {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // Top Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Layover",
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontStyle = FontStyle.Italic,
+                    fontFamily = FontFamily.Serif,
+                    color = LightText
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { onNavigateToPeople(true) }) {
+                        Icon(
+                            imageVector = Icons.Default.Search,
+                            contentDescription = "Search",
+                            tint = LightText
+                        )
+                    }
+
+                    Box {
+                        IconButton(onClick = { showMenu = true }) {
+                            Icon(
+                                imageVector = Icons.Default.Menu,
+                                contentDescription = "Menu",
+                                tint = LightText
+                            )
+                        }
+
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false },
+                            modifier = Modifier.background(ElevatedCardSurface)
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Your Profile", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = null,
+                                        tint = CyanPrimary
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    onNavigateToProfile()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("About", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Info,
+                                        contentDescription = null,
+                                        tint = CyanAccent
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    showAboutDialog = true
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            // Center SCAN glowing cyan button & radar animation
+            Box(
+                modifier = Modifier.size(300.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(280.dp)
+                        .scale(scale2)
+                        .clip(CircleShape)
+                        .background(CyanPrimary.copy(alpha = 0.05f))
+                        .border(1.dp, CyanPrimary.copy(alpha = 0.2f), CircleShape)
+                )
+
+                Box(
+                    modifier = Modifier
+                        .size(210.dp)
+                        .scale(scale1)
+                        .clip(CircleShape)
+                        .background(CyanPrimary.copy(alpha = 0.1f))
+                        .border(1.5.dp, CyanPrimary.copy(alpha = 0.4f), CircleShape)
+                )
+
+                Surface(
+                    modifier = Modifier
+                        .size(130.dp)
+                        .clickable {
+                            uiState.transport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                            onToggleScan()
+                            onNavigateToPeople(false)
+                        },
+                    shape = CircleShape,
+                    color = CyanPrimary,
+                    shadowElevation = 12.dp
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Radar,
+                                contentDescription = "Scan",
+                                tint = DarkNavyBackground,
+                                modifier = Modifier.size(36.dp)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "SCAN",
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Black,
+                                color = DarkNavyBackground,
+                                letterSpacing = 2.sp
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text(
+                text = if (uiState.isScanning) "Searching for nearby peers..." else "Tap SCAN to discover nearby travelers",
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = LightText,
+                textAlign = TextAlign.Center
+            )
+
+            Text(
+                text = "Zero Internet Required • Bluetooth Mesh & Wi-Fi Direct",
+                fontSize = 12.sp,
+                color = MutedText,
+                modifier = Modifier.padding(top = 6.dp),
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            Button(
+                onClick = { onNavigateToPeople(false) },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ElevatedCardSurface,
+                    contentColor = LightText
+                ),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Text(
+                    text = "People Around (${uiState.nearbyPeers.size})",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+@Composable
+fun AboutDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ElevatedCardSurface,
+        titleContentColor = LightText,
+        textContentColor = LightText,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Radar,
+                    contentDescription = null,
+                    tint = CyanPrimary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "About Layover",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "Layover is a decentralized, off-grid peer-to-peer social messaging application designed for travelers in transit.",
+                    fontSize = 14.sp,
+                    color = LightText
+                )
+                Surface(
+                    color = IncomingBubbleSurface,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            text = "• Transport: BLE Discovery & Wi-Fi Direct Mesh",
+                            fontSize = 12.sp,
+                            color = CyanAccent,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "• Security: End-to-End Encrypted (E2EE) Signal Channels",
+                            fontSize = 12.sp,
+                            color = CyanAccent,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
