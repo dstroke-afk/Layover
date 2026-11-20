@@ -77,6 +77,8 @@ fun ChatScreen(
     var showChatMenu by remember { mutableStateOf(false) }
 
     val peerId = peer?.id ?: ""
+    val resolvedName = peer?.displayName ?: if (peerId.isNotEmpty()) "Peer (${peerId.takeLast(4)})" else "Nearby Peer"
+    val resolvedInitials = peer?.avatar?.initials ?: resolvedName.firstOrNull()?.toString()?.uppercase() ?: "?"
 
     LayoverBackground {
         Column(
@@ -112,7 +114,7 @@ fun ChatScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = peer?.avatar?.initials ?: "?",
+                        text = resolvedInitials,
                         fontWeight = FontWeight.Bold,
                         color = if (isBlocked) MutedText else CyanPrimary,
                         fontSize = 15.sp
@@ -124,7 +126,7 @@ fun ChatScreen(
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = peer?.displayName ?: "Unknown Peer",
+                            text = resolvedName,
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
                             color = LightText
@@ -139,11 +141,18 @@ fun ChatScreen(
                             )
                         }
                     }
-                    if (!peer?.handle.isNullOrEmpty()) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Lock,
+                            contentDescription = null,
+                            tint = CyanAccent,
+                            modifier = Modifier.size(11.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isBlocked) "[BLOCKED]" else "@${peer.handle}",
-                            fontSize = 12.sp,
-                            color = MutedText
+                            text = "End-to-End Encrypted",
+                            color = CyanAccent,
+                            fontSize = 11.sp
                         )
                     }
                 }
@@ -152,8 +161,8 @@ fun ChatScreen(
                     IconButton(onClick = { showChatMenu = true }) {
                         Icon(
                             imageVector = Icons.Default.MoreVert,
-                            contentDescription = "Menu",
-                            tint = LightText
+                            contentDescription = "Options",
+                            tint = MutedText
                         )
                     }
 
@@ -163,7 +172,7 @@ fun ChatScreen(
                         modifier = Modifier.background(ElevatedCardSurface)
                     ) {
                         DropdownMenuItem(
-                            text = { Text(if (isMuted) "Unmute Chat" else "Mute Chat", color = LightText) },
+                            text = { Text(if (isMuted) "Unmute Peer" else "Mute Peer", color = LightText) },
                             leadingIcon = {
                                 Icon(
                                     imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeMute else Icons.AutoMirrored.Filled.VolumeOff,
@@ -173,7 +182,7 @@ fun ChatScreen(
                             },
                             onClick = {
                                 showChatMenu = false
-                                if (peerId.isNotEmpty()) onToggleMutePeer(peerId)
+                                onToggleMutePeer(peerId)
                             }
                         )
                         DropdownMenuItem(
@@ -187,137 +196,69 @@ fun ChatScreen(
                             },
                             onClick = {
                                 showChatMenu = false
-                                if (peerId.isNotEmpty()) onToggleBlockPeer(peerId)
+                                onToggleBlockPeer(peerId)
                             }
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
-            // Security / E2EE & Block Status Banners
-            if (isBlocked) {
-                Surface(
-                    color = Color(0xFFFF5252).copy(alpha = 0.15f),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Block,
-                            contentDescription = null,
-                            tint = Color(0xFFFF5252),
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Peer is blocked. Unblock to send or receive messages.",
-                            fontSize = 12.sp,
-                            color = Color(0xFFFF5252),
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
-                }
-            } else {
-                Surface(
-                    color = Color(0xFF10B981).copy(alpha = 0.12f),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = null,
-                            tint = Color(0xFF10B981),
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "End-to-End Encrypted (AES-GCM-256)",
-                            fontSize = 11.sp,
-                            color = Color(0xFF10B981),
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-
-            // Message List
+            // Messages List
             LazyColumn(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
-                contentPadding = PaddingValues(vertical = 8.dp)
+                contentPadding = PaddingValues(vertical = 8.dp),
+                reverseLayout = true
             ) {
-                items(messages, key = { it.id }) { message ->
+                items(messages.reversed(), key = { it.id }) { msg ->
                     ChatMessageBubble(
-                        message = message,
-                        onReplyClick = {
-                            if (!isBlocked) replyingToMessage = message
-                        }
+                        message = msg,
+                        onReply = { replyingToMessage = msg }
                     )
                 }
             }
 
-            // Active Reply Banner if replyingToMessage != null
-            replyingToMessage?.let { replyTarget ->
-                Row(
+            // Reply Preview Banner
+            if (replyingToMessage != null) {
+                Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
-                        .background(ElevatedCardSurface)
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .padding(bottom = 8.dp),
+                    color = ElevatedCardSurface,
+                    shape = RoundedCornerShape(12.dp)
                 ) {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Reply,
-                            contentDescription = null,
-                            tint = CyanPrimary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Replying to message",
+                                text = "Replying to:",
+                                color = CyanPrimary,
                                 fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = CyanPrimary
+                                fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = replyTarget.text,
-                                fontSize = 12.sp,
+                                text = replyingToMessage!!.text,
                                 color = LightText,
+                                fontSize = 13.sp,
                                 maxLines = 1
                             )
                         }
-                    }
-                    IconButton(
-                        onClick = { replyingToMessage = null },
-                        modifier = Modifier.size(24.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Cancel reply",
-                            tint = MutedText
-                        )
+                        IconButton(onClick = { replyingToMessage = null }) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Cancel Reply",
+                                tint = MutedText
+                            )
+                        }
                     }
                 }
             }
@@ -326,15 +267,15 @@ fun ChatScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 6.dp),
+                    .padding(top = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { if (!isBlocked) inputText = it },
+                    onValueChange = { inputText = it },
                     placeholder = {
                         Text(
-                            text = if (isBlocked) "Unblock peer to message..." else "Type message...",
+                            text = if (isBlocked) "Peer is blocked" else "Type encrypted message...",
                             color = MutedText
                         )
                     },
@@ -343,37 +284,38 @@ fun ChatScreen(
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedContainerColor = ElevatedCardSurface,
                         unfocusedContainerColor = ElevatedCardSurface,
-                        disabledContainerColor = ElevatedCardSurface.copy(alpha = 0.5f),
                         focusedBorderColor = CyanPrimary,
                         unfocusedBorderColor = IncomingBubbleSurface,
                         focusedTextColor = LightText,
-                        unfocusedTextColor = LightText,
-                        disabledTextColor = MutedText
+                        unfocusedTextColor = LightText
                     ),
-                    shape = RoundedCornerShape(24.dp)
+                    shape = RoundedCornerShape(24.dp),
+                    maxLines = 4
                 )
 
                 Spacer(modifier = Modifier.width(8.dp))
 
-                IconButton(
-                    onClick = {
-                        if (!isBlocked && inputText.isNotBlank()) {
-                            onSendMessage(inputText.trim(), replyingToMessage?.text)
-                            inputText = ""
-                            replyingToMessage = null
-                        }
-                    },
-                    enabled = !isBlocked && inputText.isNotBlank(),
+                Surface(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .background(if (!isBlocked && inputText.isNotBlank()) CyanPrimary else IncomingBubbleSurface)
+                        .clickable(enabled = !isBlocked && inputText.isNotBlank()) {
+                            if (inputText.isNotBlank()) {
+                                onSendMessage(inputText.trim(), replyingToMessage?.text)
+                                inputText = ""
+                                replyingToMessage = null
+                            }
+                        },
+                    color = if (!isBlocked && inputText.isNotBlank()) CyanPrimary else ElevatedCardSurface
                 ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send",
-                        tint = if (!isBlocked && inputText.isNotBlank()) DarkNavyBackground else MutedText
-                    )
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send",
+                            tint = if (!isBlocked && inputText.isNotBlank()) DarkNavyBackground else MutedText,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }
@@ -383,51 +325,51 @@ fun ChatScreen(
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
-    onReplyClick: () -> Unit
+    onReply: () -> Unit
 ) {
-    val alignment = if (message.isOutgoing) Alignment.End else Alignment.Start
-    val bubbleColor = if (message.isOutgoing) OutgoingCyanBubble else IncomingBubbleSurface
-    val shape = if (message.isOutgoing) {
-        RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp)
-    } else {
-        RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp)
-    }
+    val isOutgoing = message.isOutgoing
 
     Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = alignment
+        horizontalAlignment = if (isOutgoing) Alignment.End else Alignment.Start
     ) {
         Surface(
-            color = bubbleColor,
-            shape = shape,
-            modifier = Modifier
-                .padding(horizontal = 4.dp)
-                .clickable { onReplyClick() }
+            color = if (isOutgoing) OutgoingCyanBubble else IncomingBubbleSurface,
+            shape = RoundedCornerShape(
+                topStart = 16.dp,
+                topEnd = 16.dp,
+                bottomStart = if (isOutgoing) 16.dp else 4.dp,
+                bottomEnd = if (isOutgoing) 4.dp else 16.dp
+            ),
+            modifier = Modifier.width(width = 280.dp)
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                modifier = Modifier.padding(12.dp)
             ) {
                 if (message.replyToText != null) {
-                    Box(
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(8.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 6.dp)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(DarkNavyBackground.copy(alpha = 0.35f))
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .width(3.dp)
-                                    .height(20.dp)
-                                    .background(CyanAccent)
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Reply,
+                                contentDescription = null,
+                                tint = if (isOutgoing) DarkNavyBackground else CyanAccent,
+                                modifier = Modifier.size(12.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = message.replyToText,
+                                color = if (isOutgoing) DarkNavyBackground else LightText,
                                 fontSize = 12.sp,
-                                color = LightText.copy(alpha = 0.9f)
+                                maxLines = 1
                             )
                         }
                     }
@@ -435,18 +377,22 @@ fun ChatMessageBubble(
 
                 Text(
                     text = message.text,
-                    color = LightText,
+                    color = if (isOutgoing) DarkNavyBackground else LightText,
                     fontSize = 15.sp
                 )
 
-                Text(
-                    text = message.timestampLabel,
-                    color = MutedText,
-                    fontSize = 11.sp,
-                    modifier = Modifier
-                        .align(Alignment.End)
-                        .padding(top = 4.dp)
-                )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Row(
+                    modifier = Modifier.align(Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = message.timestampLabel,
+                        color = if (isOutgoing) DarkNavyBackground.copy(alpha = 0.7f) else MutedText,
+                        fontSize = 10.sp
+                    )
+                }
             }
         }
     }

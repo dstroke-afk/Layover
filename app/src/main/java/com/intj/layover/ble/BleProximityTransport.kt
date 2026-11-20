@@ -68,6 +68,10 @@ class BleProximityTransport(
     private var lastDiscoveryVisible = !currentUserProfile.isVisibleToNearby
     private val lastRequestTimeMap = ConcurrentHashMap<String, Long>()
 
+    // Handshake state guards to prevent infinite ping-pong loops
+    private var hasSentKeyExchange = false
+    private var hasReceivedKeyExchange = false
+
     val isE2eeEstablished: Boolean
         get() = sessionCryptoManager.isSessionKeyEstablished
 
@@ -90,6 +94,8 @@ class BleProximityTransport(
                 diagnosticsTracker.updateRfcommStateLabel(state.name)
                 if (state == RfcommConnectionState.DISCONNECTED || state == RfcommConnectionState.FAILED) {
                     sessionCryptoManager.clearSession()
+                    hasSentKeyExchange = false
+                    hasReceivedKeyExchange = false
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
                     if (state == RfcommConnectionState.FAILED) {
@@ -110,6 +116,8 @@ class BleProximityTransport(
                     diagnosticsTracker.incrementBlockedDrops()
                     gattSessionManager.disconnect()
                     sessionCryptoManager.clearSession()
+                    hasSentKeyExchange = false
+                    hasReceivedKeyExchange = false
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
                     return@collect
@@ -137,6 +145,7 @@ class BleProximityTransport(
                 when (frame) {
                     is WireFrame.KeyExchange -> {
                         LayoverFileLogger.log("Received KeyExchange frame from ${frame.senderId}. Algorithm=${frame.algorithm}")
+                        hasReceivedKeyExchange = true
                         if (sessionCryptoManager.getLocalPublicKeyBase64() == null) {
                             sessionCryptoManager.generateKeyPair()
                         }
@@ -144,7 +153,8 @@ class BleProximityTransport(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
                         )
-                        if (success && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
+                        if (success && !hasSentKeyExchange && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
+                            hasSentKeyExchange = true
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
                             val localId = currentUserProfile.handle.ifEmpty { "local" }
                             val responsePayload = WireFrameCodec.encodeKeyExchange(
@@ -232,10 +242,17 @@ class BleProximityTransport(
         if (activePeerId != null && blockedPeerIds.contains(activePeerId)) {
             gattSessionManager.disconnect()
             sessionCryptoManager.clearSession()
+            hasSentKeyExchange = false
+            hasReceivedKeyExchange = false
         }
     }
 
     private fun initiateE2eeHandshake() {
+        if (hasSentKeyExchange) {
+            LayoverFileLogger.log("KeyExchange already sent. Skipping duplicate send.")
+            return
+        }
+        hasSentKeyExchange = true
         LayoverFileLogger.log("Initiating E2EE key exchange handshake over GATT...")
         val pubKeyB64 = sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
@@ -424,6 +441,8 @@ class BleProximityTransport(
         stopDiscovery()
         rateLimiter.clearAll()
         sessionCryptoManager.clearSession()
+        hasSentKeyExchange = false
+        hasReceivedKeyExchange = false
         gattSessionManager.cleanup()
     }
 }

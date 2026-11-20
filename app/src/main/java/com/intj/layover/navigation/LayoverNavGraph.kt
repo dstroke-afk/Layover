@@ -107,7 +107,7 @@ fun LayoverNavGraph(
 
     NavHost(
         navController = navController,
-        startDestination = LayoverRoute.Splash.route,
+        startDestination = LayoverRoute.PeopleAround.route, // Start directly on People Around
         modifier = modifier
     ) {
         composable(LayoverRoute.Splash.route) {
@@ -148,7 +148,6 @@ fun LayoverNavGraph(
                     onUpdateUiState(uiState.copy(nearbyPeers = updatedPeers))
                 },
                 onOpenChat = { peerId ->
-                    uiState.transport.acceptConnectionRequest(peerId)
                     navController.navigate(LayoverRoute.Chat.createRoute(peerId))
                 },
                 onToggleBlockPeer = toggleBlockPeer,
@@ -179,8 +178,8 @@ fun LayoverNavGraph(
             arguments = listOf(navArgument("peerId") { type = NavType.StringType })
         ) { backStackEntry ->
             val peerId = backStackEntry.arguments?.getString("peerId") ?: ""
-            val peer = uiState.nearbyPeers.find { it.id == peerId }
-            val messages = uiState.chatMessages[peerId] ?: emptyList()
+            val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+            val messages = uiState.chatMessages[peerId] ?: uiState.chatMessages[peer?.id] ?: emptyList()
             val isBlocked = uiState.blockedPeerIds.contains(peerId)
             val isMuted = uiState.mutedPeerIds.contains(peerId)
 
@@ -203,6 +202,9 @@ fun LayoverNavGraph(
                     val currentList = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
                     currentList.add(newMsg)
                     updatedMap[peerId] = currentList
+                    if (peer != null) {
+                        updatedMap[peer.id] = currentList
+                    }
                     onUpdateUiState(uiState.copy(chatMessages = updatedMap))
                 },
                 onToggleBlockPeer = toggleBlockPeer,
