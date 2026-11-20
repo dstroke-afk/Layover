@@ -88,7 +88,6 @@ class GattSessionManager(
                     connectedDevice = device
                     isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
-                    // Server is ready immediately upon connection for key exchange
                     scope.launch {
                         onGattReady?.invoke()
                     }
@@ -110,7 +109,7 @@ class GattSessionManager(
                 offset: Int,
                 value: ByteArray?
             ) {
-                if (characteristic?.uuid == LAYOVER_TX_CHAR_UUID && value != null) {
+                if (characteristic?.uuid?.equals(LAYOVER_TX_CHAR_UUID) == true && value != null) {
                     if (responseNeeded) {
                         device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
                     }
@@ -127,7 +126,7 @@ class GattSessionManager(
                 offset: Int,
                 value: ByteArray?
             ) {
-                if (descriptor?.uuid == CLIENT_CONFIG_DESCRIPTOR_UUID) {
+                if (descriptor?.uuid?.equals(CLIENT_CONFIG_DESCRIPTOR_UUID) == true) {
                     if (responseNeeded) {
                         device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
                     }
@@ -215,7 +214,10 @@ class GattSessionManager(
 
             override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    LayoverFileLogger.log("GATT Services discovered successfully. Requesting MTU 512...")
+                    val service = gatt?.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
+                    val rxChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) }
+                    val txChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_TX_CHAR_UUID) }
+                    LayoverFileLogger.log("GATT Services discovered. Service found: ${service != null}, RX found: ${rxChar != null}, TX found: ${txChar != null}")
                     gatt?.requestMtu(512)
                 } else {
                     LayoverFileLogger.logError("GATT Services discovery failed with status: $status")
@@ -229,7 +231,7 @@ class GattSessionManager(
             }
 
             override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS && descriptor?.uuid == CLIENT_CONFIG_DESCRIPTOR_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS && descriptor?.uuid?.equals(CLIENT_CONFIG_DESCRIPTOR_UUID) == true) {
                     LayoverFileLogger.log("GATT Client successfully subscribed to notifications (onDescriptorWrite SUCCESS).")
                     setConnectionState(RfcommConnectionState.CONNECTED)
                     scope.launch {
@@ -240,9 +242,19 @@ class GattSessionManager(
                 }
             }
 
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                if (characteristic.uuid.equals(LAYOVER_RX_CHAR_UUID)) {
+                    parseIncomingBytes(value, device.address)
+                }
+            }
+
             @Deprecated("Deprecated in Java")
             override fun onCharacteristicChanged(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?) {
-                if (characteristic?.uuid == LAYOVER_RX_CHAR_UUID) {
+                if (characteristic?.uuid?.equals(LAYOVER_RX_CHAR_UUID) == true) {
                     @Suppress("DEPRECATION")
                     characteristic.value?.let { parseIncomingBytes(it, device.address) }
                 }
@@ -261,20 +273,22 @@ class GattSessionManager(
 
     @SuppressLint("MissingPermission")
     private fun enableNotifications(gatt: BluetoothGatt?) {
-        val service = gatt?.getService(LAYOVER_GATT_SERVICE_UUID)
-        val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID)
+        val service = gatt?.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: gatt?.getService(LAYOVER_GATT_SERVICE_UUID)
+        val rxChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: service?.getCharacteristic(LAYOVER_RX_CHAR_UUID)
         if (rxChar != null) {
-            gatt.setCharacteristicNotification(rxChar, true)
-            val desc = rxChar.getDescriptor(CLIENT_CONFIG_DESCRIPTOR_UUID)
+            gatt?.setCharacteristicNotification(rxChar, true)
+            val desc = rxChar.descriptors?.find { it.uuid.equals(CLIENT_CONFIG_DESCRIPTOR_UUID) } ?: rxChar.getDescriptor(CLIENT_CONFIG_DESCRIPTOR_UUID)
             if (desc != null) {
                 desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                    gatt?.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
                 } else {
                     @Suppress("DEPRECATION")
-                    gatt.writeDescriptor(desc)
+                    gatt?.writeDescriptor(desc)
                 }
                 LayoverFileLogger.log("GATT Client initiated writeDescriptor for notifications.")
+            } else {
+                LayoverFileLogger.logError("GATT CCCD Descriptor 0x2902 not found on RX characteristic.")
             }
         } else {
             LayoverFileLogger.logError("GATT RX characteristic not found for enabling notifications.")
@@ -322,8 +336,8 @@ class GattSessionManager(
         if (isServerRole) {
             val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
             val device = connectedDevice ?: return false.also { LayoverFileLogger.logError("GATT Server connectedDevice is null when sending frame.") }
-            val service = server.getService(LAYOVER_GATT_SERVICE_UUID)
-            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
+            val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
+            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
 
             val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 server.notifyCharacteristicChanged(device, rxChar, false, fullPacket) == android.bluetooth.BluetoothStatusCodes.SUCCESS
@@ -341,8 +355,8 @@ class GattSessionManager(
             return success
         } else {
             val client = activeGattClient ?: return false.also { LayoverFileLogger.logError("GATT Client is null when sending frame.") }
-            val service = client.getService(LAYOVER_GATT_SERVICE_UUID)
-            val txChar = service?.getCharacteristic(LAYOVER_TX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT TX characteristic null on client.") }
+            val service = client.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: client.getService(LAYOVER_GATT_SERVICE_UUID)
+            val txChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_TX_CHAR_UUID) } ?: service?.getCharacteristic(LAYOVER_TX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT TX characteristic null on client.") }
 
             val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 client.writeCharacteristic(txChar, fullPacket, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == android.bluetooth.BluetoothStatusCodes.SUCCESS
@@ -362,6 +376,7 @@ class GattSessionManager(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun disconnect() {
         try {
             activeGattClient?.disconnect()
