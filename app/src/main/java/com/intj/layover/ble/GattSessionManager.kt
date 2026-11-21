@@ -50,6 +50,9 @@ class GattSessionManager(
     private val _connectionState = MutableStateFlow(RfcommConnectionState.DISCONNECTED)
     val connectionState: StateFlow<RfcommConnectionState> = _connectionState.asStateFlow()
 
+    private val _isGattReady = MutableStateFlow(false)
+    val isGattReady: StateFlow<Boolean> = _isGattReady.asStateFlow()
+
     private val _incomingMessages = MutableSharedFlow<P2PMessageFrame>()
     val incomingMessages: SharedFlow<P2PMessageFrame> = _incomingMessages.asSharedFlow()
 
@@ -103,6 +106,7 @@ class GattSessionManager(
                     if (connectedDevice?.address == device?.address) {
                         connectedDevice = null
                         setConnectionState(RfcommConnectionState.DISCONNECTED)
+                        _isGattReady.value = false
                     }
                 }
             }
@@ -118,9 +122,18 @@ class GattSessionManager(
             ) {
                 if (characteristic?.uuid?.equals(LAYOVER_TX_CHAR_UUID) == true && value != null) {
                     if (responseNeeded) {
-                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
+                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
                     }
                     parseIncomingBytes(value, device?.address ?: "remote_peer")
+                } else if (characteristic?.uuid?.equals(LAYOVER_RX_CHAR_UUID) == true && value != null) {
+                    if (responseNeeded) {
+                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
+                    }
+                    parseIncomingBytes(value, device?.address ?: "remote_peer")
+                } else {
+                    if (responseNeeded) {
+                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null) }
+                    }
                 }
             }
 
@@ -135,9 +148,10 @@ class GattSessionManager(
             ) {
                 if (descriptor?.uuid?.equals(CLIENT_CONFIG_DESCRIPTOR_UUID) == true) {
                     if (responseNeeded) {
-                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
+                        device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
                     }
                     LayoverFileLogger.log("GATT Server: Client subscribed to notifications. Triggering server ready & flushing queue...")
+                    _isGattReady.value = true
                     scope.launch {
                         onGattReady?.invoke()
                         flushQueue()
@@ -162,8 +176,8 @@ class GattSessionManager(
 
                 val rxChar = BluetoothGattCharacteristic(
                     LAYOVER_RX_CHAR_UUID,
-                    BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-                    BluetoothGattCharacteristic.PERMISSION_READ
+                    BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                    BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
                 )
 
                 val rxDesc = BluetoothGattDescriptor(
@@ -195,6 +209,7 @@ class GattSessionManager(
             // Ignore
         }
         gattServer = null
+        _isGattReady.value = false
     }
 
     @SuppressLint("MissingPermission")
@@ -204,7 +219,6 @@ class GattSessionManager(
             return
         }
 
-        // Clean up prior client connection cleanly
         try {
             activeGattClient?.disconnect()
             activeGattClient?.close()
@@ -214,6 +228,7 @@ class GattSessionManager(
         activeGattClient = null
 
         setConnectionState(RfcommConnectionState.CONNECTING, "GATT Client connecting to ${device.address}...")
+        _isGattReady.value = false
         connectedDevice = device
         isServerRole = false
 
@@ -222,17 +237,19 @@ class GattSessionManager(
         val clientCallback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
-                    LayoverFileLogger.log("GATT Client connected to ${device.address}. Waiting 200ms settle delay before discovering services...")
+                    LayoverFileLogger.log("GATT Client connected to ${device.address}. Waiting 120ms settle delay before discovering services...")
                     scope.launch {
-                        delay(200)
+                        delay(120)
                         gatt?.discoverServices()
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Client disconnected from ${device.address}")
                     setConnectionState(RfcommConnectionState.DISCONNECTED)
+                    _isGattReady.value = false
                 } else if (status != BluetoothGatt.GATT_SUCCESS) {
                     LayoverFileLogger.logError("GATT Client connection error status: $status")
                     setConnectionState(RfcommConnectionState.FAILED, "GATT status $status")
+                    _isGattReady.value = false
                 }
             }
 
@@ -242,7 +259,7 @@ class GattSessionManager(
                     if (service == null) {
                         serviceDiscoveryRetryCount++
                         if (serviceDiscoveryRetryCount <= 2) {
-                            LayoverFileLogger.logError("GATT Services discovered but Layover service not visible (attempt $serviceDiscoveryRetryCount). Refreshing cache & retrying in 400ms...")
+                            LayoverFileLogger.logError("GATT Services discovered but Layover service not visible (attempt $serviceDiscoveryRetryCount). Refreshing cache & retrying in 250ms...")
                             if (serviceDiscoveryRetryCount == 2) {
                                 runCatching {
                                     val refreshMethod = gatt.javaClass.getMethod("refresh")
@@ -251,13 +268,14 @@ class GattSessionManager(
                                 }
                             }
                             scope.launch {
-                                delay(400)
+                                delay(250)
                                 gatt.discoverServices()
                             }
                             return
                         } else {
                             LayoverFileLogger.logError("GATT Services discovery failed: Layover service not found after retries.")
                             setConnectionState(RfcommConnectionState.FAILED, "Layover service not found")
+                            _isGattReady.value = false
                             return
                         }
                     }
@@ -270,6 +288,7 @@ class GattSessionManager(
                     serviceDiscoveryRetryCount = 0
                     LayoverFileLogger.logError("GATT Services discovery failed with status: $status")
                     setConnectionState(RfcommConnectionState.FAILED, "Services discovery status $status")
+                    _isGattReady.value = false
                 }
             }
 
@@ -282,6 +301,7 @@ class GattSessionManager(
                 if (status == BluetoothGatt.GATT_SUCCESS && descriptor?.uuid?.equals(CLIENT_CONFIG_DESCRIPTOR_UUID) == true) {
                     LayoverFileLogger.log("GATT Client successfully subscribed to notifications (onDescriptorWrite SUCCESS).")
                     setConnectionState(RfcommConnectionState.CONNECTED)
+                    _isGattReady.value = true
                     scope.launch {
                         onGattReady?.invoke()
                         flushQueue()
@@ -321,6 +341,7 @@ class GattSessionManager(
         } catch (e: Exception) {
             LayoverFileLogger.logError("Exception connecting GATT client", e)
             setConnectionState(RfcommConnectionState.FAILED, e.message)
+            _isGattReady.value = false
         }
     }
 
@@ -391,9 +412,9 @@ class GattSessionManager(
                     val success = sendFrameNow(frame)
                     if (success) {
                         pendingOutboundFrames.poll()
-                        delay(120) // Serialization write pacing between frames
+                        delay(60) // Fast serialization write pacing between frames
                     } else {
-                        delay(300) // Brief backoff on write failure before retrying
+                        delay(150) // Brief backoff on write failure before retrying
                         break
                     }
                 }
@@ -454,10 +475,12 @@ class GattSessionManager(
     @SuppressLint("MissingPermission")
     fun sendFrame(text: String): Boolean {
         pendingOutboundFrames.add(text)
-        if (_connectionState.value == RfcommConnectionState.CONNECTED) {
+        if (isServerRole && _connectionState.value == RfcommConnectionState.CONNECTED) {
+            flushQueue()
+        } else if (!isServerRole && _isGattReady.value) {
             flushQueue()
         } else {
-            LayoverFileLogger.log("GATT not yet connected. Enqueued outbound frame: ${text.take(30)}...")
+            LayoverFileLogger.log("GATT client not yet fully subscribed to notifications. Enqueued outbound frame: ${text.take(30)}...")
         }
         return true
     }
@@ -474,6 +497,7 @@ class GattSessionManager(
         connectedDevice = null
         stopServer()
         _connectionState.value = RfcommConnectionState.DISCONNECTED
+        _isGattReady.value = false
     }
 
     fun cleanup() {
