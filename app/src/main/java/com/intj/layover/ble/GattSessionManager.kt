@@ -105,6 +105,7 @@ class GattSessionManager(
                     connectedDevice = device
                     isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
+                    // Gate server flush until client writes CCCD notification descriptor
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
                     device?.let { subscribedClients.remove(it) }
@@ -501,12 +502,12 @@ class GattSessionManager(
     @SuppressLint("MissingPermission")
     fun sendFrame(text: String): Boolean {
         pendingOutboundFrames.add(text)
-        if (isServerRole && _connectionState.value == RfcommConnectionState.CONNECTED) {
+        if (isServerRole && _isGattReady.value) {
             flushQueue()
         } else if (!isServerRole && _isGattReady.value) {
             flushQueue()
         } else {
-            LayoverFileLogger.log("GATT client not yet fully subscribed to notifications. Enqueued outbound frame: ${text.take(30)}...")
+            LayoverFileLogger.log("GATT channel not yet fully ready/subscribed. Enqueued outbound frame: ${text.take(30)}...")
         }
         return true
     }
