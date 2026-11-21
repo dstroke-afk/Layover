@@ -63,7 +63,6 @@ class GattSessionManager(
     private var gattServer: BluetoothGattServer? = null
     private var activeGattClient: BluetoothGatt? = null
     private var connectedDevice: BluetoothDevice? = null
-    private var isServerRole = false
 
     private val incomingBuffer = mutableListOf<Byte>()
     private val pendingOutboundFrames = ConcurrentLinkedQueue<String>()
@@ -103,7 +102,6 @@ class GattSessionManager(
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client connected: ${device?.address}")
                     connectedDevice = device
-                    isServerRole = true
                     setConnectionState(RfcommConnectionState.CONNECTED)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
@@ -235,7 +233,6 @@ class GattSessionManager(
         setConnectionState(RfcommConnectionState.CONNECTING, "GATT Client connecting to ${device.address}...")
         _isGattReady.value = false
         connectedDevice = device
-        isServerRole = false
 
         var serviceDiscoveryRetryCount = 0
 
@@ -453,29 +450,9 @@ class GattSessionManager(
         val frameType = text.substringBefore("|")
         val remoteMac = connectedDevice?.address ?: activeGattClient?.device?.address ?: "unknown_mac"
 
-        if (isServerRole) {
-            val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
-            val device = connectedDevice ?: return false.also { LayoverFileLogger.logError("GATT Server connectedDevice is null when sending frame.") }
-            val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
-            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
-
-            LayoverFileLogger.log("GATT Server attempting notify: type=$frameType, size=${payload.size}, targetCharUUID=$LAYOVER_RX_CHAR_UUID, remoteMac=$remoteMac")
-            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                server.notifyCharacteristicChanged(device, rxChar, false, fullPacket) == android.bluetooth.BluetoothStatusCodes.SUCCESS
-            } else {
-                rxChar.value = fullPacket
-                @Suppress("DEPRECATION")
-                server.notifyCharacteristicChanged(device, rxChar, false)
-            }
-
-            if (success) {
-                LayoverFileLogger.log("GATT Server notification SUCCESS: type=$frameType, size=${payload.size}")
-            } else {
-                LayoverFileLogger.logError("GATT Server notification FAILED: type=$frameType, size=${payload.size}")
-            }
-            return success
-        } else {
-            val client = activeGattClient ?: return false.also { LayoverFileLogger.logError("GATT Client is null when sending frame.") }
+        val client = activeGattClient
+        if (client != null) {
+            // We are acting as GATT Client - write to remote server RX characteristic
             val service = client.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: client.getService(LAYOVER_GATT_SERVICE_UUID)
             val rxChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on client for write.") }
 
@@ -506,6 +483,28 @@ class GattSessionManager(
                 LayoverFileLogger.logError("GATT Client writeCharacteristic timeout waiting for onCharacteristicWrite for type=$frameType", e)
                 false
             }
+        } else {
+            // We are acting as GATT Server - notify subscribed client
+            val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
+            val device = connectedDevice ?: return false.also { LayoverFileLogger.logError("GATT Server connectedDevice is null when sending frame.") }
+            val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
+            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
+
+            LayoverFileLogger.log("GATT Server attempting notify: type=$frameType, size=${payload.size}, targetCharUUID=$LAYOVER_RX_CHAR_UUID, remoteMac=$remoteMac")
+            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                server.notifyCharacteristicChanged(device, rxChar, false, fullPacket) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+            } else {
+                rxChar.value = fullPacket
+                @Suppress("DEPRECATION")
+                server.notifyCharacteristicChanged(device, rxChar, false)
+            }
+
+            if (success) {
+                LayoverFileLogger.log("GATT Server notification SUCCESS: type=$frameType, size=${payload.size}")
+            } else {
+                LayoverFileLogger.logError("GATT Server failed to send notification frame: type=$frameType, size=${payload.size}")
+            }
+            return success
         }
     }
 
@@ -514,9 +513,9 @@ class GattSessionManager(
         val frameType = text.substringBefore("|")
         LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=${text.length}")
         pendingOutboundFrames.add(text)
-        if (isServerRole && _connectionState.value == RfcommConnectionState.CONNECTED) {
+        if (activeGattClient != null && _isGattReady.value) {
             flushQueue()
-        } else if (!isServerRole && _isGattReady.value) {
+        } else if (gattServer != null && _connectionState.value == RfcommConnectionState.CONNECTED) {
             flushQueue()
         } else {
             LayoverFileLogger.log("GATT channel not yet ready. Enqueued outbound frame: type=$frameType")
