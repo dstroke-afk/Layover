@@ -105,7 +105,7 @@ class BleProximityTransport(
             }
         }
 
-        // Handle incoming wire frames with safety, block, and rate-limiting enforcement
+        // Handle incoming wire frames with safety, block, and rate-limiting enforcement independent of rotating MACs
         scope.launch {
             gattSessionManager.incomingMessages.collect { rawFrame ->
                 val currentPeer = activePeerId ?: rawFrame.senderId
@@ -144,8 +144,12 @@ class BleProximityTransport(
 
                 diagnosticsTracker.incrementMessagesReceived()
 
+                // Associate activePeerId from frame senderId for RPA MAC rotation independence
                 when (frame) {
                     is WireFrame.KeyExchange -> {
+                        if (frame.senderId.isNotEmpty() && frame.senderId != "local" && frame.senderId != "user") {
+                            activePeerId = frame.senderId
+                        }
                         LayoverFileLogger.log("KeyExchange applied for peer=${frame.senderId}. Algorithm=${frame.algorithm}")
                         hasReceivedKeyExchange = true
                         if (sessionCryptoManager.getLocalPublicKeyBase64() == null) {
@@ -155,6 +159,7 @@ class BleProximityTransport(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
                         )
+                        LayoverFileLogger.log("KeyExchange establishRemoteKey success=$success for peer=${frame.senderId}")
 
                         // Always send local KeyExchange response if session is not yet fully established
                         if (!sessionCryptoManager.isSessionKeyEstablished && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
@@ -177,27 +182,39 @@ class BleProximityTransport(
                             LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed successfully for peer=${frame.senderId}. Fingerprint=${sessionCryptoManager.sessionFingerprint}")
                             diagnosticsTracker.updateLastErrorMessage(null)
                         } else {
-                            LayoverFileLogger.logError("Key exchange establishment failed for peer=${frame.senderId}.")
-                            diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
+                            LayoverFileLogger.logError("Key exchange establishment pending for peer=${frame.senderId}.")
+                            diagnosticsTracker.updateLastErrorMessage("E2EE key exchange pending")
                         }
                     }
 
                     is WireFrame.ConnectionRequest -> {
+                        if (frame.senderId.isNotEmpty()) {
+                            activePeerId = frame.senderId
+                        }
                         LayoverFileLogger.log("Received ConnectionRequest from ${frame.senderId} (${frame.displayName})")
                         _incomingConnectionRequestFlow.emit(Pair(frame.senderId, frame.displayName))
                     }
 
                     is WireFrame.ConnectionAccept -> {
+                        if (frame.senderId.isNotEmpty()) {
+                            activePeerId = frame.senderId
+                        }
                         LayoverFileLogger.log("Received ConnectionAccept from ${frame.senderId}")
                         _incomingConnectionAcceptFlow.emit(frame.senderId)
                     }
 
                     is WireFrame.ConnectionDecline -> {
+                        if (frame.senderId.isNotEmpty()) {
+                            activePeerId = frame.senderId
+                        }
                         LayoverFileLogger.log("Received ConnectionDecline from ${frame.senderId}")
                         _incomingConnectionDeclineFlow.emit(frame.senderId)
                     }
 
                     is WireFrame.ChatEncrypted -> {
+                        if (frame.senderId.isNotEmpty()) {
+                            activePeerId = frame.senderId
+                        }
                         val iv = try {
                             Base64.decode(frame.ivBase64, Base64.NO_WRAP)
                         } catch (e: Exception) {
