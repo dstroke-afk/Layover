@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,8 +24,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.automirrored.filled.VolumeMute
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
@@ -85,6 +84,7 @@ fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp)
+                .imePadding()
         ) {
             // Header
             Row(
@@ -131,15 +131,6 @@ fun ChatScreen(
                             fontWeight = FontWeight.Bold,
                             color = LightText
                         )
-                        if (isMuted) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.VolumeOff,
-                                contentDescription = "Muted",
-                                tint = MutedText,
-                                modifier = Modifier.size(14.dp)
-                            )
-                        }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
@@ -171,20 +162,6 @@ fun ChatScreen(
                         onDismissRequest = { showChatMenu = false },
                         modifier = Modifier.background(ElevatedCardSurface)
                     ) {
-                        DropdownMenuItem(
-                            text = { Text(if (isMuted) "Unmute Peer" else "Mute Peer", color = LightText) },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeMute else Icons.AutoMirrored.Filled.VolumeOff,
-                                    contentDescription = null,
-                                    tint = CyanAccent
-                                )
-                            },
-                            onClick = {
-                                showChatMenu = false
-                                onToggleMutePeer(peerId)
-                            }
-                        )
                         DropdownMenuItem(
                             text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
                             leadingIcon = {

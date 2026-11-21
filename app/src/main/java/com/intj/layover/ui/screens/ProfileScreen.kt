@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -60,6 +61,7 @@ fun ProfileScreen(
     var displayNameText by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.displayName) }
     var handleText by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.handle) }
     var isVisible by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.isVisibleToNearby) }
+    var showSavedDialog by remember { mutableStateOf(false) }
 
     val initials = remember(displayNameText) {
         displayNameText.split(" ")
@@ -68,6 +70,25 @@ fun ProfileScreen(
             .joinToString("")
             .ifEmpty { "BE" }
             .uppercase()
+    }
+
+    if (showSavedDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showSavedDialog = false
+                onNavigateBack()
+            },
+            title = { Text("Changes saved") },
+            text = { Text("Your profile changes have been saved successfully.") },
+            confirmButton = {
+                Button(onClick = {
+                    showSavedDialog = false
+                    onNavigateBack()
+                }) {
+                    Text("OK")
+                }
+            }
+        )
     }
 
     LayoverBackground {
@@ -180,6 +201,7 @@ fun ProfileScreen(
                                 isVisibleToNearby = isVisible
                             )
                             onSaveProfile(updatedProfile)
+                            showSavedDialog = true
                         },
                         modifier = Modifier
                             .fillMaxWidth()
