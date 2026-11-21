@@ -142,9 +142,11 @@ class BleProximityTransport(
                     return@collect
                 }
 
+                diagnosticsTracker.incrementMessagesReceived()
+
                 when (frame) {
                     is WireFrame.KeyExchange -> {
-                        LayoverFileLogger.log("Received KeyExchange frame from ${frame.senderId}. Algorithm=${frame.algorithm}")
+                        LayoverFileLogger.log("KeyExchange applied for peer=${frame.senderId}. Algorithm=${frame.algorithm}")
                         hasReceivedKeyExchange = true
                         if (sessionCryptoManager.getLocalPublicKeyBase64() == null) {
                             sessionCryptoManager.generateKeyPair()
@@ -153,7 +155,9 @@ class BleProximityTransport(
                             remotePublicKeyBase64 = frame.publicKeyBase64,
                             algorithmName = frame.algorithm
                         )
-                        if (success && !hasSentKeyExchange && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
+
+                        // Always send local KeyExchange response if session is not yet fully established
+                        if (!sessionCryptoManager.isSessionKeyEstablished && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
                             hasSentKeyExchange = true
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
                             val localId = currentUserProfile.handle.ifEmpty { "local" }
@@ -162,6 +166,7 @@ class BleProximityTransport(
                                 publicKeyBase64 = localPub,
                                 algorithm = sessionCryptoManager.getAlgorithmName()
                             )
+                            LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId}...")
                             gattSessionManager.sendFrame(responsePayload)
                         }
 
@@ -169,10 +174,10 @@ class BleProximityTransport(
                         diagnosticsTracker.updateKeyHandshakeComplete(isEstablished)
                         diagnosticsTracker.updateSessionFingerprint(sessionCryptoManager.sessionFingerprint)
                         if (isEstablished) {
-                            LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed successfully. Fingerprint=${sessionCryptoManager.sessionFingerprint}")
+                            LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed successfully for peer=${frame.senderId}. Fingerprint=${sessionCryptoManager.sessionFingerprint}")
                             diagnosticsTracker.updateLastErrorMessage(null)
                         } else {
-                            LayoverFileLogger.logError("Key exchange establishment failed.")
+                            LayoverFileLogger.logError("Key exchange establishment failed for peer=${frame.senderId}.")
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange failed")
                         }
                     }
@@ -212,7 +217,6 @@ class BleProximityTransport(
 
                         if (decryptedText != null) {
                             LayoverFileLogger.log("Successfully decrypted chat message from $currentPeer")
-                            diagnosticsTracker.incrementMessagesReceived()
                             diagnosticsTracker.updateLastErrorMessage(null)
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
@@ -248,8 +252,8 @@ class BleProximityTransport(
     }
 
     private fun initiateE2eeHandshake() {
-        if (hasSentKeyExchange) {
-            LayoverFileLogger.log("KeyExchange already sent. Skipping duplicate send.")
+        if (hasSentKeyExchange && sessionCryptoManager.isSessionKeyEstablished) {
+            LayoverFileLogger.log("KeyExchange already completed. Skipping duplicate send.")
             return
         }
         hasSentKeyExchange = true
