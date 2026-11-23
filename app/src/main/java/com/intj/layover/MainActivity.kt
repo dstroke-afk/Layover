@@ -1,5 +1,6 @@
 package com.intj.layover
 
+import android.content.Context.MODE_PRIVATE
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -31,6 +32,7 @@ import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
+import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.ui.theme.LayoverTheme
@@ -50,6 +52,16 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        val prefs = applicationContext.getSharedPreferences("layover_user_profile", MODE_PRIVATE)
+        val savedName = prefs.getString("display_name", "Balaji Eswar") ?: "Balaji Eswar"
+        val savedHandle = prefs.getString("handle", "balajieswar") ?: "balajieswar"
+        val savedVisible = prefs.getBoolean("is_visible", true)
+        val initialProfile = UserProfile(
+            displayName = savedName,
+            handle = savedHandle,
+            isVisibleToNearby = savedVisible
+        )
+
         bleStateController = BleStateController(applicationContext)
         bleDiscoveryManager = BleDiscoveryManager(applicationContext, bleStateController)
         gattSessionManager = GattSessionManager(applicationContext)
@@ -57,7 +69,8 @@ class MainActivity : ComponentActivity() {
             context = applicationContext,
             discoveryManager = bleDiscoveryManager,
             bleStateController = bleStateController,
-            gattSessionManager = gattSessionManager
+            gattSessionManager = gattSessionManager,
+            currentUserProfile = initialProfile
         )
 
         setContent {
@@ -70,6 +83,7 @@ class MainActivity : ComponentActivity() {
             var uiState by remember {
                 mutableStateOf(
                     LayoverUiState(
+                        userProfile = initialProfile,
                         nearbyPeers = emptyList(),
                         isScanning = true, // Auto-start discovery by default on launch
                         transport = bleTransport,
@@ -128,10 +142,20 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
                     incomingRequestPeer = Pair(peerId, displayName)
-                    val updatedPeers = uiState.nearbyPeers.map { p ->
-                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.REQUESTED) else p
+                    val existing = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+                    if (existing == null) {
+                        val newPeer = com.intj.layover.model.NearbyPeer(
+                            id = peerId,
+                            displayName = displayName,
+                            status = ConnectionStatus.REQUESTED
+                        )
+                        uiState = uiState.copy(nearbyPeers = uiState.nearbyPeers + newPeer)
+                    } else {
+                        val updatedPeers = uiState.nearbyPeers.map { p ->
+                            if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.REQUESTED) else p
+                        }
+                        uiState = uiState.copy(nearbyPeers = updatedPeers)
                     }
-                    uiState = uiState.copy(nearbyPeers = updatedPeers)
                 }
             }
 
@@ -308,9 +332,13 @@ class MainActivity : ComponentActivity() {
                             blocked = newState.blockedPeerIds,
                             muted = newState.mutedPeerIds
                         )
-                        if (newState.userProfile.displayName != oldProfile.displayName ||
-                            newState.userProfile.handle != oldProfile.handle ||
-                            newState.userProfile.isVisibleToNearby != oldProfile.isVisibleToNearby) {
+                        if (newState.userProfile != oldProfile) {
+                            prefs.edit()
+                                .putString("display_name", newState.userProfile.displayName)
+                                .putString("handle", newState.userProfile.handle)
+                                .putBoolean("is_visible", newState.userProfile.isVisibleToNearby)
+                                .apply()
+
                             if (newState.userProfile.isVisibleToNearby) {
                                 bleDiscoveryManager.startAdvertising(newState.userProfile)
                             } else {

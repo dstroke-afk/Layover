@@ -87,20 +87,26 @@ fun LayoverNavGraph(
 ) {
     val toggleBlockPeer = { peerId: String ->
         val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
-        if (updatedBlocked.contains(peerId)) {
-            updatedBlocked.remove(peerId)
+        val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+        val targetId = peer?.id ?: peerId
+
+        if (updatedBlocked.contains(targetId)) {
+            updatedBlocked.remove(targetId)
         } else {
-            updatedBlocked.add(peerId)
+            updatedBlocked.add(targetId)
         }
         onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
     }
 
     val toggleMutePeer = { peerId: String ->
         val updatedMuted = uiState.mutedPeerIds.toMutableSet()
-        if (updatedMuted.contains(peerId)) {
-            updatedMuted.remove(peerId)
+        val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+        val targetId = peer?.id ?: peerId
+
+        if (updatedMuted.contains(targetId)) {
+            updatedMuted.remove(targetId)
         } else {
-            updatedMuted.add(peerId)
+            updatedMuted.add(targetId)
         }
         onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
     }
@@ -143,7 +149,7 @@ fun LayoverNavGraph(
                 onConnectPeer = { peerId ->
                     uiState.transport.sendConnectionRequest(peerId)
                     val updatedPeers = uiState.nearbyPeers.map { peer ->
-                        if (peer.id == peerId) peer.copy(status = ConnectionStatus.REQUESTED) else peer
+                        if (peer.id == peerId || peer.handle == peerId) peer.copy(status = ConnectionStatus.REQUESTED) else peer
                     }
                     onUpdateUiState(uiState.copy(nearbyPeers = updatedPeers))
                 },
@@ -178,10 +184,13 @@ fun LayoverNavGraph(
             arguments = listOf(navArgument("peerId") { type = NavType.StringType })
         ) { backStackEntry ->
             val peerId = backStackEntry.arguments?.getString("peerId") ?: ""
-            val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+            val peer = uiState.nearbyPeers.find {
+                it.id == peerId || it.handle == peerId || it.displayName == peerId || it.id.equals(peerId, ignoreCase = true)
+            } ?: uiState.nearbyPeers.firstOrNull()
+
             val messages = uiState.chatMessages[peerId] ?: uiState.chatMessages[peer?.id] ?: emptyList()
-            val isBlocked = uiState.blockedPeerIds.contains(peerId)
-            val isMuted = uiState.mutedPeerIds.contains(peerId)
+            val isBlocked = uiState.blockedPeerIds.contains(peerId) || (peer != null && uiState.blockedPeerIds.contains(peer.id))
+            val isMuted = uiState.mutedPeerIds.contains(peerId) || (peer != null && uiState.mutedPeerIds.contains(peer.id))
 
             ChatScreen(
                 peer = peer,
