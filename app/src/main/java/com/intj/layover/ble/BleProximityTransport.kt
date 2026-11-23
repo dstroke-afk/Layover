@@ -110,16 +110,17 @@ class BleProximityTransport(
             gattSessionManager.incomingMessages.collect { rawFrame ->
                 val currentPeer = activePeerId ?: rawFrame.senderId
 
-                // Block enforcement
-                if (blockedPeerIds.contains(currentPeer)) {
-                    LayoverFileLogger.log("Dropping frame from blocked peer: $currentPeer")
+                // Unified block enforcement across MAC, active peer ID, and alias strings
+                val isBlocked = blockedPeerIds.contains(currentPeer) ||
+                        blockedPeerIds.contains(rawFrame.senderId) ||
+                        blockedPeerIds.any { blockedId ->
+                            currentPeer.equals(blockedId, ignoreCase = true) ||
+                                    rawFrame.senderId.equals(blockedId, ignoreCase = true)
+                        }
+
+                if (isBlocked) {
+                    LayoverFileLogger.log("Dropping frame from blocked peer: currentPeer=$currentPeer, rawSender=${rawFrame.senderId}")
                     diagnosticsTracker.incrementBlockedDrops()
-                    gattSessionManager.disconnect()
-                    sessionCryptoManager.clearSession()
-                    hasSentKeyExchange = false
-                    hasReceivedKeyExchange = false
-                    diagnosticsTracker.updateKeyHandshakeComplete(false)
-                    diagnosticsTracker.updateSessionFingerprint(null)
                     return@collect
                 }
 
@@ -258,9 +259,12 @@ class BleProximityTransport(
     }
 
     fun updateSafetySettings(blocked: Set<String>, muted: Set<String>) {
+        val wasBlocked = activePeerId != null && blockedPeerIds.contains(activePeerId)
         blockedPeerIds = blocked
         mutedPeerIds = muted
-        if (activePeerId != null && blockedPeerIds.contains(activePeerId)) {
+        val isNowBlocked = activePeerId != null && blockedPeerIds.contains(activePeerId)
+
+        if (!wasBlocked && isNowBlocked) {
             gattSessionManager.disconnect()
             sessionCryptoManager.clearSession()
             hasSentKeyExchange = false
@@ -438,23 +442,24 @@ class BleProximityTransport(
         val msgId = "msg_${System.currentTimeMillis()}"
 
         val encryptedPayload = sessionCryptoManager.encryptText(text)
-        val sent = if (encryptedPayload != null) {
+        if (encryptedPayload != null) {
             val wirePayload = WireFrameCodec.encodeChatEncrypted(
                 msgId = msgId,
                 senderId = localId,
                 timestamp = System.currentTimeMillis(),
                 payload = encryptedPayload
             )
-            gattSessionManager.sendFrame(wirePayload)
+            val sent = gattSessionManager.sendFrame(wirePayload)
+            if (sent) {
+                diagnosticsTracker.incrementMessagesSent()
+                diagnosticsTracker.updateLastErrorMessage(null)
+            } else {
+                diagnosticsTracker.updateLastErrorMessage("Failed to send message frame")
+            }
         } else {
-            gattSessionManager.sendFrame(text)
-        }
-
-        if (sent) {
-            diagnosticsTracker.incrementMessagesSent()
-            diagnosticsTracker.updateLastErrorMessage(null)
-        } else {
-            diagnosticsTracker.updateLastErrorMessage("Failed to send message frame")
+            LayoverFileLogger.logError("Failed to encrypt text for peerId=$peerId. Re-initiating E2EE key exchange...")
+            initiateE2eeHandshake()
+            diagnosticsTracker.updateLastErrorMessage("E2EE key session missing - re-initiating handshake")
         }
     }
 

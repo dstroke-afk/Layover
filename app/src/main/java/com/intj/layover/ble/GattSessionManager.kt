@@ -502,7 +502,7 @@ class GattSessionManager(
             if (success) {
                 LayoverFileLogger.log("GATT Server notification SUCCESS: type=$frameType, size=${payload.size}")
             } else {
-                LayoverFileLogger.logError("GATT Server failed to send notification frame: type=$frameType, size=${payload.size}")
+                LayoverFileLogger.logError("GATT Server notification FAILED: type=$frameType, size=${payload.size}")
             }
             return success
         }
@@ -511,6 +511,17 @@ class GattSessionManager(
     @SuppressLint("MissingPermission")
     fun sendFrame(text: String): Boolean {
         val frameType = text.substringBefore("|")
+        val isValidPrefix = frameType == "KEY_EXCHANGE" ||
+                frameType == "CONNECTION_REQUEST" ||
+                frameType == "CONNECTION_ACCEPT" ||
+                frameType == "CONNECTION_DECLINE" ||
+                frameType == "CHAT_ENCRYPTED"
+
+        if (!isValidPrefix) {
+            LayoverFileLogger.logError("Dropping malformed/unframed outbound payload: ${text.take(30)}")
+            return false
+        }
+
         LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=${text.length}")
         pendingOutboundFrames.add(text)
         if (activeGattClient != null && _isGattReady.value) {

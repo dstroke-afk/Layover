@@ -1,6 +1,6 @@
 package com.intj.layover
 
-import android.content.Context.MODE_PRIVATE
+import android.content.Context
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -32,11 +32,13 @@ import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
+import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.flow.collectLatest
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -52,9 +54,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        val prefs = applicationContext.getSharedPreferences("layover_user_profile", MODE_PRIVATE)
+        val prefs = applicationContext.getSharedPreferences("layover_user_profile", Context.MODE_PRIVATE)
+        val savedDeviceId = prefs.getString("device_id", null) ?: run {
+            val newId = "dev_" + UUID.randomUUID().toString().take(8)
+            prefs.edit().putString("device_id", newId).apply()
+            newId
+        }
         val savedName = prefs.getString("display_name", "Balaji Eswar") ?: "Balaji Eswar"
-        val savedHandle = prefs.getString("handle", "balajieswar") ?: "balajieswar"
+        val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedVisible = prefs.getBoolean("is_visible", true)
         val initialProfile = UserProfile(
             displayName = savedName,
@@ -100,38 +107,55 @@ class MainActivity : ComponentActivity() {
                 uiState = uiState.copy(diagnostics = diagnostics)
             }
 
-            // Sync live discovered BLE peers into uiState and preserve local connection status
+            // Sync live discovered BLE peers into uiState, preserving status and deduplicating by name/handle/id
             LaunchedEffect(liveDiscoveredPeers) {
-                val existingMap = uiState.nearbyPeers.associateBy { it.id }
-                val merged = liveDiscoveredPeers.map { discovered ->
-                    val existing = existingMap[discovered.id]
-                    if (existing != null && existing.status != ConnectionStatus.NONE) {
-                        discovered.copy(status = existing.status)
-                    } else {
-                        discovered
+                val existingList = uiState.nearbyPeers
+                val merged = liveDiscoveredPeers
+                    .groupBy { it.displayName.ifBlank { it.id } }
+                    .map { (_, group) ->
+                        val discovered = group.first()
+                        val existing = existingList.find { p ->
+                            p.id == discovered.id ||
+                                    (p.handle.isNotEmpty() && p.handle == discovered.handle) ||
+                                    (p.displayName.isNotEmpty() && p.displayName.equals(discovered.displayName, ignoreCase = true))
+                        }
+                        if (existing != null && existing.status != ConnectionStatus.NONE) {
+                            discovered.copy(
+                                id = existing.id,
+                                handle = existing.handle.ifEmpty { discovered.handle },
+                                displayName = existing.displayName.ifEmpty { discovered.displayName },
+                                status = existing.status
+                            )
+                        } else {
+                            discovered
+                        }
                     }
-                }
                 uiState = uiState.copy(nearbyPeers = merged)
                 bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(merged.size)
-                Log.d(TAG, "UI State updated with ${merged.size} real BLE discovered peers.")
+                Log.d(TAG, "UI State updated with ${merged.size} deduplicated BLE discovered peers.")
             }
 
-            // Collect incoming P2P GATT messages and store under both raw peerId and mapped peer entries
+            // Collect incoming P2P GATT messages and store under raw peerId, handle, and display name entries
             LaunchedEffect(Unit) {
                 bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
                     val updatedMap = uiState.chatMessages.toMutableMap()
-                    val list1 = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
-                    if (!list1.any { it.id == message.id }) {
-                        list1.add(message)
-                        updatedMap[peerId] = list1
+
+                    fun addMsgToKey(key: String) {
+                        val list = updatedMap[key]?.toMutableList() ?: mutableListOf()
+                        if (!list.any { it.id == message.id }) {
+                            list.add(message)
+                            updatedMap[key] = list
+                        }
                     }
 
-                    uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }?.let { peer ->
-                        val list2 = updatedMap[peer.id]?.toMutableList() ?: mutableListOf()
-                        if (!list2.any { it.id == message.id }) {
-                            list2.add(message)
-                            updatedMap[peer.id] = list2
-                        }
+                    addMsgToKey(peerId)
+
+                    uiState.nearbyPeers.find {
+                        it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true)
+                    }?.let { peer ->
+                        addMsgToKey(peer.id)
+                        if (peer.handle.isNotEmpty()) addMsgToKey(peer.handle)
+                        if (peer.displayName.isNotEmpty()) addMsgToKey(peer.displayName)
                     }
 
                     uiState = uiState.copy(chatMessages = updatedMap)
@@ -141,21 +165,44 @@ class MainActivity : ComponentActivity() {
             // Collect incoming connection requests
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
+                    val isBlocked = uiState.blockedPeerIds.contains(peerId) ||
+                            uiState.blockedPeerIds.contains(displayName) ||
+                            uiState.blockedPeerIds.any { blocked ->
+                                peerId.equals(blocked, ignoreCase = true) || displayName.equals(blocked, ignoreCase = true)
+                            }
+
+                    if (isBlocked) {
+                        Log.d(TAG, "Dropped CONNECTION_REQUEST popup for blocked peer: $peerId ($displayName)")
+                        return@collectLatest
+                    }
+
                     incomingRequestPeer = Pair(peerId, displayName)
-                    val existing = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
-                    if (existing == null) {
-                        val newPeer = com.intj.layover.model.NearbyPeer(
+
+                    val existingPeer = uiState.nearbyPeers.find {
+                        it.id == peerId || it.handle == peerId || it.displayName.equals(displayName, ignoreCase = true)
+                    }
+
+                    val updatedPeers = if (existingPeer == null) {
+                        uiState.nearbyPeers + NearbyPeer(
                             id = peerId,
-                            displayName = displayName,
+                            displayName = displayName.ifEmpty { "Layover Peer" },
+                            handle = peerId,
                             status = ConnectionStatus.REQUESTED
                         )
-                        uiState = uiState.copy(nearbyPeers = uiState.nearbyPeers + newPeer)
                     } else {
-                        val updatedPeers = uiState.nearbyPeers.map { p ->
-                            if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.REQUESTED) else p
+                        uiState.nearbyPeers.map { p ->
+                            if (p.id == existingPeer.id || p.handle == peerId || p.displayName.equals(displayName, ignoreCase = true)) {
+                                p.copy(
+                                    handle = peerId.ifEmpty { p.handle },
+                                    displayName = displayName.ifEmpty { p.displayName },
+                                    status = ConnectionStatus.REQUESTED
+                                )
+                            } else {
+                                p
+                            }
                         }
-                        uiState = uiState.copy(nearbyPeers = updatedPeers)
                     }
+                    uiState = uiState.copy(nearbyPeers = updatedPeers)
                 }
             }
 
@@ -163,8 +210,16 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionAcceptFlow.collectLatest { peerId ->
                     acceptedRequestPeer = peerId
+                    val existingPeer = uiState.nearbyPeers.find {
+                        it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true)
+                    }
+
                     val updatedPeers = uiState.nearbyPeers.map { p ->
-                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                        if (p.id == peerId || p.handle == peerId || (existingPeer != null && p.id == existingPeer.id)) {
+                            p.copy(status = ConnectionStatus.ACCEPTED)
+                        } else {
+                            p
+                        }
                     }
                     uiState = uiState.copy(nearbyPeers = updatedPeers)
                 }
@@ -270,7 +325,11 @@ class MainActivity : ComponentActivity() {
                                 incomingRequestPeer = null
                                 bleTransport.acceptConnectionRequest(peerId)
                                 val updatedPeers = uiState.nearbyPeers.map { p ->
-                                    if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                                    if (p.id == peerId || p.handle == peerId || p.displayName.equals(displayName, ignoreCase = true)) {
+                                        p.copy(status = ConnectionStatus.ACCEPTED)
+                                    } else {
+                                        p
+                                    }
                                 }
                                 uiState = uiState.copy(nearbyPeers = updatedPeers)
                                 navController.navigate(LayoverRoute.Chat.createRoute(peerId))
@@ -295,7 +354,7 @@ class MainActivity : ComponentActivity() {
 
                 // Incoming Connection Accepted Dialog
                 acceptedRequestPeer?.let { peerId ->
-                    val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
+                    val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true) }
                     val name = peer?.displayName ?: "Peer"
                     AlertDialog(
                         onDismissRequest = { acceptedRequestPeer = null },
@@ -304,7 +363,8 @@ class MainActivity : ComponentActivity() {
                         confirmButton = {
                             Button(onClick = {
                                 acceptedRequestPeer = null
-                                navController.navigate(LayoverRoute.Chat.createRoute(peerId))
+                                val targetRouteId = peer?.id ?: peerId
+                                navController.navigate(LayoverRoute.Chat.createRoute(targetRouteId))
                             }) {
                                 Text("Message")
                             }
@@ -313,7 +373,7 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = {
                                 acceptedRequestPeer = null
                                 val updatedPeers = uiState.nearbyPeers.map { p ->
-                                    if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                                    if (p.id == peerId || p.handle == peerId || (peer != null && p.id == peer.id)) p.copy(status = ConnectionStatus.ACCEPTED) else p
                                 }
                                 uiState = uiState.copy(nearbyPeers = updatedPeers)
                             }) {

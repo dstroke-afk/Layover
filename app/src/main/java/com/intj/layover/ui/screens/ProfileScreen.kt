@@ -44,7 +44,6 @@ import androidx.compose.ui.unit.sp
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverBackground
-import com.intj.layover.ui.theme.CyanAccent
 import com.intj.layover.ui.theme.CyanPrimary
 import com.intj.layover.ui.theme.DarkNavyBackground
 import com.intj.layover.ui.theme.ElevatedCardSurface
@@ -59,7 +58,6 @@ fun ProfileScreen(
     onNavigateBack: () -> Unit
 ) {
     var displayNameText by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.displayName) }
-    var handleText by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.handle) }
     var isVisible by remember(uiState.userProfile) { mutableStateOf(uiState.userProfile.isVisibleToNearby) }
     var showSavedDialog by remember { mutableStateOf(false) }
 
@@ -169,27 +167,6 @@ fun ProfileScreen(
                         shape = RoundedCornerShape(14.dp)
                     )
 
-                    Spacer(modifier = Modifier.height(14.dp))
-
-                    // Editable Handle Field
-                    OutlinedTextField(
-                        value = handleText,
-                        onValueChange = { handleText = it },
-                        label = { Text("Handle", color = MutedText) },
-                        prefix = { Text("@", color = CyanAccent) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = DarkNavyBackground,
-                            unfocusedContainerColor = DarkNavyBackground,
-                            focusedBorderColor = CyanPrimary,
-                            unfocusedBorderColor = IncomingBubbleSurface,
-                            focusedTextColor = LightText,
-                            unfocusedTextColor = LightText
-                        ),
-                        shape = RoundedCornerShape(14.dp)
-                    )
-
                     Spacer(modifier = Modifier.height(20.dp))
 
                     // Save Profile Button
@@ -197,7 +174,6 @@ fun ProfileScreen(
                         onClick = {
                             val updatedProfile = uiState.userProfile.copy(
                                 displayName = displayNameText.trim(),
-                                handle = handleText.trim().removePrefix("@"),
                                 isVisibleToNearby = isVisible
                             )
                             onSaveProfile(updatedProfile)
@@ -255,7 +231,6 @@ fun ProfileScreen(
                                 }
                                 val updatedProfile = uiState.userProfile.copy(
                                     displayName = displayNameText.trim(),
-                                    handle = handleText.trim().removePrefix("@"),
                                     isVisibleToNearby = checked
                                 )
                                 onSaveProfile(updatedProfile)

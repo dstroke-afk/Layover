@@ -87,13 +87,22 @@ fun LayoverNavGraph(
 ) {
     val toggleBlockPeer = { peerId: String ->
         val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
-        val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
-        val targetId = peer?.id ?: peerId
+        val peer = uiState.nearbyPeers.find {
+            it.id == peerId || it.handle == peerId || it.displayName == peerId || it.id.equals(peerId, ignoreCase = true)
+        }
+        val aliases = setOfNotNull(
+            peerId,
+            peer?.id,
+            peer?.handle?.ifEmpty { null },
+            peer?.displayName?.ifEmpty { null }
+        )
 
-        if (updatedBlocked.contains(targetId)) {
-            updatedBlocked.remove(targetId)
+        val isCurrentlyBlocked = aliases.any { updatedBlocked.contains(it) }
+
+        if (isCurrentlyBlocked) {
+            updatedBlocked.removeAll(aliases)
         } else {
-            updatedBlocked.add(targetId)
+            updatedBlocked.addAll(aliases)
         }
         onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
     }
@@ -189,7 +198,7 @@ fun LayoverNavGraph(
             } ?: uiState.nearbyPeers.firstOrNull()
 
             val messages = uiState.chatMessages[peerId] ?: uiState.chatMessages[peer?.id] ?: emptyList()
-            val isBlocked = uiState.blockedPeerIds.contains(peerId) || (peer != null && uiState.blockedPeerIds.contains(peer.id))
+            val isBlocked = uiState.blockedPeerIds.contains(peerId) || (peer != null && (uiState.blockedPeerIds.contains(peer.id) || uiState.blockedPeerIds.contains(peer.displayName)))
             val isMuted = uiState.mutedPeerIds.contains(peerId) || (peer != null && uiState.mutedPeerIds.contains(peer.id))
 
             ChatScreen(
