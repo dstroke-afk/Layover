@@ -68,7 +68,8 @@ class MainActivity : ComponentActivity() {
             prefs.edit().putString("device_id", newId).apply()
             newId
         }
-        val savedName = prefs.getString("display_name", "Balaji Eswar") ?: "Balaji Eswar"
+        val usernameAlreadySet = prefs.getBoolean("username_set", false)
+        val savedName = if (usernameAlreadySet) (prefs.getString("display_name", "") ?: "") else ""
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
         val savedAge = if (prefs.contains("age")) prefs.getInt("age", -1).takeIf { it > 0 } else null
@@ -79,7 +80,7 @@ class MainActivity : ComponentActivity() {
             runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
         }
         val savedResolutionLabel = prefs.getString("cropped_resolution", null)
-        val savedVisible = prefs.getBoolean("is_visible", true)
+        val savedVisible = prefs.getBoolean("is_visible", true) && usernameAlreadySet
         val initialProfile = UserProfile(
             displayName = savedName,
             handle = savedHandle,
@@ -137,7 +138,7 @@ class MainActivity : ComponentActivity() {
                 mutableStateOf(BlePermissionHelper.hasAllRequiredPermissions(context))
             }
             var hasSetUsername by remember {
-                mutableStateOf(prefs.getBoolean("username_set", false))
+                mutableStateOf(usernameAlreadySet)
             }
 
             LaunchedEffect(diagnostics) {
@@ -326,7 +327,7 @@ class MainActivity : ComponentActivity() {
                 hasPermissions = allGranted || BlePermissionHelper.hasAllRequiredPermissions(context)
                 if (allGranted) {
                     Log.d(TAG, "Permissions granted via system dialog.")
-                    bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                    bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                 } else {
                     Log.e(TAG, "Permissions rejected by user.")
                     Toast.makeText(
@@ -350,7 +351,7 @@ class MainActivity : ComponentActivity() {
                         permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
                     } else {
                         hasPermissions = true
-                        bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                        bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                     }
                 } else {
                     bleTransport.stopDiscovery()
@@ -381,7 +382,7 @@ class MainActivity : ComponentActivity() {
                                 Log.d(TAG, "Lifecycle $event: Missing permissions detected. Launching prompt.")
                                 permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
                             } else {
-                                bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
+                                bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                             }
                         }
                         else -> {}
@@ -397,13 +398,15 @@ class MainActivity : ComponentActivity() {
             LayoverTheme {
                 val navController = androidx.navigation.compose.rememberNavController()
 
-                if (hasPermissions && !hasSetUsername) {
+                if (!hasSetUsername) {
                     OneTimeUsernameDialog(
                         onConfirmUsername = { chosenName, chosenGender ->
                             val cleanedName = chosenName.trim()
+                            val visiblePref = prefs.getBoolean("is_visible", true)
                             val updatedProfile = uiState.userProfile.copy(
                                 displayName = cleanedName,
-                                gender = chosenGender
+                                gender = chosenGender,
+                                isVisibleToNearby = visiblePref
                             )
                             prefs.edit()
                                 .putString("display_name", cleanedName)
@@ -413,7 +416,9 @@ class MainActivity : ComponentActivity() {
                             bleTransport.updateProfile(updatedProfile)
                             uiState = uiState.copy(userProfile = updatedProfile)
                             hasSetUsername = true
-                            if (updatedProfile.isVisibleToNearby) {
+                            if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+                                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
+                            } else if (updatedProfile.isVisibleToNearby) {
                                 bleDiscoveryManager.startAdvertising(updatedProfile)
                                 bleTransport.startDiscovery(true)
                             }
@@ -523,7 +528,7 @@ class MainActivity : ComponentActivity() {
                             }
                             editor.apply()
 
-                            if (newState.userProfile.isVisibleToNearby) {
+                            if (newState.userProfile.isVisibleToNearby && hasSetUsername) {
                                 bleDiscoveryManager.startAdvertising(newState.userProfile)
                             } else {
                                 bleDiscoveryManager.stopAdvertising()

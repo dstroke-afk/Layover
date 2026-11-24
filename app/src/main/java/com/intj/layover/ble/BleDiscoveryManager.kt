@@ -331,14 +331,7 @@ class BleDiscoveryManager(
             return
         }
 
-        val deviceName = try {
-            result.device?.name ?: scanRecord.deviceName
-        } catch (e: Exception) {
-            null
-        }
-
         val fallbackName = payload?.displayName?.ifEmpty { null }
-            ?: deviceName?.ifEmpty { null }
             ?: "Layover Peer (${macAddress.takeLast(4)})"
 
         val mapKey = payload?.instanceIdHex?.ifBlank { macAddress } ?: macAddress

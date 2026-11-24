@@ -100,7 +100,7 @@ data class ChatMessage(
 )
 
 data class UserProfile(
-    val displayName: String = "Balaji Eswar",
+    val displayName: String = "",
     val handle: String = "balajieswar",
     val gender: GenderOption = GenderOption.MALE,
     val age: Int? = null,
