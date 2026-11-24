@@ -82,6 +82,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverBackground
@@ -146,7 +147,6 @@ private fun computeScaledBitmapSizePx(
     viewportSizePx: Float,
     zoom: Float
 ): Pair<Float, Float> {
-    // Cover-fit so smaller dimension equals viewportSizePx, then apply zoom
     val coverScale = max(viewportSizePx / srcW, viewportSizePx / srcH)
     val scale = coverScale * zoom
     return Pair(srcW * scale, srcH * scale)
@@ -197,7 +197,6 @@ private fun cropCircularAndDownscale(
     val cropH = max(1, (srcBottom - srcTop).roundToInt())
     val squareSide = max(1, min(cropW, cropH))
 
-    // Center the square crop inside [srcLeft..srcRight, srcTop..srcBottom]
     val cx = (srcLeft + srcRight) / 2f
     val cy = (srcTop + srcBottom) / 2f
     val sqLeft = (cx - squareSide / 2f).roundToInt().coerceIn(0, max(0, source.width - squareSide))
@@ -328,6 +327,7 @@ fun ProfileScreen(
                     avatarBytes = processed.displayBytes
                     compactAvatarBytes = processed.compactTransferBytes
                     resolutionLabel = "${processed.croppedWidth} x ${processed.croppedHeight} px"
+                    LayoverFileLogger.log("ProfileScreen cropped avatar: display=${processed.displayBytes.size}B, compact=${processed.compactTransferBytes.size}B")
                 }
             }
         )
@@ -657,10 +657,12 @@ fun ProfileScreen(
 
                     Button(
                         onClick = {
+                            val effectiveCompact = compactAvatarBytes ?: avatarBytes
+                            LayoverFileLogger.log("ProfileScreen saving profile: compactBytes=${effectiveCompact?.size ?: 0}")
                             val updatedProfile = profile.copy(
                                 age = selectedAge,
                                 avatarBytes = avatarBytes,
-                                compactTransferAvatarBytes = compactAvatarBytes ?: avatarBytes,
+                                compactTransferAvatarBytes = effectiveCompact,
                                 croppedResolutionLabel = resolutionLabel,
                                 isVisibleToNearby = isVisible
                             )

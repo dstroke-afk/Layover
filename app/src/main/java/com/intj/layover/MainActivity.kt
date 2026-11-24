@@ -32,6 +32,7 @@ import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.ble.PeerAliasRegistry
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
@@ -53,6 +54,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var bleDiscoveryManager: BleDiscoveryManager
     private lateinit var gattSessionManager: GattSessionManager
     private lateinit var bleTransport: BleProximityTransport
+
+    private fun UserProfile.effectiveCompactAvatarBytes(): ByteArray? =
+        compactTransferAvatarBytes ?: avatarBytes
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,8 +91,16 @@ class MainActivity : ComponentActivity() {
             isVisibleToNearby = savedVisible
         )
 
+        var transportRef: BleProximityTransport? = null
+
         bleStateController = BleStateController(applicationContext)
-        bleDiscoveryManager = BleDiscoveryManager(applicationContext, bleStateController)
+        bleDiscoveryManager = BleDiscoveryManager(
+            context = applicationContext,
+            bleStateController = bleStateController,
+            onRequestAvatarFetch = { device, mapKey, onLoaded ->
+                transportRef?.requestAvatarFetch(device, mapKey, onLoaded)
+            }
+        )
         gattSessionManager = GattSessionManager(applicationContext)
         bleTransport = BleProximityTransport(
             context = applicationContext,
@@ -96,7 +108,9 @@ class MainActivity : ComponentActivity() {
             bleStateController = bleStateController,
             gattSessionManager = gattSessionManager,
             currentUserProfile = initialProfile
-        )
+        ).also {
+            transportRef = it
+        }
 
         setContent {
             val context = LocalContext.current
@@ -154,20 +168,28 @@ class MainActivity : ComponentActivity() {
                             discoveredAliases.any { dAlias -> existingAliases.any { eAlias -> dAlias.equals(eAlias, ignoreCase = true) } } ||
                                     (p.displayName.isNotEmpty() && p.displayName.equals(discovered.displayName, ignoreCase = true))
                         }
+                        val resolvedAvatar = when {
+                            discovered.avatar.avatarBase64OrBytes != null -> discovered.avatar
+                            existing != null && existing.avatar.avatarBase64OrBytes != null -> existing.avatar
+                            else -> discovered.avatar
+                        }
                         if (existing != null && existing.status != ConnectionStatus.NONE) {
                             discovered.copy(
                                 id = existing.id,
                                 handle = existing.handle.ifEmpty { discovered.handle },
                                 displayName = discovered.displayName.ifBlank { existing.displayName },
                                 status = existing.status,
-                                avatar = if (discovered.avatar.avatarBase64OrBytes != null) discovered.avatar else existing.avatar
+                                avatar = resolvedAvatar
                             )
                         } else {
-                            discovered
+                            discovered.copy(avatar = resolvedAvatar)
                         }
                     }
                 uiState = uiState.copy(nearbyPeers = merged)
                 bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(merged.size)
+                merged.forEach { p ->
+                    LayoverFileLogger.log("UI Peer state: id=${p.id}, name=${p.displayName}, avatarBytes=${p.avatar.avatarBase64OrBytes?.size ?: 0}")
+                }
                 Log.d(TAG, "UI State updated with ${merged.size} deduplicated BLE discovered peers.")
             }
 
@@ -507,7 +529,20 @@ class MainActivity : ComponentActivity() {
                                 bleDiscoveryManager.stopAdvertising()
                             }
                         }
+
+                        val compactBytes = newState.userProfile.effectiveCompactAvatarBytes()
+                        val updatedNearbyPeers = newState.nearbyPeers.map { peer ->
+                            val isSelf = peer.id.equals(newState.userProfile.handle, ignoreCase = true) ||
+                                    (peer.displayName.isNotEmpty() && peer.displayName.equals(newState.userProfile.displayName, ignoreCase = true))
+                            if (isSelf && compactBytes != null) {
+                                peer.copy(avatar = peer.avatar.copy(avatarBase64OrBytes = compactBytes))
+                            } else {
+                                peer
+                            }
+                        }
+
                         uiState = newState.copy(
+                            nearbyPeers = updatedNearbyPeers,
                             transport = bleTransport,
                             diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
                         )

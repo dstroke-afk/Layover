@@ -2,6 +2,7 @@ package com.intj.layover.ble
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.util.Base64
@@ -155,6 +156,10 @@ class BleProximityTransport(
     }
 
     init {
+        gattSessionManager.compactAvatarBytesProvider = {
+            currentUserProfile.compactTransferAvatarBytes ?: currentUserProfile.avatarBytes
+        }
+
         gattSessionManager.startServer()
 
         gattSessionManager.onGattReady = {
@@ -364,6 +369,11 @@ class BleProximityTransport(
                 }
             }
         }
+    }
+
+    fun requestAvatarFetch(device: BluetoothDevice, mapKey: String, onLoaded: (ByteArray) -> Unit) {
+        if (isPeerIdentifierBlocked(mapKey, device.address)) return
+        gattSessionManager.fetchAvatarFromDevice(device, onLoaded)
     }
 
     override fun resetDiagnosticsCounters() {

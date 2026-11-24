@@ -59,6 +59,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
@@ -87,12 +88,9 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
 
     for (p in peers) {
         val existingIndex = canonicalList.indexOfFirst { existing ->
-            existing.id == p.id ||
-                    (existing.handle.isNotEmpty() && p.handle.isNotEmpty() && existing.handle == p.handle) ||
-                    (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() && (
-                            existing.displayName.equals(p.displayName, ignoreCase = true) ||
-                                    existing.displayName.take(3).equals(p.displayName.take(3), ignoreCase = true)
-                            ))
+            existing.id.equals(p.id, ignoreCase = true) ||
+                    (existing.handle.isNotEmpty() && p.handle.isNotEmpty() && existing.handle.equals(p.handle, ignoreCase = true)) ||
+                    (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() && existing.displayName.equals(p.displayName, ignoreCase = true))
         }
 
         if (existingIndex == -1) {
@@ -114,13 +112,18 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
             val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
             val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
             val bestName = if (p.displayName.isNotBlank()) p.displayName else existing.displayName
+            val bestAvatar = when {
+                p.avatar.avatarBase64OrBytes != null -> p.avatar
+                existing.avatar.avatarBase64OrBytes != null -> existing.avatar
+                else -> p.avatar
+            }
 
             canonicalList[existingIndex] = existing.copy(
                 id = bestId,
                 handle = bestHandle,
                 displayName = bestName,
                 status = bestStatus,
-                avatar = if (p.avatar.avatarBase64OrBytes != null) p.avatar else existing.avatar
+                avatar = bestAvatar
             )
         }
     }
@@ -342,9 +345,17 @@ fun PeerListItemCard(
     val displayInitials = remember(peer.displayName, peer.avatar.initials) {
         if (peer.displayName.isNotBlank()) initialsForName(peer.displayName) else peer.avatar.initials
     }
-    val peerAvatarBitmap = remember(peer.avatar.avatarBase64OrBytes) {
-        peer.avatar.avatarBase64OrBytes?.let { bytes ->
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    val rawBytes = peer.avatar.avatarBase64OrBytes
+    val peerAvatarBitmap = remember(rawBytes) {
+        if (rawBytes != null && rawBytes.isNotEmpty()) {
+            val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
+            LayoverFileLogger.logThrottled(
+                "avatar_decode_${peer.id}_${rawBytes.size}",
+                "PeerListItemCard decode: id=${peer.id}, name=${peer.displayName}, bytes=${rawBytes.size}, success=${decoded != null}, w=${decoded?.width ?: 0}, h=${decoded?.height ?: 0}"
+            )
+            decoded?.asImageBitmap()
+        } else {
+            null
         }
     }
 

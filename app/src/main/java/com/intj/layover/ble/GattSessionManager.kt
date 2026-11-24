@@ -28,10 +28,13 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.min
 
 class GattSessionManager(
     private val context: Context
@@ -40,6 +43,7 @@ class GattSessionManager(
         val LAYOVER_GATT_SERVICE_UUID: UUID = UUID.fromString("7f41a0d8-5526-4b6a-9f5b-6147e4b2a8d1")
         val LAYOVER_TX_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7042")
         val LAYOVER_RX_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7043")
+        val LAYOVER_AVATAR_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7044")
         val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
@@ -59,6 +63,7 @@ class GattSessionManager(
     val incomingMessages: SharedFlow<P2PMessageFrame> = _incomingMessages.asSharedFlow()
 
     var onGattReady: (() -> Unit)? = null
+    var compactAvatarBytesProvider: (() -> ByteArray?)? = null
 
     private var gattServer: BluetoothGattServer? = null
     private var activeGattClient: BluetoothGatt? = null
@@ -68,6 +73,7 @@ class GattSessionManager(
     private val pendingOutboundFrames = ConcurrentLinkedQueue<String>()
     private val isFlushingQueue = AtomicBoolean(false)
     private val subscribedClients = mutableSetOf<BluetoothDevice>()
+    private val avatarReadBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
 
     private var writeCompletion: CompletableDeferred<Boolean>? = null
 
@@ -111,6 +117,36 @@ class GattSessionManager(
                         setConnectionState(RfcommConnectionState.DISCONNECTED)
                         _isGattReady.value = false
                     }
+                }
+            }
+
+            override fun onCharacteristicReadRequest(
+                device: BluetoothDevice?,
+                requestId: Int,
+                offset: Int,
+                characteristic: BluetoothGattCharacteristic?
+            ) {
+                val targetDevice = device ?: return
+                if (characteristic?.uuid?.equals(LAYOVER_AVATAR_CHAR_UUID) == true) {
+                    val rawAvatar = compactAvatarBytesProvider?.invoke() ?: ByteArray(0)
+                    val framedPayload = if (rawAvatar.isEmpty()) {
+                        ByteBuffer.allocate(4).putInt(0).array()
+                    } else {
+                        ByteBuffer.allocate(4 + rawAvatar.size)
+                            .putInt(rawAvatar.size)
+                            .put(rawAvatar)
+                            .array()
+                    }
+                    val slice = if (offset >= framedPayload.size) {
+                        ByteArray(0)
+                    } else {
+                        val end = min(framedPayload.size, offset + 500)
+                        framedPayload.copyOfRange(offset, end)
+                    }
+                    LayoverFileLogger.log("GATT Server avatar read: device=${targetDevice.address}, offset=$offset, framedTotal=${framedPayload.size}, sent=${slice.size}")
+                    gattServer?.sendResponse(targetDevice, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
+                } else {
+                    gattServer?.sendResponse(targetDevice, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
                 }
             }
 
@@ -182,6 +218,12 @@ class GattSessionManager(
                     BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
                 )
 
+                val avatarChar = BluetoothGattCharacteristic(
+                    LAYOVER_AVATAR_CHAR_UUID,
+                    BluetoothGattCharacteristic.PROPERTY_READ,
+                    BluetoothGattCharacteristic.PERMISSION_READ
+                )
+
                 val rxDesc = BluetoothGattDescriptor(
                     CLIENT_CONFIG_DESCRIPTOR_UUID,
                     BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
@@ -190,6 +232,7 @@ class GattSessionManager(
 
                 service.addCharacteristic(txChar)
                 service.addCharacteristic(rxChar)
+                service.addCharacteristic(avatarChar)
 
                 server.addService(service)
                 gattServer = server
@@ -200,6 +243,151 @@ class GattSessionManager(
         } catch (e: Exception) {
             LayoverFileLogger.logError("Exception starting GATT Server", e)
             setConnectionState(RfcommConnectionState.FAILED, e.message)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun fetchAvatarFromDevice(
+        device: BluetoothDevice,
+        onAvatarLoaded: (ByteArray) -> Unit
+    ) {
+        if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+            LayoverFileLogger.logError("Avatar probe skipped: missing Bluetooth permissions.")
+            onAvatarLoaded(ByteArray(0))
+            return
+        }
+        val adapter = bluetoothAdapter
+        if (adapter == null || !adapter.isEnabled) {
+            LayoverFileLogger.logError("Avatar probe skipped: Bluetooth adapter null or off.")
+            onAvatarLoaded(ByteArray(0))
+            return
+        }
+
+        val probeKey = "${device.address}_${System.nanoTime()}"
+        val buffer = ByteArrayOutputStream()
+        avatarReadBuffers[probeKey] = buffer
+
+        var probeGatt: BluetoothGatt? = null
+        var completed = false
+
+        fun finishAndClose(gatt: BluetoothGatt?, reason: String) {
+            if (completed) return
+            completed = true
+            val raw = avatarReadBuffers.remove(probeKey)?.toByteArray() ?: ByteArray(0)
+            val collected = if (raw.size > 4) {
+                val expectedLen = ByteBuffer.wrap(raw, 0, 4).int
+                val availablePayload = raw.copyOfRange(4, raw.size)
+                if (expectedLen in 1..availablePayload.size) {
+                    availablePayload.copyOfRange(0, expectedLen)
+                } else {
+                    availablePayload
+                }
+            } else {
+                ByteArray(0)
+            }
+            LayoverFileLogger.log("Avatar probe finished (${device.address}): reason=$reason, raw=${raw.size}, avatarBytes=${collected.size}")
+            try {
+                gatt?.disconnect()
+                gatt?.close()
+            } catch (_: Exception) {
+            }
+            scope.launch(Dispatchers.Main) {
+                onAvatarLoaded(collected)
+            }
+        }
+
+        val probeCallback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                    LayoverFileLogger.log("Avatar probe connected to ${device.address}. Discovering services...")
+                    scope.launch {
+                        delay(120)
+                        gatt?.discoverServices()
+                    }
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
+                    finishAndClose(gatt, "connState=$newState, status=$status")
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && gatt != null) {
+                    gatt.requestMtu(512)
+                } else {
+                    finishAndClose(gatt, "servicesStatus=$status")
+                }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+                val service = gatt?.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
+                    ?: gatt?.getService(LAYOVER_GATT_SERVICE_UUID)
+                val avatarChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_AVATAR_CHAR_UUID) }
+                    ?: service?.getCharacteristic(LAYOVER_AVATAR_CHAR_UUID)
+                if (avatarChar != null) {
+                    LayoverFileLogger.log("Avatar probe reading characteristic from ${device.address} (mtu=$mtu)...")
+                    gatt?.readCharacteristic(avatarChar)
+                } else {
+                    finishAndClose(gatt, "avatarCharMissing")
+                }
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid.equals(LAYOVER_AVATAR_CHAR_UUID)) {
+                    if (value.isNotEmpty()) {
+                        buffer.write(value)
+                        val currentBytes = buffer.toByteArray()
+                        if (currentBytes.size >= 4) {
+                            val expectedTotal = ByteBuffer.wrap(currentBytes, 0, 4).int
+                            LayoverFileLogger.log("Avatar probe progress (${device.address}): got=${currentBytes.size - 4}/$expectedTotal")
+                            if (expectedTotal <= 0 || (currentBytes.size - 4) >= expectedTotal) {
+                                finishAndClose(gatt, "complete")
+                                return
+                            }
+                        }
+                        gatt.readCharacteristic(characteristic)
+                    } else {
+                        finishAndClose(gatt, "emptyChunk")
+                    }
+                } else {
+                    finishAndClose(gatt, "readStatus=$status")
+                }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt?,
+                characteristic: BluetoothGattCharacteristic?,
+                status: Int
+            ) {
+                @Suppress("DEPRECATION")
+                val bytes = characteristic?.value ?: ByteArray(0)
+                if (gatt != null && characteristic != null) {
+                    onCharacteristicRead(gatt, characteristic, bytes, status)
+                } else {
+                    finishAndClose(gatt, "nullCallbackArgs")
+                }
+            }
+        }
+
+        try {
+            LayoverFileLogger.log("Avatar probe starting connectGatt to ${device.address}...")
+            probeGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(context, false, probeCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                @Suppress("DEPRECATION")
+                device.connectGatt(context, false, probeCallback)
+            }
+            scope.launch {
+                delay(5000)
+                finishAndClose(probeGatt, "timeout")
+            }
+        } catch (e: Exception) {
+            LayoverFileLogger.logError("Avatar probe exception for ${device.address}", e)
+            finishAndClose(probeGatt, "exception")
         }
     }
 
@@ -430,10 +618,10 @@ class GattSessionManager(
                     val success = sendFrameSuspended(frame)
                     if (success) {
                         pendingOutboundFrames.poll()
-                        delay(60) // Fast serialization write pacing between frames
+                        delay(60)
                     } else {
                         LayoverFileLogger.logError("GATT write failed for frame: ${frame.take(30)}. Discarding failed frame to prevent infinite retry loops.")
-                        pendingOutboundFrames.poll() // Discard failed frame to avoid infinite retry loops
+                        pendingOutboundFrames.poll()
                         delay(150)
                         break
                     }
@@ -453,7 +641,6 @@ class GattSessionManager(
 
         val client = activeGattClient
         if (client != null) {
-            // We are acting as GATT Client - write to remote server RX characteristic
             val service = client.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) } ?: client.getService(LAYOVER_GATT_SERVICE_UUID)
             val rxChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on client for write.") }
 
@@ -485,7 +672,6 @@ class GattSessionManager(
                 false
             }
         } else {
-            // We are acting as GATT Server - notify subscribed client
             val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
             val device = connectedDevice ?: return false.also { LayoverFileLogger.logError("GATT Server connectedDevice is null when sending frame.") }
             val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
