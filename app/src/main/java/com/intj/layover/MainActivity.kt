@@ -32,6 +32,7 @@ import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
 import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.model.ConnectionStatus
+import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.UserProfile
@@ -64,10 +65,12 @@ class MainActivity : ComponentActivity() {
         }
         val savedName = prefs.getString("display_name", "Balaji Eswar") ?: "Balaji Eswar"
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
+        val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
         val savedVisible = prefs.getBoolean("is_visible", true)
         val initialProfile = UserProfile(
             displayName = savedName,
             handle = savedHandle,
+            gender = savedGender,
             isVisibleToNearby = savedVisible
         )
 
@@ -360,11 +363,15 @@ class MainActivity : ComponentActivity() {
 
                 if (hasPermissions && !hasSetUsername) {
                     OneTimeUsernameDialog(
-                        onConfirmUsername = { chosenName ->
+                        onConfirmUsername = { chosenName, chosenGender ->
                             val cleanedName = chosenName.trim()
-                            val updatedProfile = uiState.userProfile.copy(displayName = cleanedName)
+                            val updatedProfile = uiState.userProfile.copy(
+                                displayName = cleanedName,
+                                gender = chosenGender
+                            )
                             prefs.edit()
                                 .putString("display_name", cleanedName)
+                                .putString("gender", chosenGender.name)
                                 .putBoolean("username_set", true)
                                 .apply()
                             bleTransport.updateProfile(updatedProfile)
@@ -461,6 +468,7 @@ class MainActivity : ComponentActivity() {
                             prefs.edit()
                                 .putString("display_name", newState.userProfile.displayName)
                                 .putString("handle", newState.userProfile.handle)
+                                .putString("gender", newState.userProfile.gender.name)
                                 .putBoolean("is_visible", newState.userProfile.isVisibleToNearby)
                                 .apply()
 

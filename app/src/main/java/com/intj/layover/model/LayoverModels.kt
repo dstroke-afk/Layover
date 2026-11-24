@@ -36,6 +36,20 @@ enum class ConnectionStatus {
     DECLINED
 }
 
+enum class GenderOption(val label: String) {
+    MALE("Male"),
+    FEMALE("Female");
+
+    companion object {
+        fun fromLabelOrName(raw: String?): GenderOption {
+            if (raw == null) return MALE
+            return entries.firstOrNull {
+                it.name.equals(raw, ignoreCase = true) || it.label.equals(raw, ignoreCase = true)
+            } ?: MALE
+        }
+    }
+}
+
 data class PeerAvatar(
     val peerId: String,
     val initials: String,
@@ -88,6 +102,7 @@ data class ChatMessage(
 data class UserProfile(
     val displayName: String = "Balaji Eswar",
     val handle: String = "balajieswar",
+    val gender: GenderOption = GenderOption.MALE,
     val isVisibleToNearby: Boolean = true
 )
 

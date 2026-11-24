@@ -1,5 +1,6 @@
 package com.intj.layover.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -54,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intj.layover.model.ConnectionStatus
+import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.navigation.LayoverBackground
@@ -508,12 +510,15 @@ fun PeerListItemCard(
 
 @Composable
 fun OneTimeUsernameDialog(
-    onConfirmUsername: (String) -> Unit
+    onConfirmUsername: (username: String, gender: GenderOption) -> Unit
 ) {
     var usernameInput by remember { mutableStateOf("") }
+    var selectedGender by remember { mutableStateOf<GenderOption?>(null) }
+
     val hasSpace = usernameInput.any { it.isWhitespace() }
     val tooLong = usernameInput.length > 8
-    val isValid = usernameInput.isNotEmpty() && !hasSpace && !tooLong
+    val isUsernameValid = usernameInput.isNotEmpty() && !hasSpace && !tooLong
+    val isValid = isUsernameValid && selectedGender != null
 
     val errorMessage = when {
         hasSpace -> "Spaces are not allowed in your username."
@@ -566,14 +571,61 @@ fun OneTimeUsernameDialog(
                     isError = errorMessage != null,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                Text(
+                    text = "Select Gender",
+                    color = LightText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    GenderOption.entries.forEach { option ->
+                        val isSelected = selectedGender == option
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { selectedGender = option },
+                            color = if (isSelected) CyanPrimary.copy(alpha = 0.18f) else IncomingBubbleSurface,
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(
+                                width = 1.5.dp,
+                                color = if (isSelected) CyanPrimary else Color.Transparent
+                            )
+                        ) {
+                            Box(
+                                modifier = Modifier.padding(vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = option.label,
+                                    color = if (isSelected) CyanPrimary else LightText,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    fontSize = 14.sp
+                                )
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
             androidx.compose.material3.Button(
                 enabled = isValid,
-                onClick = { onConfirmUsername(usernameInput) }
+                onClick = {
+                    val chosenGender = selectedGender ?: GenderOption.MALE
+                    onConfirmUsername(usernameInput, chosenGender)
+                }
             ) {
-                Text("Save Username")
+                Text("Save Profile")
             }
         }
     )
