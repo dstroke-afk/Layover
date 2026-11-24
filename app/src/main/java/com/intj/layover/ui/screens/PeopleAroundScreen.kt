@@ -23,7 +23,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
-import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -66,6 +65,16 @@ import com.intj.layover.ui.theme.IncomingBubbleSurface
 import com.intj.layover.ui.theme.LightText
 import com.intj.layover.ui.theme.MutedText
 
+internal fun initialsForName(name: String, fallback: String = "?"): String {
+    val computed = name.trim()
+        .split("\\s+".toRegex())
+        .mapNotNull { it.firstOrNull()?.toString() }
+        .take(2)
+        .joinToString("")
+        .uppercase()
+    return computed.ifEmpty { fallback }
+}
+
 fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
     val canonicalList = mutableListOf<NearbyPeer>()
 
@@ -74,9 +83,9 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
             existing.id == p.id ||
                     (existing.handle.isNotEmpty() && p.handle.isNotEmpty() && existing.handle == p.handle) ||
                     (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() && (
-                        existing.displayName.equals(p.displayName, ignoreCase = true) ||
-                        existing.displayName.take(3).equals(p.displayName.take(3), ignoreCase = true)
-                    ))
+                            existing.displayName.equals(p.displayName, ignoreCase = true) ||
+                                    existing.displayName.take(3).equals(p.displayName.take(3), ignoreCase = true)
+                            ))
         }
 
         if (existingIndex == -1) {
@@ -97,7 +106,7 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
 
             val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
             val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
-            val bestName = if (p.displayName.length > existing.displayName.length) p.displayName else existing.displayName
+            val bestName = if (p.displayName.isNotBlank()) p.displayName else existing.displayName
 
             canonicalList[existingIndex] = existing.copy(
                 id = bestId,
@@ -150,7 +159,6 @@ fun PeopleAroundScreen(
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            // Top Bar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -200,20 +208,6 @@ fun PeopleAroundScreen(
                             modifier = Modifier.background(ElevatedCardSurface)
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Your Profile", color = LightText) },
-                                leadingIcon = {
-                                    Icon(
-                                        imageVector = Icons.Default.AccountCircle,
-                                        contentDescription = null,
-                                        tint = CyanPrimary
-                                    )
-                                },
-                                onClick = {
-                                    showMenu = false
-                                    onNavigateToProfile()
-                                }
-                            )
-                            DropdownMenuItem(
                                 text = { Text("Diagnostics", color = LightText) },
                                 leadingIcon = {
                                     Icon(
@@ -246,7 +240,6 @@ fun PeopleAroundScreen(
                 }
             }
 
-            // Live Search Bar
             if (searchActive) {
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedTextField(
@@ -280,7 +273,6 @@ fun PeopleAroundScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Section Header
             Text(
                 text = "People Around (${filteredPeers.size})",
                 fontSize = 18.sp,
@@ -325,6 +317,9 @@ fun PeerListItemCard(
     onToggleMute: () -> Unit
 ) {
     val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
+    val displayInitials = remember(peer.displayName, peer.avatar.initials) {
+        if (peer.displayName.isNotBlank()) initialsForName(peer.displayName) else peer.avatar.initials
+    }
 
     Card(
         modifier = Modifier
@@ -361,7 +356,7 @@ fun PeerListItemCard(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = peer.avatar.initials,
+                        text = displayInitials,
                         fontWeight = FontWeight.Bold,
                         color = if (isBlocked) MutedText else CyanPrimary,
                         fontSize = 17.sp
@@ -406,7 +401,6 @@ fun PeerListItemCard(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            // Action Pill
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isBlocked) {
                     Surface(
@@ -510,4 +504,77 @@ fun PeerListItemCard(
             }
         }
     }
+}
+
+@Composable
+fun OneTimeUsernameDialog(
+    onConfirmUsername: (String) -> Unit
+) {
+    var usernameInput by remember { mutableStateOf("") }
+    val hasSpace = usernameInput.any { it.isWhitespace() }
+    val tooLong = usernameInput.length > 8
+    val isValid = usernameInput.isNotEmpty() && !hasSpace && !tooLong
+
+    val errorMessage = when {
+        hasSpace -> "Spaces are not allowed in your username."
+        tooLong -> "Username must be 8 characters or fewer."
+        else -> null
+    }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = {},
+        containerColor = ElevatedCardSurface,
+        title = {
+            Text(
+                text = "Set Your Username",
+                color = LightText,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column {
+                Surface(
+                    color = IncomingBubbleSurface,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Your username can only be set once and cannot be changed later.",
+                        color = CyanAccent,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(10.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = usernameInput,
+                    onValueChange = { usernameInput = it },
+                    singleLine = true,
+                    placeholder = {
+                        Text("Up to 8 chars, no spaces", color = MutedText)
+                    },
+                    supportingText = {
+                        Text(
+                            text = errorMessage ?: "${usernameInput.length}/8 characters • No spaces",
+                            color = if (errorMessage != null) Color(0xFFFF5252) else MutedText,
+                            fontSize = 12.sp
+                        )
+                    },
+                    isError = errorMessage != null,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.Button(
+                enabled = isValid,
+                onClick = { onConfirmUsername(usernameInput) }
+            ) {
+                Text("Save Username")
+            }
+        }
+    )
 }

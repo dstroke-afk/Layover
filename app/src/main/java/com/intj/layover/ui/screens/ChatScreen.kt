@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,14 +39,19 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,6 +66,7 @@ import com.intj.layover.ui.theme.IncomingBubbleSurface
 import com.intj.layover.ui.theme.LightText
 import com.intj.layover.ui.theme.MutedText
 import com.intj.layover.ui.theme.OutgoingCyanBubble
+import kotlinx.coroutines.delay
 
 @Composable
 fun ChatScreen(
@@ -76,9 +83,44 @@ fun ChatScreen(
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
 
+    val listState = rememberLazyListState()
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
     val peerId = peer?.id ?: ""
-    val resolvedName = peer?.displayName ?: if (peerId.isNotEmpty()) "Peer (${peerId.takeLast(4)})" else "Nearby Peer"
-    val resolvedInitials = peer?.avatar?.initials ?: resolvedName.firstOrNull()?.toString()?.uppercase() ?: "?"
+    val resolvedName = peer?.displayName?.takeIf { it.isNotBlank() }
+        ?: if (peerId.isNotEmpty()) "Peer (${peerId.takeLast(4)})" else "Nearby Peer"
+    val resolvedInitials = remember(peer?.displayName, peer?.avatar?.initials, resolvedName) {
+        if (peer?.displayName?.isNotBlank() == true) {
+            initialsForName(peer.displayName)
+        } else {
+            peer?.avatar?.initials?.takeIf { it.isNotBlank() }
+                ?: initialsForName(resolvedName)
+        }
+    }
+
+    LaunchedEffect(peerId, isBlocked) {
+        if (!isBlocked) {
+            delay(100)
+            runCatching {
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            }
+        } else {
+            keyboardController?.hide()
+        }
+    }
+
+    val latestMessageId = messages.lastOrNull()?.id
+    LaunchedEffect(messages.size, latestMessageId) {
+        if (messages.isNotEmpty()) {
+            listState.animateScrollToItem(index = 0)
+        }
+    }
+
+    val greyDisabledFill = Color(0xFF232933)
+    val greyDisabledBorder = Color(0xFF3A4250)
+    val greyDisabledText = Color(0xFF8A94A6)
 
     LayoverBackground {
         Column(
@@ -107,10 +149,10 @@ fun ChatScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .background(IncomingBubbleSurface)
+                        .background(if (isBlocked) greyDisabledFill else IncomingBubbleSurface)
                         .border(
                             1.5.dp,
-                            if (isBlocked) MutedText else CyanPrimary,
+                            if (isBlocked) greyDisabledBorder else CyanPrimary,
                             CircleShape
                         ),
                     contentAlignment = Alignment.Center
@@ -118,7 +160,7 @@ fun ChatScreen(
                     Text(
                         text = resolvedInitials,
                         fontWeight = FontWeight.Bold,
-                        color = if (isBlocked) MutedText else CyanPrimary,
+                        color = if (isBlocked) greyDisabledText else CyanPrimary,
                         fontSize = 15.sp
                     )
                 }
@@ -131,20 +173,20 @@ fun ChatScreen(
                             text = resolvedName,
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
-                            color = LightText
+                            color = if (isBlocked) greyDisabledText else LightText
                         )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = Icons.Default.Lock,
                             contentDescription = null,
-                            tint = CyanAccent,
+                            tint = if (isBlocked) greyDisabledText else CyanAccent,
                             modifier = Modifier.size(11.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "End-to-End Encrypted",
-                            color = CyanAccent,
+                            text = if (isBlocked) "Blocked" else "End-to-End Encrypted",
+                            color = if (isBlocked) greyDisabledText else CyanAccent,
                             fontSize = 11.sp
                         )
                     }
@@ -184,11 +226,13 @@ fun ChatScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Messages List
+            // Messages List (greyed out when blocked)
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .alpha(if (isBlocked) 0.45f else 1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 contentPadding = PaddingValues(vertical = 8.dp),
                 reverseLayout = true
@@ -196,13 +240,49 @@ fun ChatScreen(
                 items(messages.reversed(), key = { it.id }) { msg ->
                     ChatMessageBubble(
                         message = msg,
-                        onReply = { replyingToMessage = msg }
+                        onReply = {
+                            if (!isBlocked) {
+                                replyingToMessage = msg
+                            }
+                        }
                     )
                 }
             }
 
+            if (isBlocked) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    color = greyDisabledFill,
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Block,
+                            contentDescription = null,
+                            tint = greyDisabledText,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "You've been blocked",
+                            color = greyDisabledText,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+
             // Reply Preview Banner
-            if (replyingToMessage != null) {
+            if (replyingToMessage != null && !isBlocked) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -243,6 +323,7 @@ fun ChatScreen(
             }
 
             // Input Bar
+            val canSend = !isBlocked && inputText.isNotBlank()
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -250,23 +331,29 @@ fun ChatScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
+                    value = if (isBlocked) "" else inputText,
+                    onValueChange = { if (!isBlocked) inputText = it },
                     placeholder = {
                         Text(
-                            text = if (isBlocked) "Peer is blocked" else "Type encrypted message...",
-                            color = MutedText
+                            text = if (isBlocked) "You've been blocked" else "Type encrypted message...",
+                            color = if (isBlocked) greyDisabledText else MutedText
                         )
                     },
                     enabled = !isBlocked,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focusRequester),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedContainerColor = ElevatedCardSurface,
                         unfocusedContainerColor = ElevatedCardSurface,
+                        disabledContainerColor = greyDisabledFill,
                         focusedBorderColor = CyanPrimary,
                         unfocusedBorderColor = IncomingBubbleSurface,
+                        disabledBorderColor = greyDisabledBorder,
                         focusedTextColor = LightText,
-                        unfocusedTextColor = LightText
+                        unfocusedTextColor = LightText,
+                        disabledTextColor = greyDisabledText,
+                        disabledPlaceholderColor = greyDisabledText
                     ),
                     shape = RoundedCornerShape(24.dp),
                     maxLines = 4
@@ -278,20 +365,28 @@ fun ChatScreen(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .clickable(enabled = !isBlocked && inputText.isNotBlank()) {
-                            if (inputText.isNotBlank()) {
+                        .clickable(enabled = canSend) {
+                            if (canSend) {
                                 onSendMessage(inputText.trim(), replyingToMessage?.text)
                                 inputText = ""
                                 replyingToMessage = null
                             }
                         },
-                    color = if (!isBlocked && inputText.isNotBlank()) CyanPrimary else ElevatedCardSurface
+                    color = when {
+                        isBlocked -> greyDisabledFill
+                        canSend -> CyanPrimary
+                        else -> ElevatedCardSurface
+                    }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Send",
-                            tint = if (!isBlocked && inputText.isNotBlank()) DarkNavyBackground else MutedText,
+                            tint = when {
+                                isBlocked -> greyDisabledText
+                                canSend -> DarkNavyBackground
+                                else -> MutedText
+                            },
                             modifier = Modifier.size(20.dp)
                         )
                     }

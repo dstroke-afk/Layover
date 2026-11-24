@@ -37,6 +37,7 @@ import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
+import com.intj.layover.ui.screens.OneTimeUsernameDialog
 import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.flow.collectLatest
 import java.util.UUID
@@ -102,6 +103,12 @@ class MainActivity : ComponentActivity() {
 
             var incomingRequestPeer by remember { mutableStateOf<Pair<String, String>?>(null) }
             var acceptedRequestPeer by remember { mutableStateOf<String?>(null) }
+            var hasPermissions by remember {
+                mutableStateOf(BlePermissionHelper.hasAllRequiredPermissions(context))
+            }
+            var hasSetUsername by remember {
+                mutableStateOf(prefs.getBoolean("username_set", false))
+            }
 
             LaunchedEffect(diagnostics) {
                 uiState = uiState.copy(diagnostics = diagnostics)
@@ -135,7 +142,7 @@ class MainActivity : ComponentActivity() {
                             discovered.copy(
                                 id = existing.id,
                                 handle = existing.handle.ifEmpty { discovered.handle },
-                                displayName = existing.displayName.ifEmpty { discovered.displayName },
+                                displayName = discovered.displayName.ifBlank { existing.displayName },
                                 status = existing.status
                             )
                         } else {
@@ -258,6 +265,7 @@ class MainActivity : ComponentActivity() {
             ) { permsMap ->
                 val allGranted = permsMap.values.all { it }
                 bleStateController.refreshPermissionAndAdapterState()
+                hasPermissions = allGranted || BlePermissionHelper.hasAllRequiredPermissions(context)
                 if (allGranted) {
                     Log.d(TAG, "Permissions granted via system dialog.")
                     bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
@@ -279,9 +287,11 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(uiState.isScanning) {
                 if (uiState.isScanning) {
                     if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+                        hasPermissions = false
                         Log.d(TAG, "Requesting missing BLE runtime permissions...")
                         permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
                     } else {
+                        hasPermissions = true
                         bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby)
                     }
                 } else {
@@ -307,7 +317,9 @@ class MainActivity : ComponentActivity() {
                         }
                         Lifecycle.Event.ON_START, Lifecycle.Event.ON_RESUME -> {
                             bleStateController.refreshPermissionAndAdapterState()
-                            if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
+                            val granted = BlePermissionHelper.hasAllRequiredPermissions(context)
+                            hasPermissions = granted
+                            if (!granted) {
                                 Log.d(TAG, "Lifecycle $event: Missing permissions detected. Launching prompt.")
                                 permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
                             } else {
@@ -326,6 +338,26 @@ class MainActivity : ComponentActivity() {
 
             LayoverTheme {
                 val navController = androidx.navigation.compose.rememberNavController()
+
+                if (hasPermissions && !hasSetUsername) {
+                    OneTimeUsernameDialog(
+                        onConfirmUsername = { chosenName ->
+                            val cleanedName = chosenName.trim()
+                            val updatedProfile = uiState.userProfile.copy(displayName = cleanedName)
+                            prefs.edit()
+                                .putString("display_name", cleanedName)
+                                .putBoolean("username_set", true)
+                                .apply()
+                            bleTransport.updateProfile(updatedProfile)
+                            uiState = uiState.copy(userProfile = updatedProfile)
+                            hasSetUsername = true
+                            if (updatedProfile.isVisibleToNearby) {
+                                bleDiscoveryManager.startAdvertising(updatedProfile)
+                                bleTransport.startDiscovery(true)
+                            }
+                        }
+                    )
+                }
 
                 incomingRequestPeer?.let { (peerId, displayName) ->
                     AlertDialog(
