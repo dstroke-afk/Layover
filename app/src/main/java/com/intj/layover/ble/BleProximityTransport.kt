@@ -108,6 +108,9 @@ class BleProximityTransport(
     private val _incomingConnectionDeclineFlow = MutableSharedFlow<String>()
     val incomingConnectionDeclineFlow: SharedFlow<String> = _incomingConnectionDeclineFlow.asSharedFlow()
 
+    private val _incomingPeerBlockStateFlow = MutableSharedFlow<Pair<String, Boolean>>()
+    val incomingPeerBlockStateFlow: SharedFlow<Pair<String, Boolean>> = _incomingPeerBlockStateFlow.asSharedFlow()
+
     private var activePeerId: String? = null
     private var lastGattMac: String? = null
 
@@ -188,15 +191,6 @@ class BleProximityTransport(
 
                 LayoverFileLogger.log("FRAME INGESTION [1/3]: rawType=$rawType, rawSender=$rawSenderMac, activePeer=$activePeerId, len=${rawFrame.text.length}")
 
-                val isRawBlocked = isPeerIdentifierBlocked(currentPeer, activePeerId, rawSenderMac, lastGattMac)
-                LayoverFileLogger.log("FRAME INGESTION [2/3]: Pre-decode block evaluation for currentPeer=$currentPeer, rawSender=$rawSenderMac -> isBlocked=$isRawBlocked")
-
-                if (isRawBlocked) {
-                    diagnosticsTracker.incrementBlockedDrops()
-                    LayoverFileLogger.log("FRAME INGESTION [3/3]: DROPPED raw frame from blocked peer. Blocked Drops=${diagnosticsTracker.diagnosticsState.value.blockedDrops}")
-                    return@collect
-                }
-
                 val frame = WireFrameCodec.decodeFrame(rawFrame.text)
                 if (frame == null) {
                     LayoverFileLogger.logError("Failed to decode incoming wire frame payload.")
@@ -209,6 +203,7 @@ class BleProximityTransport(
                     is WireFrame.ConnectionRequest -> frame.senderId
                     is WireFrame.ConnectionAccept -> frame.senderId
                     is WireFrame.ConnectionDecline -> frame.senderId
+                    is WireFrame.PeerBlockState -> frame.senderId
                     is WireFrame.ChatEncrypted -> frame.senderId
                 }
 
@@ -224,25 +219,27 @@ class BleProximityTransport(
                     )
                 )
 
-                val isDecodedBlocked = isPeerIdentifierBlocked(
-                    frameSenderId,
-                    frameDisplayName,
-                    activePeerId,
-                    rawSenderMac,
-                    lastGattMac
-                )
-                LayoverFileLogger.log("FRAME INGESTION [2b/3]: Post-decode block evaluation for frameSenderId=$frameSenderId, frameDisplayName=$frameDisplayName -> isBlocked=$isDecodedBlocked")
-
-                if (isDecodedBlocked) {
-                    diagnosticsTracker.incrementBlockedDrops()
-                    LayoverFileLogger.log("FRAME INGESTION [3/3]: DROPPED decoded frame from blocked peer. Blocked Drops=${diagnosticsTracker.diagnosticsState.value.blockedDrops}")
-                    return@collect
+                if (frame !is WireFrame.PeerBlockState) {
+                    val isRawBlocked = isPeerIdentifierBlocked(currentPeer, activePeerId, rawSenderMac, lastGattMac)
+                    val isDecodedBlocked = isPeerIdentifierBlocked(
+                        frameSenderId,
+                        frameDisplayName,
+                        activePeerId,
+                        rawSenderMac,
+                        lastGattMac
+                    )
+                    if (isRawBlocked || isDecodedBlocked) {
+                        diagnosticsTracker.incrementBlockedDrops()
+                        LayoverFileLogger.log("FRAME INGESTION [3/3]: DROPPED frame from blocked peer. Blocked Drops=${diagnosticsTracker.diagnosticsState.value.blockedDrops}")
+                        return@collect
+                    }
                 }
 
                 val isControlFrame = frame is WireFrame.KeyExchange ||
                         frame is WireFrame.ConnectionRequest ||
                         frame is WireFrame.ConnectionAccept ||
-                        frame is WireFrame.ConnectionDecline
+                        frame is WireFrame.ConnectionDecline ||
+                        frame is WireFrame.PeerBlockState
 
                 if (!isControlFrame && !rateLimiter.allowMessage(currentPeer)) {
                     LayoverFileLogger.log("Dropping rate-limited frame from peer: $currentPeer")
@@ -318,6 +315,15 @@ class BleProximityTransport(
                         _incomingConnectionDeclineFlow.emit(frame.senderId)
                     }
 
+                    is WireFrame.PeerBlockState -> {
+                        val effectivePeerId = frame.senderId.ifEmpty { currentPeer }
+                        if (effectivePeerId.isNotEmpty()) {
+                            activePeerId = effectivePeerId
+                        }
+                        LayoverFileLogger.log("Received PeerBlockState from $effectivePeerId: blocked=${frame.blocked}")
+                        _incomingPeerBlockStateFlow.emit(Pair(effectivePeerId, frame.blocked))
+                    }
+
                     is WireFrame.ChatEncrypted -> {
                         if (frame.senderId.isNotEmpty()) {
                             activePeerId = frame.senderId
@@ -370,6 +376,19 @@ class BleProximityTransport(
         val activeSessionIds = setOfNotNull(activePeerId, lastGattMac)
         discoveryManager.updateProtectedIdentifiers(blocked, muted, activeSessionIds)
         LayoverFileLogger.log("SAFETY SETTINGS UPDATE: blockedPeerIds=$blockedPeerIds, activePeerId=$activePeerId")
+    }
+
+    override fun sendBlockState(peerId: String, blocked: Boolean) {
+        LayoverFileLogger.log("sendBlockState to peerId=$peerId, blocked=$blocked")
+        val localId = currentUserProfile.handle.ifEmpty { "user" }
+        val frame = WireFrameCodec.encodePeerBlockState(
+            senderId = localId,
+            blocked = blocked
+        )
+        val sent = gattSessionManager.sendFrame(frame)
+        if (sent) {
+            diagnosticsTracker.incrementMessagesSent()
+        }
     }
 
     private fun initiateE2eeHandshake() {

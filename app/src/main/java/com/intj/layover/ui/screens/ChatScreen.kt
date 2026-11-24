@@ -73,6 +73,7 @@ fun ChatScreen(
     peer: NearbyPeer?,
     messages: List<ChatMessage>,
     isBlocked: Boolean = false,
+    isBlockedByPeer: Boolean = false,
     isMuted: Boolean = false,
     onSendMessage: (text: String, replyToText: String?) -> Unit,
     onToggleBlockPeer: (String) -> Unit,
@@ -87,6 +88,8 @@ fun ChatScreen(
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
 
+    val isChatLocked = isBlocked || isBlockedByPeer
+
     val peerId = peer?.id ?: ""
     val resolvedName = peer?.displayName?.takeIf { it.isNotBlank() }
         ?: if (peerId.isNotEmpty()) "Peer (${peerId.takeLast(4)})" else "Nearby Peer"
@@ -99,8 +102,8 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(peerId, isBlocked) {
-        if (!isBlocked) {
+    LaunchedEffect(peerId, isChatLocked) {
+        if (!isChatLocked) {
             delay(100)
             runCatching {
                 focusRequester.requestFocus()
@@ -121,6 +124,18 @@ fun ChatScreen(
     val greyDisabledFill = Color(0xFF232933)
     val greyDisabledBorder = Color(0xFF3A4250)
     val greyDisabledText = Color(0xFF8A94A6)
+
+    val statusText = when {
+        isBlockedByPeer -> "You have been blocked"
+        isBlocked -> "Blocked"
+        else -> "End-to-End Encrypted"
+    }
+
+    val inputPlaceholderText = when {
+        isBlockedByPeer -> "You have been blocked"
+        isBlocked -> "Peer is blocked"
+        else -> "Type encrypted message..."
+    }
 
     LayoverBackground {
         Column(
@@ -149,10 +164,10 @@ fun ChatScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .background(if (isBlocked) greyDisabledFill else IncomingBubbleSurface)
+                        .background(if (isChatLocked) greyDisabledFill else IncomingBubbleSurface)
                         .border(
                             1.5.dp,
-                            if (isBlocked) greyDisabledBorder else CyanPrimary,
+                            if (isChatLocked) greyDisabledBorder else CyanPrimary,
                             CircleShape
                         ),
                     contentAlignment = Alignment.Center
@@ -160,7 +175,7 @@ fun ChatScreen(
                     Text(
                         text = resolvedInitials,
                         fontWeight = FontWeight.Bold,
-                        color = if (isBlocked) greyDisabledText else CyanPrimary,
+                        color = if (isChatLocked) greyDisabledText else CyanPrimary,
                         fontSize = 15.sp
                     )
                 }
@@ -173,20 +188,20 @@ fun ChatScreen(
                             text = resolvedName,
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (isBlocked) greyDisabledText else LightText
+                            color = if (isChatLocked) greyDisabledText else LightText
                         )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = Icons.Default.Lock,
                             contentDescription = null,
-                            tint = if (isBlocked) greyDisabledText else CyanAccent,
+                            tint = if (isChatLocked) greyDisabledText else CyanAccent,
                             modifier = Modifier.size(11.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isBlocked) "Blocked" else "End-to-End Encrypted",
-                            color = if (isBlocked) greyDisabledText else CyanAccent,
+                            text = statusText,
+                            color = if (isChatLocked) greyDisabledText else CyanAccent,
                             fontSize = 11.sp
                         )
                     }
@@ -226,13 +241,13 @@ fun ChatScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Messages List (greyed out when blocked)
+            // Messages List (greyed out when chat is locked)
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .alpha(if (isBlocked) 0.45f else 1f),
+                    .alpha(if (isChatLocked) 0.45f else 1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 contentPadding = PaddingValues(vertical = 8.dp),
                 reverseLayout = true
@@ -241,7 +256,7 @@ fun ChatScreen(
                     ChatMessageBubble(
                         message = msg,
                         onReply = {
-                            if (!isBlocked) {
+                            if (!isChatLocked) {
                                 replyingToMessage = msg
                             }
                         }
@@ -249,7 +264,7 @@ fun ChatScreen(
                 }
             }
 
-            if (isBlocked) {
+            if (isBlockedByPeer) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -272,7 +287,7 @@ fun ChatScreen(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "You've been blocked",
+                            text = "You have been blocked",
                             color = greyDisabledText,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium
@@ -282,7 +297,7 @@ fun ChatScreen(
             }
 
             // Reply Preview Banner
-            if (replyingToMessage != null && !isBlocked) {
+            if (replyingToMessage != null && !isChatLocked) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -323,7 +338,7 @@ fun ChatScreen(
             }
 
             // Input Bar
-            val canSend = !isBlocked && inputText.isNotBlank()
+            val canSend = !isChatLocked && inputText.isNotBlank()
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -331,15 +346,15 @@ fun ChatScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
-                    value = if (isBlocked) "" else inputText,
-                    onValueChange = { if (!isBlocked) inputText = it },
+                    value = if (isChatLocked) "" else inputText,
+                    onValueChange = { if (!isChatLocked) inputText = it },
                     placeholder = {
                         Text(
-                            text = if (isBlocked) "You've been blocked" else "Type encrypted message...",
-                            color = if (isBlocked) greyDisabledText else MutedText
+                            text = inputPlaceholderText,
+                            color = if (isChatLocked) greyDisabledText else MutedText
                         )
                     },
-                    enabled = !isBlocked,
+                    enabled = !isChatLocked,
                     modifier = Modifier
                         .weight(1f)
                         .focusRequester(focusRequester),
@@ -373,7 +388,7 @@ fun ChatScreen(
                             }
                         },
                     color = when {
-                        isBlocked -> greyDisabledFill
+                        isChatLocked -> greyDisabledFill
                         canSend -> CyanPrimary
                         else -> ElevatedCardSurface
                     }
@@ -383,7 +398,7 @@ fun ChatScreen(
                             imageVector = Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Send",
                             tint = when {
-                                isBlocked -> greyDisabledText
+                                isChatLocked -> greyDisabledText
                                 canSend -> DarkNavyBackground
                                 else -> MutedText
                             },

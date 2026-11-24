@@ -23,6 +23,11 @@ sealed class WireFrame {
         val senderId: String
     ) : WireFrame()
 
+    data class PeerBlockState(
+        val senderId: String,
+        val blocked: Boolean
+    ) : WireFrame()
+
     data class ChatEncrypted(
         val msgId: String,
         val senderId: String,
@@ -48,6 +53,11 @@ object WireFrameCodec {
 
     fun encodeConnectionDecline(senderId: String): String {
         return "CONNECTION_DECLINE|$senderId"
+    }
+
+    fun encodePeerBlockState(senderId: String, blocked: Boolean): String {
+        val flag = if (blocked) "1" else "0"
+        return "PEER_BLOCK_STATE|$senderId|$flag"
     }
 
     fun encodeChatEncrypted(
@@ -97,6 +107,16 @@ object WireFrameCodec {
                 if (parts.size >= 2) {
                     WireFrame.ConnectionDecline(
                         senderId = parts[1]
+                    )
+                } else null
+            }
+
+            "PEER_BLOCK_STATE" -> {
+                if (parts.size >= 3) {
+                    val blocked = parts[2] == "1" || parts[2].equals("true", ignoreCase = true)
+                    WireFrame.PeerBlockState(
+                        senderId = parts[1],
+                        blocked = blocked
                     )
                 } else null
             }

@@ -11,6 +11,7 @@ interface ProximityTransport {
     fun sendConnectionRequest(peerId: String)
     fun acceptConnectionRequest(peerId: String)
     fun declineConnectionRequest(peerId: String) {}
+    fun sendBlockState(peerId: String, blocked: Boolean) {}
     fun sendMessage(peerId: String, text: String)
     fun resetDiagnosticsCounters() {}
 }
@@ -24,6 +25,7 @@ class NoOpProximityTransport : ProximityTransport {
     override fun sendConnectionRequest(peerId: String) {}
     override fun acceptConnectionRequest(peerId: String) {}
     override fun declineConnectionRequest(peerId: String) {}
+    override fun sendBlockState(peerId: String, blocked: Boolean) {}
     override fun sendMessage(peerId: String, text: String) {}
 }
 
@@ -94,6 +96,7 @@ data class LayoverUiState(
     val nearbyPeers: List<NearbyPeer> = emptyList(),
     val chatMessages: Map<String, List<ChatMessage>> = emptyMap(),
     val blockedPeerIds: Set<String> = emptySet(),
+    val blockedByPeerIds: Set<String> = emptySet(),
     val mutedPeerIds: Set<String> = emptySet(),
     val rateLimitedPeerIds: Set<String> = emptySet(),
     val isScanning: Boolean = false,

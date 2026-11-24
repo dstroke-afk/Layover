@@ -260,6 +260,25 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            LaunchedEffect(Unit) {
+                bleTransport.incomingPeerBlockStateFlow.collectLatest { event: Pair<String, Boolean> ->
+                    val peerId = event.first
+                    val isBlockedByPeer = event.second
+                    val aliases = (PeerAliasRegistry.resolveAliases(peerId) + peerId)
+                        .filter { alias: String -> alias.isNotBlank() && alias != "00000000" && alias != "user" }
+                        .toSet()
+                    val updatedBlockedBy = uiState.blockedByPeerIds.toMutableSet()
+                    if (isBlockedByPeer) {
+                        updatedBlockedBy.addAll(aliases)
+                    } else {
+                        updatedBlockedBy.removeAll { existing: String ->
+                            aliases.any { candidate: String -> existing.equals(candidate, ignoreCase = true) }
+                        }
+                    }
+                    uiState = uiState.copy(blockedByPeerIds = updatedBlockedBy)
+                }
+            }
+
             val permissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestMultiplePermissions()
             ) { permsMap ->

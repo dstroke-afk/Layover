@@ -132,9 +132,11 @@ fun LayoverNavGraph(
                 updatedBlocked.removeAll { existing ->
                     aliases.any { candidate -> existing.equals(candidate, ignoreCase = true) }
                 }
+                uiState.transport.sendBlockState(resolvedPeerId, false)
                 LayoverFileLogger.log("BLOCK ACTION: Unblocked peerId=$resolvedPeerId. Removed aliases=$aliases. Total blocked set size=${updatedBlocked.size}")
             } else {
                 updatedBlocked.addAll(aliases)
+                uiState.transport.sendBlockState(resolvedPeerId, true)
                 LayoverFileLogger.log("BLOCK ACTION: Blocked peerId=$resolvedPeerId. Added aliases=$aliases. Total blocked set size=${updatedBlocked.size}, contents=$updatedBlocked")
             }
             onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
@@ -246,12 +248,19 @@ fun LayoverNavGraph(
                     val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
                     expanded.any { exp -> uiState.blockedPeerIds.any { it.equals(exp, ignoreCase = true) } }
                 }
+
+            val isBlockedByPeer = listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
+                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+                expanded.any { exp -> uiState.blockedByPeerIds.any { it.equals(exp, ignoreCase = true) } }
+            }
+
             val isMuted = uiState.mutedPeerIds.contains(peerId) || (peer != null && uiState.mutedPeerIds.contains(peer.id))
 
             ChatScreen(
                 peer = peer,
                 messages = messages,
                 isBlocked = isBlocked,
+                isBlockedByPeer = isBlockedByPeer,
                 isMuted = isMuted,
                 onSendMessage = { text, replyTo ->
                     uiState.transport.sendMessage(peerId, text)
