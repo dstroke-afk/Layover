@@ -14,6 +14,7 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.graphics.BitmapFactory
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.NearbyPeer
@@ -389,6 +390,13 @@ class BleDiscoveryManager(
         maybeFetchAvatar(result.device, mapKey)
     }
 
+    private fun isValidDecodedAvatar(bytes: ByteArray): Boolean {
+        if (bytes.isEmpty()) return false
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        return opts.outWidth > 0 && opts.outHeight > 0
+    }
+
     private fun maybeFetchAvatar(device: BluetoothDevice, mapKey: String) {
         val fetcher = onRequestAvatarFetch ?: run {
             LayoverFileLogger.logThrottled("no_fetcher_$mapKey", "Avatar fetcher callback is null for Key=$mapKey")
@@ -401,8 +409,9 @@ class BleDiscoveryManager(
         LayoverFileLogger.log("Scheduling avatar fetch for Key=$mapKey, MAC=${device.address}")
         fetcher(device, mapKey) { avatarBytes ->
             inFlightAvatarKeys.remove(mapKey)
-            if (avatarBytes.isNotEmpty()) {
+            if (isValidDecodedAvatar(avatarBytes)) {
                 fetchedAvatarKeys.add(mapKey)
+                PeerAliasRegistry.resolveAliases(mapKey).forEach { fetchedAvatarKeys.add(it) }
                 cachedAvatarsByKey[mapKey] = avatarBytes
                 PeerAliasRegistry.resolveAliases(mapKey).forEach { cachedAvatarsByKey[it] = avatarBytes }
 
@@ -420,7 +429,7 @@ class BleDiscoveryManager(
                     LayoverFileLogger.log("Updated peer avatar in discovery list for Key=$mapKey (${avatarBytes.size} bytes)")
                 }
             } else {
-                LayoverFileLogger.log("Avatar fetch returned 0 bytes for Key=$mapKey")
+                LayoverFileLogger.log("Avatar fetch returned invalid/undecodable image (${avatarBytes.size} bytes) for Key=$mapKey; not caching.")
             }
         }
     }

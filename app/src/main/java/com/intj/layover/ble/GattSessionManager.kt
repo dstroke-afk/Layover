@@ -45,6 +45,7 @@ class GattSessionManager(
         val LAYOVER_RX_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7043")
         val LAYOVER_AVATAR_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7044")
         val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val AVATAR_CHUNK_SIZE = 500
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
@@ -74,6 +75,7 @@ class GattSessionManager(
     private val isFlushingQueue = AtomicBoolean(false)
     private val subscribedClients = mutableSetOf<BluetoothDevice>()
     private val avatarReadBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
+    private val avatarReadOffsets = ConcurrentHashMap<String, Int>()
 
     private var writeCompletion: CompletableDeferred<Boolean>? = null
 
@@ -107,10 +109,12 @@ class GattSessionManager(
             override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client connected: ${device?.address}")
+                    device?.address?.let { avatarReadOffsets.remove(it) }
                     connectedDevice = device
                     setConnectionState(RfcommConnectionState.CONNECTED)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
+                    device?.address?.let { avatarReadOffsets.remove(it) }
                     device?.let { subscribedClients.remove(it) }
                     if (connectedDevice?.address == device?.address) {
                         connectedDevice = null
@@ -137,13 +141,30 @@ class GattSessionManager(
                             .put(rawAvatar)
                             .array()
                     }
-                    val slice = if (offset >= framedPayload.size) {
+
+                    val trackedOffset = avatarReadOffsets[targetDevice.address]
+                    val effectiveOffset = when {
+                        offset > 0 -> offset
+                        trackedOffset != null && trackedOffset < framedPayload.size -> trackedOffset
+                        else -> 0
+                    }
+
+                    val slice = if (effectiveOffset >= framedPayload.size) {
+                        avatarReadOffsets.remove(targetDevice.address)
                         ByteArray(0)
                     } else {
-                        val end = min(framedPayload.size, offset + 500)
-                        framedPayload.copyOfRange(offset, end)
+                        val end = min(framedPayload.size, effectiveOffset + AVATAR_CHUNK_SIZE)
+                        val chunk = framedPayload.copyOfRange(effectiveOffset, end)
+                        val nextPos = end
+                        if (nextPos >= framedPayload.size) {
+                            avatarReadOffsets.remove(targetDevice.address)
+                        } else {
+                            avatarReadOffsets[targetDevice.address] = nextPos
+                        }
+                        chunk
                     }
-                    LayoverFileLogger.log("GATT Server avatar read: device=${targetDevice.address}, offset=$offset, framedTotal=${framedPayload.size}, sent=${slice.size}")
+
+                    LayoverFileLogger.log("GATT Server avatar read: device=${targetDevice.address}, reqOffset=$offset, effectiveOffset=$effectiveOffset, framedTotal=${framedPayload.size}, sent=${slice.size}")
                     gattServer?.sendResponse(targetDevice, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
                 } else {
                     gattServer?.sendResponse(targetDevice, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
@@ -269,6 +290,12 @@ class GattSessionManager(
 
         var probeGatt: BluetoothGatt? = null
         var completed = false
+        var expectedFramedTotal: Int? = null
+
+        fun readNextChunk(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            @Suppress("DEPRECATION")
+            gatt.readCharacteristic(characteristic)
+        }
 
         fun finishAndClose(gatt: BluetoothGatt?, reason: String) {
             if (completed) return
@@ -280,12 +307,14 @@ class GattSessionManager(
                 if (expectedLen in 1..availablePayload.size) {
                     availablePayload.copyOfRange(0, expectedLen)
                 } else {
-                    availablePayload
+                    ByteArray(0)
                 }
             } else {
                 ByteArray(0)
             }
-            LayoverFileLogger.log("Avatar probe finished (${device.address}): reason=$reason, raw=${raw.size}, avatarBytes=${collected.size}")
+            val magicHex = collected.take(4).joinToString("") { "%02X".format(it) }
+            val tailHex = collected.takeLast(2).joinToString("") { "%02X".format(it) }
+            LayoverFileLogger.log("Avatar probe finished (${device.address}): reason=$reason, raw=${raw.size}, avatarBytes=${collected.size}, magic=$magicHex, tail=$tailHex")
             try {
                 gatt?.disconnect()
                 gatt?.close()
@@ -322,9 +351,10 @@ class GattSessionManager(
                     ?: gatt?.getService(LAYOVER_GATT_SERVICE_UUID)
                 val avatarChar = service?.characteristics?.find { it.uuid.equals(LAYOVER_AVATAR_CHAR_UUID) }
                     ?: service?.getCharacteristic(LAYOVER_AVATAR_CHAR_UUID)
-                if (avatarChar != null) {
+                if (avatarChar != null && gatt != null) {
+                    expectedFramedTotal = null
                     LayoverFileLogger.log("Avatar probe reading characteristic from ${device.address} (mtu=$mtu)...")
-                    gatt?.readCharacteristic(avatarChar)
+                    readNextChunk(gatt, avatarChar)
                 } else {
                     finishAndClose(gatt, "avatarCharMissing")
                 }
@@ -341,14 +371,20 @@ class GattSessionManager(
                         buffer.write(value)
                         val currentBytes = buffer.toByteArray()
                         if (currentBytes.size >= 4) {
-                            val expectedTotal = ByteBuffer.wrap(currentBytes, 0, 4).int
-                            LayoverFileLogger.log("Avatar probe progress (${device.address}): got=${currentBytes.size - 4}/$expectedTotal")
-                            if (expectedTotal <= 0 || (currentBytes.size - 4) >= expectedTotal) {
+                            val payloadLen = ByteBuffer.wrap(currentBytes, 0, 4).int
+                            if (payloadLen <= 0) {
+                                finishAndClose(gatt, "emptyAvatar")
+                                return
+                            }
+                            val totalNeeded = 4 + payloadLen
+                            expectedFramedTotal = totalNeeded
+                            LayoverFileLogger.log("Avatar probe progress (${device.address}): got=${currentBytes.size}/$totalNeeded")
+                            if (currentBytes.size >= totalNeeded) {
                                 finishAndClose(gatt, "complete")
                                 return
                             }
                         }
-                        gatt.readCharacteristic(characteristic)
+                        readNextChunk(gatt, characteristic)
                     } else {
                         finishAndClose(gatt, "emptyChunk")
                     }
@@ -382,7 +418,7 @@ class GattSessionManager(
                 device.connectGatt(context, false, probeCallback)
             }
             scope.launch {
-                delay(5000)
+                delay(7000)
                 finishAndClose(probeGatt, "timeout")
             }
         } catch (e: Exception) {
@@ -400,6 +436,7 @@ class GattSessionManager(
         }
         gattServer = null
         subscribedClients.clear()
+        avatarReadOffsets.clear()
         _isGattReady.value = false
     }
 
