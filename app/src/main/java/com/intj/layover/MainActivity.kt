@@ -2,6 +2,7 @@ package com.intj.layover
 
 import android.content.Context
 import android.os.Bundle
+import android.util.Base64
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -67,12 +68,22 @@ class MainActivity : ComponentActivity() {
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
         val savedAge = if (prefs.contains("age")) prefs.getInt("age", -1).takeIf { it > 0 } else null
+        val savedAvatarBytes = prefs.getString("avatar_b64", null)?.let {
+            runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
+        }
+        val savedCompactAvatarBytes = prefs.getString("compact_avatar_b64", null)?.let {
+            runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
+        }
+        val savedResolutionLabel = prefs.getString("cropped_resolution", null)
         val savedVisible = prefs.getBoolean("is_visible", true)
         val initialProfile = UserProfile(
             displayName = savedName,
             handle = savedHandle,
             gender = savedGender,
             age = savedAge,
+            avatarBytes = savedAvatarBytes,
+            compactTransferAvatarBytes = savedCompactAvatarBytes,
+            croppedResolutionLabel = savedResolutionLabel,
             isVisibleToNearby = savedVisible
         )
 
@@ -148,7 +159,8 @@ class MainActivity : ComponentActivity() {
                                 id = existing.id,
                                 handle = existing.handle.ifEmpty { discovered.handle },
                                 displayName = discovered.displayName.ifBlank { existing.displayName },
-                                status = existing.status
+                                status = existing.status,
+                                avatar = if (discovered.avatar.avatarBase64OrBytes != null) discovered.avatar else existing.avatar
                             )
                         } else {
                             discovered
@@ -477,6 +489,15 @@ class MainActivity : ComponentActivity() {
                                 editor.putInt("age", ageValue)
                             } else {
                                 editor.remove("age")
+                            }
+                            newState.userProfile.avatarBytes?.let {
+                                editor.putString("avatar_b64", Base64.encodeToString(it, Base64.NO_WRAP))
+                            }
+                            newState.userProfile.compactTransferAvatarBytes?.let {
+                                editor.putString("compact_avatar_b64", Base64.encodeToString(it, Base64.NO_WRAP))
+                            }
+                            newState.userProfile.croppedResolutionLabel?.let {
+                                editor.putString("cropped_resolution", it)
                             }
                             editor.apply()
 

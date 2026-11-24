@@ -104,8 +104,47 @@ data class UserProfile(
     val handle: String = "balajieswar",
     val gender: GenderOption = GenderOption.MALE,
     val age: Int? = null,
+    val avatarBytes: ByteArray? = null,
+    val compactTransferAvatarBytes: ByteArray? = null,
+    val croppedResolutionLabel: String? = null,
     val isVisibleToNearby: Boolean = true
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as UserProfile
+
+        if (displayName != other.displayName) return false
+        if (handle != other.handle) return false
+        if (gender != other.gender) return false
+        if (age != other.age) return false
+        if (isVisibleToNearby != other.isVisibleToNearby) return false
+        if (croppedResolutionLabel != other.croppedResolutionLabel) return false
+        if (avatarBytes != null) {
+            if (other.avatarBytes == null) return false
+            if (!avatarBytes.contentEquals(other.avatarBytes)) return false
+        } else if (other.avatarBytes != null) return false
+        if (compactTransferAvatarBytes != null) {
+            if (other.compactTransferAvatarBytes == null) return false
+            if (!compactTransferAvatarBytes.contentEquals(other.compactTransferAvatarBytes)) return false
+        } else if (other.compactTransferAvatarBytes != null) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = displayName.hashCode()
+        result = 31 * result + handle.hashCode()
+        result = 31 * result + gender.hashCode()
+        result = 31 * result + (age ?: 0)
+        result = 31 * result + isVisibleToNearby.hashCode()
+        result = 31 * result + (croppedResolutionLabel?.hashCode() ?: 0)
+        result = 31 * result + (avatarBytes?.contentHashCode() ?: 0)
+        result = 31 * result + (compactTransferAvatarBytes?.contentHashCode() ?: 0)
+        return result
+    }
+}
 
 data class LayoverUiState(
     val userProfile: UserProfile = UserProfile(),
