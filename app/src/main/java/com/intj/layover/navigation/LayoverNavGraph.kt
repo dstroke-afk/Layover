@@ -19,6 +19,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.intj.layover.ble.PeerAliasRegistry
+import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
@@ -85,26 +87,58 @@ fun LayoverNavGraph(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController()
 ) {
-    val toggleBlockPeer = { peerId: String ->
-        val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
-        val peer = uiState.nearbyPeers.find {
-            it.id == peerId || it.handle == peerId || it.displayName == peerId || it.id.equals(peerId, ignoreCase = true)
+    val toggleBlockPeer = { rawPeerId: String ->
+        val queryAliases = PeerAliasRegistry.resolveAliases(rawPeerId) + rawPeerId
+        val targetPeer = uiState.nearbyPeers.find { peer ->
+            queryAliases.any { q ->
+                peer.id.equals(q, ignoreCase = true) ||
+                        peer.handle.equals(q, ignoreCase = true) ||
+                        peer.displayName.equals(q, ignoreCase = true)
+            }
         }
-        val aliases = setOfNotNull(
-            peerId,
-            peer?.id,
-            peer?.handle?.ifEmpty { null },
-            peer?.displayName?.ifEmpty { null }
-        )
 
-        val isCurrentlyBlocked = aliases.any { updatedBlocked.contains(it) }
+        val resolvedPeerId = targetPeer?.id?.takeIf { it.isNotBlank() }
+            ?: targetPeer?.handle?.takeIf { it.isNotBlank() }
+            ?: rawPeerId.trim()
 
-        if (isCurrentlyBlocked) {
-            updatedBlocked.removeAll(aliases)
-        } else {
-            updatedBlocked.addAll(aliases)
+        if (resolvedPeerId.isNotBlank() && resolvedPeerId != "00000000" && resolvedPeerId != "user") {
+            PeerAliasRegistry.linkAliases(
+                listOfNotNull(
+                    rawPeerId,
+                    resolvedPeerId,
+                    targetPeer?.id,
+                    targetPeer?.handle?.ifEmpty { null },
+                    targetPeer?.displayName?.ifEmpty { null }
+                )
+            )
+
+            val aliases = (
+                    PeerAliasRegistry.resolveAliases(resolvedPeerId) +
+                            PeerAliasRegistry.resolveAliases(rawPeerId) +
+                            listOfNotNull(
+                                resolvedPeerId,
+                                targetPeer?.id,
+                                targetPeer?.handle?.ifEmpty { null },
+                                targetPeer?.displayName?.ifEmpty { null }
+                            )
+                    ).filter { it.isNotBlank() && it != "00000000" && it != "user" }.toSet()
+
+            val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
+            val isCurrentlyBlocked = aliases.any { candidate ->
+                updatedBlocked.any { existing -> existing.equals(candidate, ignoreCase = true) }
+            }
+
+            if (isCurrentlyBlocked) {
+                updatedBlocked.removeAll { existing ->
+                    aliases.any { candidate -> existing.equals(candidate, ignoreCase = true) }
+                }
+                LayoverFileLogger.log("BLOCK ACTION: Unblocked peerId=$resolvedPeerId. Removed aliases=$aliases. Total blocked set size=${updatedBlocked.size}")
+            } else {
+                updatedBlocked.addAll(aliases)
+                LayoverFileLogger.log("BLOCK ACTION: Blocked peerId=$resolvedPeerId. Added aliases=$aliases. Total blocked set size=${updatedBlocked.size}, contents=$updatedBlocked")
+            }
+            onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
         }
-        onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
     }
 
     val toggleMutePeer = { peerId: String ->
@@ -122,7 +156,7 @@ fun LayoverNavGraph(
 
     NavHost(
         navController = navController,
-        startDestination = LayoverRoute.PeopleAround.route, // Start directly on People Around
+        startDestination = LayoverRoute.PeopleAround.route,
         modifier = modifier
     ) {
         composable(LayoverRoute.Splash.route) {
@@ -193,12 +227,25 @@ fun LayoverNavGraph(
             arguments = listOf(navArgument("peerId") { type = NavType.StringType })
         ) { backStackEntry ->
             val peerId = backStackEntry.arguments?.getString("peerId") ?: ""
-            val peer = uiState.nearbyPeers.find {
-                it.id == peerId || it.handle == peerId || it.displayName == peerId || it.id.equals(peerId, ignoreCase = true)
-            } ?: uiState.nearbyPeers.firstOrNull()
+            val queryAliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+            val peer = uiState.nearbyPeers.find { p ->
+                queryAliases.any { q ->
+                    p.id.equals(q, ignoreCase = true) ||
+                            p.handle.equals(q, ignoreCase = true) ||
+                            p.displayName.equals(q, ignoreCase = true)
+                }
+            }
 
-            val messages = uiState.chatMessages[peerId] ?: uiState.chatMessages[peer?.id] ?: emptyList()
-            val isBlocked = uiState.blockedPeerIds.contains(peerId) || (peer != null && (uiState.blockedPeerIds.contains(peer.id) || uiState.blockedPeerIds.contains(peer.displayName)))
+            val messages = uiState.chatMessages[peerId]
+                ?: peer?.let { uiState.chatMessages[it.id] ?: uiState.chatMessages[it.handle] }
+                ?: emptyList()
+
+            val isBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
+                ?.isPeerIdentifierBlocked(peerId, peer?.id, peer?.handle, peer?.displayName)
+                ?: listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
+                    val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+                    expanded.any { exp -> uiState.blockedPeerIds.any { it.equals(exp, ignoreCase = true) } }
+                }
             val isMuted = uiState.mutedPeerIds.contains(peerId) || (peer != null && uiState.mutedPeerIds.contains(peer.id))
 
             ChatScreen(

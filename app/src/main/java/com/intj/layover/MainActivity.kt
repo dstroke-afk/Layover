@@ -30,6 +30,7 @@ import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
+import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
@@ -92,31 +93,42 @@ class MainActivity : ComponentActivity() {
                     LayoverUiState(
                         userProfile = initialProfile,
                         nearbyPeers = emptyList(),
-                        isScanning = true, // Auto-start discovery by default on launch
+                        isScanning = true,
                         transport = bleTransport,
                         diagnostics = diagnostics
                     )
                 )
             }
 
-            var incomingRequestPeer by remember { mutableStateOf<Pair<String, String>?>(null) } // peerId, displayName
-            var acceptedRequestPeer by remember { mutableStateOf<String?>(null) } // peerId
+            var incomingRequestPeer by remember { mutableStateOf<Pair<String, String>?>(null) }
+            var acceptedRequestPeer by remember { mutableStateOf<String?>(null) }
 
-            // Sync live diagnostics state into uiState
             LaunchedEffect(diagnostics) {
                 uiState = uiState.copy(diagnostics = diagnostics)
             }
 
-            // Sync live discovered BLE peers into uiState, preserving status and deduplicating by name/handle/id
             LaunchedEffect(liveDiscoveredPeers) {
                 val existingList = uiState.nearbyPeers
                 val merged = liveDiscoveredPeers
-                    .groupBy { it.displayName.ifBlank { it.id } }
+                    .groupBy { peer ->
+                        val aliases = PeerAliasRegistry.resolveAliases(peer.id) +
+                                PeerAliasRegistry.resolveAliases(peer.handle) +
+                                listOfNotNull(peer.id.takeIf { it.isNotBlank() }, peer.handle.takeIf { it.isNotBlank() })
+                        aliases.firstOrNull { it.startsWith("dev_", ignoreCase = true) }
+                            ?: aliases.firstOrNull()
+                            ?: peer.displayName.ifBlank { peer.id }
+                    }
                     .map { (_, group) ->
                         val discovered = group.first()
+                        val discoveredAliases = PeerAliasRegistry.resolveAliases(discovered.id) +
+                                PeerAliasRegistry.resolveAliases(discovered.handle) +
+                                listOfNotNull(discovered.id.takeIf { it.isNotBlank() }, discovered.handle.takeIf { it.isNotBlank() })
+
                         val existing = existingList.find { p ->
-                            p.id == discovered.id ||
-                                    (p.handle.isNotEmpty() && p.handle == discovered.handle) ||
+                            val existingAliases = PeerAliasRegistry.resolveAliases(p.id) +
+                                    PeerAliasRegistry.resolveAliases(p.handle) +
+                                    listOfNotNull(p.id.takeIf { it.isNotBlank() }, p.handle.takeIf { it.isNotBlank() })
+                            discoveredAliases.any { dAlias -> existingAliases.any { eAlias -> dAlias.equals(eAlias, ignoreCase = true) } } ||
                                     (p.displayName.isNotEmpty() && p.displayName.equals(discovered.displayName, ignoreCase = true))
                         }
                         if (existing != null && existing.status != ConnectionStatus.NONE) {
@@ -135,7 +147,6 @@ class MainActivity : ComponentActivity() {
                 Log.d(TAG, "UI State updated with ${merged.size} deduplicated BLE discovered peers.")
             }
 
-            // Collect incoming P2P GATT messages and store under raw peerId, handle, and display name entries
             LaunchedEffect(Unit) {
                 bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
                     val updatedMap = uiState.chatMessages.toMutableMap()
@@ -150,8 +161,13 @@ class MainActivity : ComponentActivity() {
 
                     addMsgToKey(peerId)
 
-                    uiState.nearbyPeers.find {
-                        it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true)
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    uiState.nearbyPeers.find { peer ->
+                        aliases.any { a ->
+                            peer.id.equals(a, ignoreCase = true) ||
+                                    peer.handle.equals(a, ignoreCase = true) ||
+                                    peer.displayName.equals(a, ignoreCase = true)
+                        }
                     }?.let { peer ->
                         addMsgToKey(peer.id)
                         if (peer.handle.isNotEmpty()) addMsgToKey(peer.handle)
@@ -162,24 +178,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Collect incoming connection requests
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
-                    val isBlocked = uiState.blockedPeerIds.contains(peerId) ||
-                            uiState.blockedPeerIds.contains(displayName) ||
-                            uiState.blockedPeerIds.any { blocked ->
-                                peerId.equals(blocked, ignoreCase = true) || displayName.equals(blocked, ignoreCase = true)
-                            }
-
-                    if (isBlocked) {
+                    if (bleTransport.isPeerIdentifierBlocked(peerId, displayName)) {
                         Log.d(TAG, "Dropped CONNECTION_REQUEST popup for blocked peer: $peerId ($displayName)")
                         return@collectLatest
                     }
 
                     incomingRequestPeer = Pair(peerId, displayName)
 
-                    val existingPeer = uiState.nearbyPeers.find {
-                        it.id == peerId || it.handle == peerId || it.displayName.equals(displayName, ignoreCase = true)
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    val existingPeer = uiState.nearbyPeers.find { p ->
+                        aliases.any { a ->
+                            p.id.equals(a, ignoreCase = true) ||
+                                    p.handle.equals(a, ignoreCase = true) ||
+                                    (displayName.isNotEmpty() && p.displayName.equals(displayName, ignoreCase = true))
+                        }
                     }
 
                     val updatedPeers = if (existingPeer == null) {
@@ -191,7 +205,7 @@ class MainActivity : ComponentActivity() {
                         )
                     } else {
                         uiState.nearbyPeers.map { p ->
-                            if (p.id == existingPeer.id || p.handle == peerId || p.displayName.equals(displayName, ignoreCase = true)) {
+                            if (p.id == existingPeer.id) {
                                 p.copy(
                                     handle = peerId.ifEmpty { p.handle },
                                     displayName = displayName.ifEmpty { p.displayName },
@@ -206,12 +220,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Collect incoming connection accepts
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionAcceptFlow.collectLatest { peerId ->
                     acceptedRequestPeer = peerId
-                    val existingPeer = uiState.nearbyPeers.find {
-                        it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true)
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    val existingPeer = uiState.nearbyPeers.find { p ->
+                        aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }
                     }
 
                     val updatedPeers = uiState.nearbyPeers.map { p ->
@@ -225,17 +239,20 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Collect incoming connection declines
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionDeclineFlow.collectLatest { peerId ->
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
                     val updatedPeers = uiState.nearbyPeers.map { p ->
-                        if (p.id == peerId || p.handle == peerId) p.copy(status = ConnectionStatus.DECLINED) else p
+                        if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
+                            p.copy(status = ConnectionStatus.DECLINED)
+                        } else {
+                            p
+                        }
                     }
                     uiState = uiState.copy(nearbyPeers = updatedPeers)
                 }
             }
 
-            // Permission Launcher
             val permissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestMultiplePermissions()
             ) { permsMap ->
@@ -254,13 +271,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Bind missing permissions callback to transport
             bleTransport.onMissingPermissions = {
                 Log.d(TAG, "Transport requested missing permissions. Launching permission dialog...")
                 permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
             }
 
-            // Check permissions when scanning starts / uiState changes
             LaunchedEffect(uiState.isScanning) {
                 if (uiState.isScanning) {
                     if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
@@ -274,7 +289,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Display error toasts if BLE state reports issues
             LaunchedEffect(bleStatus.lastError) {
                 bleStatus.lastError?.let { err ->
                     bleTransport.diagnosticsTracker.updateLastErrorMessage(err)
@@ -284,7 +298,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Lifecycle awareness
             DisposableEffect(lifecycleOwner) {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
@@ -314,7 +327,6 @@ class MainActivity : ComponentActivity() {
             LayoverTheme {
                 val navController = androidx.navigation.compose.rememberNavController()
 
-                // Incoming Connection Request Dialog
                 incomingRequestPeer?.let { (peerId, displayName) ->
                     AlertDialog(
                         onDismissRequest = { incomingRequestPeer = null },
@@ -352,9 +364,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // Incoming Connection Accepted Dialog
                 acceptedRequestPeer?.let { peerId ->
-                    val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId || it.displayName.equals(peerId, ignoreCase = true) }
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    val peer = uiState.nearbyPeers.find { p ->
+                        aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }
+                    }
                     val name = peer?.displayName ?: "Peer"
                     AlertDialog(
                         onDismissRequest = { acceptedRequestPeer = null },

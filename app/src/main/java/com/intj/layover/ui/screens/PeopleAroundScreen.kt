@@ -22,16 +22,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
-import androidx.compose.material.icons.automirrored.filled.VolumeMute
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -69,6 +66,51 @@ import com.intj.layover.ui.theme.IncomingBubbleSurface
 import com.intj.layover.ui.theme.LightText
 import com.intj.layover.ui.theme.MutedText
 
+fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
+    val canonicalList = mutableListOf<NearbyPeer>()
+
+    for (p in peers) {
+        val existingIndex = canonicalList.indexOfFirst { existing ->
+            existing.id == p.id ||
+                    (existing.handle.isNotEmpty() && p.handle.isNotEmpty() && existing.handle == p.handle) ||
+                    (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() && (
+                        existing.displayName.equals(p.displayName, ignoreCase = true) ||
+                        existing.displayName.take(3).equals(p.displayName.take(3), ignoreCase = true)
+                    ))
+        }
+
+        if (existingIndex == -1) {
+            canonicalList.add(p)
+        } else {
+            val existing = canonicalList[existingIndex]
+            val statusPriority = mapOf(
+                ConnectionStatus.ACCEPTED to 4,
+                ConnectionStatus.REQUESTED to 3,
+                ConnectionStatus.DECLINED to 2,
+                ConnectionStatus.NONE to 1
+            )
+            val bestStatus = if ((statusPriority[p.status] ?: 0) > (statusPriority[existing.status] ?: 0)) {
+                p.status
+            } else {
+                existing.status
+            }
+
+            val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
+            val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
+            val bestName = if (p.displayName.length > existing.displayName.length) p.displayName else existing.displayName
+
+            canonicalList[existingIndex] = existing.copy(
+                id = bestId,
+                handle = bestHandle,
+                displayName = bestName,
+                status = bestStatus
+            )
+        }
+    }
+
+    return canonicalList
+}
+
 @Composable
 fun PeopleAroundScreen(
     uiState: LayoverUiState,
@@ -95,7 +137,7 @@ fun PeopleAroundScreen(
     }
 
     val filteredPeers = remember(uiState.nearbyPeers, searchQuery, uiState.blockedPeerIds) {
-        uiState.nearbyPeers.filter { peer ->
+        canonicalDeduplicatePeers(uiState.nearbyPeers).filter { peer ->
             searchQuery.isBlank() ||
                     peer.displayName.contains(searchQuery, ignoreCase = true) ||
                     (peer.handle.isNotEmpty() && peer.handle.contains(searchQuery, ignoreCase = true))
@@ -254,7 +296,9 @@ fun PeopleAroundScreen(
                 items(filteredPeers, key = { it.id }) { peer ->
                     PeerListItemCard(
                         peer = peer,
-                        isBlocked = uiState.blockedPeerIds.contains(peer.id),
+                        isBlocked = uiState.blockedPeerIds.contains(peer.id) ||
+                                (peer.handle.isNotEmpty() && uiState.blockedPeerIds.contains(peer.handle)) ||
+                                (peer.displayName.isNotEmpty() && uiState.blockedPeerIds.contains(peer.displayName)),
                         isMuted = uiState.mutedPeerIds.contains(peer.id),
                         onConnect = {
                             uiState.transport.sendConnectionRequest(peer.id)
@@ -280,10 +324,14 @@ fun PeerListItemCard(
     onToggleBlock: () -> Unit,
     onToggleMute: () -> Unit
 ) {
-    var showCardMenu by remember { mutableStateOf(false) }
+    val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = isChatAllowed) {
+                onChat()
+            },
         colors = CardDefaults.cardColors(
             containerColor = if (isBlocked) ElevatedCardSurface.copy(alpha = 0.6f) else ElevatedCardSurface
         ),
@@ -358,7 +406,7 @@ fun PeerListItemCard(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            // Action Pill & Menu
+            // Action Pill
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isBlocked) {
                     Surface(
@@ -435,7 +483,7 @@ fun PeerListItemCard(
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = "Accepted",
+                                        text = "Connected",
                                         color = Color.White,
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 13.sp
@@ -457,51 +505,6 @@ fun PeerListItemCard(
                                 )
                             }
                         }
-                    }
-                }
-
-                Box {
-                    IconButton(onClick = { showCardMenu = true }) {
-                        Icon(
-                            imageVector = Icons.Default.MoreVert,
-                            contentDescription = "Options",
-                            tint = MutedText
-                        )
-                    }
-
-                    DropdownMenu(
-                        expanded = showCardMenu,
-                        onDismissRequest = { showCardMenu = false },
-                        modifier = Modifier.background(ElevatedCardSurface)
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text(if (isMuted) "Unmute Peer" else "Mute Peer", color = LightText) },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeMute else Icons.AutoMirrored.Filled.VolumeOff,
-                                    contentDescription = null,
-                                    tint = CyanAccent
-                                )
-                            },
-                            onClick = {
-                                showCardMenu = false
-                                onToggleMute()
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Block,
-                                    contentDescription = null,
-                                    tint = Color(0xFFFF5252)
-                                )
-                            },
-                            onClick = {
-                                showCardMenu = false
-                                onToggleBlock()
-                            }
-                        )
                     }
                 }
             }

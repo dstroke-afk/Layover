@@ -52,6 +52,9 @@ class BleDiscoveryManager(
     private val peerMap = ConcurrentHashMap<String, DiscoveredPeerRecord>()
     private var pruneJob: Job? = null
 
+    private var protectedIdentifiers: Set<String> = emptySet()
+    private var activeGattIdentifiers: Set<String> = emptySet()
+
     private var currentAdvertiser: BluetoothLeAdvertiser? = null
     private var currentScanner: BluetoothLeScanner? = null
 
@@ -60,6 +63,31 @@ class BleDiscoveryManager(
 
     init {
         startPruningTask()
+    }
+
+    fun updateProtectedIdentifiers(blocked: Set<String>, muted: Set<String>, activeSessionIds: Set<String> = emptySet()) {
+        protectedIdentifiers = (blocked + muted).map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        activeGattIdentifiers = activeSessionIds.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    }
+
+    private fun isPeerProtected(peer: NearbyPeer): Boolean {
+        val candidates = listOfNotNull(
+            peer.id.takeIf { it.isNotBlank() },
+            peer.handle.takeIf { it.isNotBlank() },
+            peer.displayName.takeIf { it.isNotBlank() }
+        )
+        val hasActiveStatus = peer.status != ConnectionStatus.NONE
+        val isKnownDevId = peer.id.startsWith("dev_", ignoreCase = true) ||
+                peer.handle.startsWith("dev_", ignoreCase = true) ||
+                candidates.any { id -> PeerAliasRegistry.resolveAliases(id).any { it.startsWith("dev_", ignoreCase = true) } }
+        val isProtectedBySafetyOrSession = candidates.any { id ->
+            val expanded = PeerAliasRegistry.resolveAliases(id) + id
+            expanded.any { alias ->
+                protectedIdentifiers.any { it.equals(alias, ignoreCase = true) } ||
+                        activeGattIdentifiers.any { it.equals(alias, ignoreCase = true) }
+            }
+        }
+        return hasActiveStatus || isKnownDevId || isProtectedBySafetyOrSession
     }
 
     private fun startPruningTask() {
@@ -72,9 +100,8 @@ class BleDiscoveryManager(
 
                 peerMap.entries.removeIf { entry ->
                     val peer = entry.value.peer
-                    val hasActiveStatus = peer.status != ConnectionStatus.NONE
                     val isStale = (now - entry.value.lastSeenTimestamp) > LayoverBleConstants.PEER_STALE_TIMEOUT_MS
-                    val shouldPrune = isStale && !hasActiveStatus
+                    val shouldPrune = isStale && !isPeerProtected(peer)
                     if (shouldPrune) {
                         LayoverFileLogger.log("Pruning stale BLE peer: ${entry.key}")
                         updated = true
@@ -91,7 +118,14 @@ class BleDiscoveryManager(
     }
 
     fun getDiscoveredDevice(peerId: String): BluetoothDevice? {
-        val record = peerMap[peerId] ?: peerMap.values.find { it.peer.id == peerId }
+        val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+        val record = aliases.firstNotNullOfOrNull { key ->
+            peerMap[key] ?: peerMap.values.find {
+                it.peer.id.equals(key, ignoreCase = true) ||
+                        it.peer.handle.equals(key, ignoreCase = true) ||
+                        it.device.address.equals(key, ignoreCase = true)
+            }
+        }
         return record?.device
     }
 
@@ -135,17 +169,16 @@ class BleDiscoveryManager(
 
         val payload = LayoverBlePayloadEncoder.encodePayload(
             displayName = userProfile.displayName,
-            isVisible = userProfile.isVisibleToNearby
+            isVisible = userProfile.isVisibleToNearby,
+            handleOrDeviceId = userProfile.handle
         )
 
-        // Primary Advertising Data: 18 bytes (128-bit UUID)
         val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(LayoverBleConstants.LAYOVER_SERVICE_UUID)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
-        // Scan Response Data: 25 bytes (18-byte UUID header + 7-byte compact payload)
         val scanResponseData = AdvertiseData.Builder()
             .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, payload)
             .setIncludeDeviceName(false)
@@ -154,7 +187,8 @@ class BleDiscoveryManager(
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE). InstanceId=${LayoverBleConstants.LOCAL_INSTANCE_ID_HEX}")
+                val instId = LayoverBlePayloadEncoder.getInstanceIdHex(userProfile.handle)
+                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE). InstanceId=$instId")
                 bleStateController.startAdvertising()
             }
 
@@ -304,20 +338,34 @@ class BleDiscoveryManager(
 
         val mapKey = payload?.instanceIdHex?.ifBlank { macAddress } ?: macAddress
 
-        val existingRecord = peerMap[mapKey]
+        val existingRecord = peerMap[mapKey] ?: peerMap.values.find {
+            it.peer.id == macAddress || it.peer.handle == mapKey || it.device.address.equals(macAddress, ignoreCase = true)
+        }
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
 
         val updatedPeer = NearbyPeer(
-            id = macAddress,
+            id = mapKey,
             displayName = fallbackName,
+            handle = mapKey,
             status = currentStatus,
             avatar = PeerAvatar(
-                peerId = macAddress,
+                peerId = mapKey,
                 initials = fallbackName.split(" ")
                     .mapNotNull { it.firstOrNull()?.toString() }
                     .take(2)
                     .joinToString("")
                     .ifEmpty { "?" }
+            )
+        )
+
+        PeerAliasRegistry.linkAliases(
+            listOfNotNull(
+                mapKey,
+                payload?.instanceIdHex,
+                macAddress,
+                existingRecord?.peer?.id,
+                existingRecord?.peer?.handle,
+                fallbackName
             )
         )
 
@@ -332,7 +380,10 @@ class BleDiscoveryManager(
     }
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {
-        val record = peerMap[peerId] ?: peerMap.values.find { it.peer.id == peerId }
+        val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+        val record = aliases.firstNotNullOfOrNull { key ->
+            peerMap[key] ?: peerMap.values.find { it.peer.id.equals(key, ignoreCase = true) || it.peer.handle.equals(key, ignoreCase = true) }
+        }
         if (record != null) {
             val updated = record.peer.copy(status = newStatus)
             val key = peerMap.entries.find { it.value.peer.id == record.peer.id }?.key ?: peerId

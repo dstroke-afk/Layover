@@ -10,7 +10,7 @@ object LayoverBleConstants {
     const val PEER_STALE_TIMEOUT_MS = 60_000L
     const val MAX_NAME_BYTE_LENGTH = 8
 
-    // Stable 4-byte random instance ID generated once per app session to collapse rotating BLE MACs
+    // Fallback 4-byte random instance ID generated once per app session
     val LOCAL_INSTANCE_ID_BYTES: ByteArray = ByteArray(4).apply {
         val randInt = UUID.randomUUID().mostSignificantBits.toInt()
         this[0] = (randInt ushr 24).toByte()
@@ -29,10 +29,28 @@ object LayoverBlePayloadEncoder {
         val isVisible: Boolean
     )
 
-    fun encodePayload(displayName: String, isVisible: Boolean): ByteArray {
+    fun getInstanceIdBytes(handleOrDeviceId: String): ByteArray {
+        val hash = handleOrDeviceId.hashCode()
+        return byteArrayOf(
+            (hash ushr 24).toByte(),
+            (hash ushr 16).toByte(),
+            (hash ushr 8).toByte(),
+            hash.toByte()
+        )
+    }
+
+    fun getInstanceIdHex(handleOrDeviceId: String): String {
+        return getInstanceIdBytes(handleOrDeviceId).joinToString("") { "%02X".format(it) }
+    }
+
+    fun encodePayload(displayName: String, isVisible: Boolean, handleOrDeviceId: String = ""): ByteArray {
         val flags = if (isVisible) 0x01.toByte() else 0x00.toByte()
 
-        val instanceIdBytes = LayoverBleConstants.LOCAL_INSTANCE_ID_BYTES
+        val instanceIdBytes = if (handleOrDeviceId.isNotEmpty()) {
+            getInstanceIdBytes(handleOrDeviceId)
+        } else {
+            LayoverBleConstants.LOCAL_INSTANCE_ID_BYTES
+        }
 
         val nameBytes = displayName.toByteArray(Charsets.UTF_8)
         var nameLen = nameBytes.size.coerceAtMost(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)

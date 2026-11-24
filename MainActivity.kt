@@ -30,6 +30,7 @@ import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.ble.BleProximityTransport
 import com.intj.layover.ble.BleStateController
 import com.intj.layover.ble.GattSessionManager
+import com.intj.layover.ble.LayoverBlePayloadEncoder
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
@@ -50,11 +51,77 @@ class MainActivity : ComponentActivity() {
     private lateinit var gattSessionManager: GattSessionManager
     private lateinit var bleTransport: BleProximityTransport
 
-    private fun isMatchingPeer(p1: NearbyPeer, idOrName: String): Boolean {
-        if (p1.id == idOrName) return true
-        if (p1.handle.isNotEmpty() && p1.handle == idOrName) return true
-        if (p1.displayName.isNotEmpty() && p1.displayName.equals(idOrName, ignoreCase = true)) return true
+    private fun getCanonicalPeerKey(idOrHandle: String): String {
+        if (idOrHandle.isEmpty()) return ""
+        if (idOrHandle.length == 8 && idOrHandle.all { it in "0123456789ABCDEFabcdef" }) {
+            return idOrHandle.uppercase()
+        }
+        if (idOrHandle.startsWith("dev_")) {
+            return LayoverBlePayloadEncoder.getInstanceIdHex(idOrHandle)
+        }
+        return idOrHandle
+    }
+
+    private fun isMatchingPeer(p: NearbyPeer, queryId: String, queryName: String = ""): Boolean {
+        if (queryId.isEmpty() && queryName.isEmpty()) return false
+        val canonicalQuery = getCanonicalPeerKey(queryId)
+        val canonicalPeerId = getCanonicalPeerKey(p.id)
+        val canonicalHandle = getCanonicalPeerKey(p.handle)
+
+        if (p.id == queryId || p.handle == queryId) return true
+        if (canonicalPeerId.isNotEmpty() && (canonicalPeerId == canonicalQuery || canonicalHandle == canonicalQuery)) return true
+        if (queryName.isNotEmpty() && p.displayName.isNotEmpty()) {
+            if (p.displayName.equals(queryName, ignoreCase = true)) return true
+            val pPrefix = p.displayName.take(4)
+            val qPrefix = queryName.take(4)
+            if (pPrefix.length >= 3 && qPrefix.length >= 3 &&
+                (p.displayName.startsWith(qPrefix, ignoreCase = true) || queryName.startsWith(pPrefix, ignoreCase = true))
+            ) return true
+        }
         return false
+    }
+
+    private fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
+        val canonicalList = mutableListOf<NearbyPeer>()
+
+        for (p in peers) {
+            val existingIndex = canonicalList.indexOfFirst { existing ->
+                isMatchingPeer(existing, p.id, p.displayName) ||
+                        isMatchingPeer(existing, p.handle, p.displayName) ||
+                        (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() &&
+                                existing.displayName.take(4).equals(p.displayName.take(4), ignoreCase = true))
+            }
+
+            if (existingIndex == -1) {
+                canonicalList.add(p)
+            } else {
+                val existing = canonicalList[existingIndex]
+                val statusPriority = mapOf(
+                    ConnectionStatus.ACCEPTED to 4,
+                    ConnectionStatus.REQUESTED to 3,
+                    ConnectionStatus.DECLINED to 2,
+                    ConnectionStatus.NONE to 1
+                )
+                val bestStatus = if ((statusPriority[p.status] ?: 0) > (statusPriority[existing.status] ?: 0)) {
+                    p.status
+                } else {
+                    existing.status
+                }
+
+                val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
+                val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
+                val bestName = if (p.displayName.length > existing.displayName.length) p.displayName else existing.displayName
+
+                canonicalList[existingIndex] = existing.copy(
+                    id = bestId,
+                    handle = bestHandle,
+                    displayName = bestName,
+                    status = bestStatus
+                )
+            }
+        }
+
+        return canonicalList
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -114,29 +181,10 @@ class MainActivity : ComponentActivity() {
                 uiState = uiState.copy(diagnostics = diagnostics)
             }
 
-            // Sync live discovered BLE peers into uiState, preserving status and deduplicating by name/handle/id
+            // Sync live discovered BLE peers into uiState, preserving status and deduplicating into canonical list
             LaunchedEffect(liveDiscoveredPeers) {
-                val existingList = uiState.nearbyPeers
-                val merged = liveDiscoveredPeers
-                    .groupBy { it.displayName.ifBlank { it.id } }
-                    .map { (_, group) ->
-                        val discovered = group.first()
-                        val existing = existingList.find { p ->
-                            p.id == discovered.id ||
-                                    (p.handle.isNotEmpty() && p.handle == discovered.handle) ||
-                                    (p.displayName.isNotEmpty() && p.displayName.equals(discovered.displayName, ignoreCase = true))
-                        }
-                        if (existing != null && existing.status != ConnectionStatus.NONE) {
-                            discovered.copy(
-                                id = existing.id,
-                                handle = existing.handle.ifEmpty { discovered.handle },
-                                displayName = existing.displayName.ifEmpty { discovered.displayName },
-                                status = existing.status
-                            )
-                        } else {
-                            discovered
-                        }
-                    }
+                val combined = uiState.nearbyPeers + liveDiscoveredPeers
+                val merged = canonicalDeduplicatePeers(combined)
                 uiState = uiState.copy(nearbyPeers = merged)
                 bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(merged.size)
                 Log.d(TAG, "UI State updated with ${merged.size} deduplicated BLE discovered peers.")
@@ -167,13 +215,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Collect incoming connection requests
+            // Collect incoming connection requests and update matching peer in place
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
                     val isBlocked = uiState.blockedPeerIds.contains(peerId) ||
                             uiState.blockedPeerIds.contains(displayName) ||
                             uiState.blockedPeerIds.any { blocked ->
-                                peerId.equals(blocked, ignoreCase = true) || displayName.equals(blocked, ignoreCase = true)
+                                isMatchingPeer(NearbyPeer(id = peerId, displayName = displayName), blocked)
                             }
 
                     if (isBlocked) {
@@ -183,56 +231,41 @@ class MainActivity : ComponentActivity() {
 
                     incomingRequestPeer = Pair(peerId, displayName)
 
-                    val existingPeer = uiState.nearbyPeers.find { isMatchingPeer(it, peerId) || isMatchingPeer(it, displayName) }
-
-                    val updatedPeers = if (existingPeer == null) {
-                        uiState.nearbyPeers + NearbyPeer(
-                            id = peerId,
-                            displayName = displayName.ifEmpty { "Layover Peer" },
-                            handle = peerId,
-                            status = ConnectionStatus.REQUESTED
-                        )
-                    } else {
-                        uiState.nearbyPeers.map { p ->
-                            if (p.id == existingPeer.id || isMatchingPeer(p, peerId) || isMatchingPeer(p, displayName)) {
-                                p.copy(
-                                    handle = peerId.ifEmpty { p.handle },
-                                    displayName = displayName.ifEmpty { p.displayName },
-                                    status = ConnectionStatus.REQUESTED
-                                )
-                            } else {
-                                p
-                            }
-                        }
-                    }
-                    uiState = uiState.copy(nearbyPeers = updatedPeers)
+                    val newRequestedPeer = NearbyPeer(
+                        id = peerId,
+                        displayName = displayName.ifEmpty { "Layover Peer" },
+                        handle = peerId,
+                        status = ConnectionStatus.REQUESTED
+                    )
+                    val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + newRequestedPeer)
+                    uiState = uiState.copy(nearbyPeers = merged)
                 }
             }
 
-            // Collect incoming connection accepts
+            // Collect incoming connection accepts and update matching peer in place
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionAcceptFlow.collectLatest { peerId ->
                     acceptedRequestPeer = peerId
-                    val existingPeer = uiState.nearbyPeers.find { isMatchingPeer(it, peerId) }
-
-                    val updatedPeers = uiState.nearbyPeers.map { p ->
-                        if (isMatchingPeer(p, peerId) || (existingPeer != null && p.id == existingPeer.id)) {
-                            p.copy(status = ConnectionStatus.ACCEPTED)
-                        } else {
-                            p
-                        }
-                    }
-                    uiState = uiState.copy(nearbyPeers = updatedPeers)
+                    val newAcceptedPeer = NearbyPeer(
+                        id = peerId,
+                        handle = peerId,
+                        status = ConnectionStatus.ACCEPTED
+                    )
+                    val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + newAcceptedPeer)
+                    uiState = uiState.copy(nearbyPeers = merged)
                 }
             }
 
             // Collect incoming connection declines
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionDeclineFlow.collectLatest { peerId ->
-                    val updatedPeers = uiState.nearbyPeers.map { p ->
-                        if (isMatchingPeer(p, peerId)) p.copy(status = ConnectionStatus.DECLINED) else p
-                    }
-                    uiState = uiState.copy(nearbyPeers = updatedPeers)
+                    val newDeclinedPeer = NearbyPeer(
+                        id = peerId,
+                        handle = peerId,
+                        status = ConnectionStatus.DECLINED
+                    )
+                    val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + newDeclinedPeer)
+                    uiState = uiState.copy(nearbyPeers = merged)
                 }
             }
 
@@ -325,14 +358,14 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = {
                                 incomingRequestPeer = null
                                 bleTransport.acceptConnectionRequest(peerId)
-                                val updatedPeers = uiState.nearbyPeers.map { p ->
-                                    if (isMatchingPeer(p, peerId) || p.displayName.equals(displayName, ignoreCase = true)) {
-                                        p.copy(status = ConnectionStatus.ACCEPTED)
-                                    } else {
-                                        p
-                                    }
-                                }
-                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                                val acceptedPeer = NearbyPeer(
+                                    id = peerId,
+                                    displayName = displayName,
+                                    handle = peerId,
+                                    status = ConnectionStatus.ACCEPTED
+                                )
+                                val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + acceptedPeer)
+                                uiState = uiState.copy(nearbyPeers = merged)
                                 navController.navigate(LayoverRoute.Chat.createRoute(peerId))
                             }) {
                                 Text("Accept")
@@ -342,10 +375,14 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = {
                                 incomingRequestPeer = null
                                 bleTransport.declineConnectionRequest(peerId)
-                                val updatedPeers = uiState.nearbyPeers.map { p ->
-                                    if (isMatchingPeer(p, peerId)) p.copy(status = ConnectionStatus.DECLINED) else p
-                                }
-                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                                val declinedPeer = NearbyPeer(
+                                    id = peerId,
+                                    displayName = displayName,
+                                    handle = peerId,
+                                    status = ConnectionStatus.DECLINED
+                                )
+                                val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + declinedPeer)
+                                uiState = uiState.copy(nearbyPeers = merged)
                             }) {
                                 Text("Decline")
                             }
@@ -373,10 +410,13 @@ class MainActivity : ComponentActivity() {
                         dismissButton = {
                             Button(onClick = {
                                 acceptedRequestPeer = null
-                                val updatedPeers = uiState.nearbyPeers.map { p ->
-                                    if (isMatchingPeer(p, peerId) || (peer != null && p.id == peer.id)) p.copy(status = ConnectionStatus.ACCEPTED) else p
-                                }
-                                uiState = uiState.copy(nearbyPeers = updatedPeers)
+                                val acceptedPeer = NearbyPeer(
+                                    id = peerId,
+                                    handle = peerId,
+                                    status = ConnectionStatus.ACCEPTED
+                                )
+                                val merged = canonicalDeduplicatePeers(uiState.nearbyPeers + acceptedPeer)
+                                uiState = uiState.copy(nearbyPeers = merged)
                             }) {
                                 Text("Close")
                             }

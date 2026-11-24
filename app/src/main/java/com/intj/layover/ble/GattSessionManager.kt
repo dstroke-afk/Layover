@@ -432,8 +432,9 @@ class GattSessionManager(
                         pendingOutboundFrames.poll()
                         delay(60) // Fast serialization write pacing between frames
                     } else {
-                        LayoverFileLogger.logError("GATT write failed for frame: ${frame.take(30)}. Re-queuing for retry...")
-                        delay(250) // Brief backoff on write failure before retrying
+                        LayoverFileLogger.logError("GATT write failed for frame: ${frame.take(30)}. Discarding failed frame to prevent infinite retry loops.")
+                        pendingOutboundFrames.poll() // Discard failed frame to avoid infinite retry loops
+                        delay(150)
                         break
                     }
                 }

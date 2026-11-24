@@ -24,6 +24,53 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArraySet
+
+object PeerAliasRegistry {
+    private val aliasGroups = CopyOnWriteArraySet<MutableSet<String>>()
+
+    private fun isValidAlias(value: String?): Boolean {
+        if (value == null) return false
+        val trimmed = value.trim()
+        return trimmed.isNotEmpty() &&
+                !trimmed.equals("00000000", ignoreCase = true) &&
+                !trimmed.equals("user", ignoreCase = true) &&
+                !trimmed.equals("local", ignoreCase = true) &&
+                !trimmed.equals("remote_peer", ignoreCase = true) &&
+                !trimmed.equals("unknown_mac", ignoreCase = true)
+    }
+
+    fun linkAliases(rawAliases: Collection<String?>) {
+        val clean = rawAliases.filter(::isValidAlias).map { it!!.trim() }.toSet()
+        if (clean.isEmpty()) return
+
+        val overlapping = aliasGroups.filter { group ->
+            group.any { existing -> clean.any { candidate -> existing.equals(candidate, ignoreCase = true) } }
+        }
+
+        val merged = linkedSetOf<String>().apply {
+            addAll(clean)
+            overlapping.forEach { addAll(it) }
+        }
+
+        aliasGroups.removeAll(overlapping.toSet())
+        aliasGroups.add(merged)
+    }
+
+    fun resolveAliases(identifier: String?): Set<String> {
+        if (!isValidAlias(identifier)) return emptySet()
+        val target = identifier!!.trim()
+        val result = linkedSetOf<String>(target)
+
+        aliasGroups.filter { group ->
+            group.any { it.equals(target, ignoreCase = true) }
+        }.forEach { group ->
+            result.addAll(group)
+        }
+
+        return result
+    }
+}
 
 class BleProximityTransport(
     private val context: Context,
@@ -62,13 +109,12 @@ class BleProximityTransport(
     val incomingConnectionDeclineFlow: SharedFlow<String> = _incomingConnectionDeclineFlow.asSharedFlow()
 
     private var activePeerId: String? = null
+    private var lastGattMac: String? = null
 
-    // Debounce tracking for startDiscovery & connection requests
     private var lastDiscoveryStartMs = 0L
     private var lastDiscoveryVisible = !currentUserProfile.isVisibleToNearby
     private val lastRequestTimeMap = ConcurrentHashMap<String, Long>()
 
-    // Handshake state guards to prevent infinite ping-pong loops
     private var hasSentKeyExchange = false
     private var hasReceivedKeyExchange = false
 
@@ -78,16 +124,40 @@ class BleProximityTransport(
     val sessionFingerprint: String?
         get() = sessionCryptoManager.sessionFingerprint
 
+    fun isPeerIdentifierBlocked(vararg candidates: String?): Boolean {
+        val expandedCandidates = linkedSetOf<String>()
+        for (raw in candidates) {
+            if (raw.isNullOrBlank() || raw == "00000000" || raw == "user") continue
+            expandedCandidates.add(raw.trim())
+            expandedCandidates.addAll(PeerAliasRegistry.resolveAliases(raw))
+        }
+        if (expandedCandidates.isEmpty()) return false
+
+        val expandedBlocked = linkedSetOf<String>()
+        for (b in blockedPeerIds) {
+            if (b.isBlank() || b == "00000000" || b == "user") continue
+            expandedBlocked.add(b.trim())
+            expandedBlocked.addAll(PeerAliasRegistry.resolveAliases(b))
+        }
+
+        val matched = expandedCandidates.firstOrNull { cand ->
+            expandedBlocked.any { blocked -> cand.equals(blocked, ignoreCase = true) }
+        }
+
+        if (matched != null) {
+            LayoverFileLogger.log("BLOCK EVALUATION: Matched blocked alias '$matched' across candidates=$expandedCandidates")
+            return true
+        }
+        return false
+    }
+
     init {
-        // Start GATT Server listener
         gattSessionManager.startServer()
 
-        // Bind GATT ready callback so handshake occurs after services, MTU, and notification descriptors are fully negotiated
         gattSessionManager.onGattReady = {
             initiateE2eeHandshake()
         }
 
-        // Handle GATT connection lifecycle and E2EE key exchange
         scope.launch {
             gattSessionManager.connectionState.collect { state ->
                 LayoverFileLogger.log("GATT connection state changed: ${state.name}")
@@ -105,34 +175,25 @@ class BleProximityTransport(
             }
         }
 
-        // Handle incoming wire frames with safety, block, and rate-limiting enforcement independent of rotating MACs
         scope.launch {
             gattSessionManager.incomingMessages.collect { rawFrame ->
-                val currentPeer = activePeerId ?: rawFrame.senderId
-
-                // Unified block enforcement across MAC, active peer ID, and alias strings
-                val isBlocked = blockedPeerIds.contains(currentPeer) ||
-                        blockedPeerIds.contains(rawFrame.senderId) ||
-                        blockedPeerIds.any { blockedId ->
-                            currentPeer.equals(blockedId, ignoreCase = true) ||
-                                    rawFrame.senderId.equals(blockedId, ignoreCase = true)
-                        }
-
-                if (isBlocked) {
-                    LayoverFileLogger.log("Dropping frame from blocked peer: currentPeer=$currentPeer, rawSender=${rawFrame.senderId}")
-                    diagnosticsTracker.incrementBlockedDrops()
-                    return@collect
+                val rawSenderMac = rawFrame.senderId
+                if (BluetoothAdapter.checkBluetoothAddress(rawSenderMac)) {
+                    lastGattMac = rawSenderMac
+                    PeerAliasRegistry.linkAliases(listOfNotNull(activePeerId, rawSenderMac))
                 }
 
-                // Rate limiting enforcement (exempt handshake and control frames)
-                val isControlFrame = rawFrame.text.startsWith("KEY_EXCHANGE") ||
-                        rawFrame.text.startsWith("CONNECTION_REQUEST") ||
-                        rawFrame.text.startsWith("CONNECTION_ACCEPT") ||
-                        rawFrame.text.startsWith("CONNECTION_DECLINE")
+                val currentPeer = activePeerId ?: rawSenderMac
+                val rawType = rawFrame.text.substringBefore("|")
 
-                if (!isControlFrame && !rateLimiter.allowMessage(currentPeer)) {
-                    LayoverFileLogger.log("Dropping rate-limited frame from peer: $currentPeer")
-                    diagnosticsTracker.incrementRateLimitedDrops()
+                LayoverFileLogger.log("FRAME INGESTION [1/3]: rawType=$rawType, rawSender=$rawSenderMac, activePeer=$activePeerId, len=${rawFrame.text.length}")
+
+                val isRawBlocked = isPeerIdentifierBlocked(currentPeer, activePeerId, rawSenderMac, lastGattMac)
+                LayoverFileLogger.log("FRAME INGESTION [2/3]: Pre-decode block evaluation for currentPeer=$currentPeer, rawSender=$rawSenderMac -> isBlocked=$isRawBlocked")
+
+                if (isRawBlocked) {
+                    diagnosticsTracker.incrementBlockedDrops()
+                    LayoverFileLogger.log("FRAME INGESTION [3/3]: DROPPED raw frame from blocked peer. Blocked Drops=${diagnosticsTracker.diagnosticsState.value.blockedDrops}")
                     return@collect
                 }
 
@@ -143,9 +204,55 @@ class BleProximityTransport(
                     return@collect
                 }
 
-                diagnosticsTracker.incrementMessagesReceived()
+                val frameSenderId = when (frame) {
+                    is WireFrame.KeyExchange -> frame.senderId
+                    is WireFrame.ConnectionRequest -> frame.senderId
+                    is WireFrame.ConnectionAccept -> frame.senderId
+                    is WireFrame.ConnectionDecline -> frame.senderId
+                    is WireFrame.ChatEncrypted -> frame.senderId
+                }
 
-                // Associate activePeerId from frame senderId for RPA MAC rotation independence
+                val frameDisplayName = if (frame is WireFrame.ConnectionRequest) frame.displayName else ""
+
+                PeerAliasRegistry.linkAliases(
+                    listOfNotNull(
+                        activePeerId,
+                        rawSenderMac,
+                        lastGattMac,
+                        frameSenderId,
+                        frameDisplayName.ifEmpty { null }
+                    )
+                )
+
+                val isDecodedBlocked = isPeerIdentifierBlocked(
+                    frameSenderId,
+                    frameDisplayName,
+                    activePeerId,
+                    rawSenderMac,
+                    lastGattMac
+                )
+                LayoverFileLogger.log("FRAME INGESTION [2b/3]: Post-decode block evaluation for frameSenderId=$frameSenderId, frameDisplayName=$frameDisplayName -> isBlocked=$isDecodedBlocked")
+
+                if (isDecodedBlocked) {
+                    diagnosticsTracker.incrementBlockedDrops()
+                    LayoverFileLogger.log("FRAME INGESTION [3/3]: DROPPED decoded frame from blocked peer. Blocked Drops=${diagnosticsTracker.diagnosticsState.value.blockedDrops}")
+                    return@collect
+                }
+
+                val isControlFrame = frame is WireFrame.KeyExchange ||
+                        frame is WireFrame.ConnectionRequest ||
+                        frame is WireFrame.ConnectionAccept ||
+                        frame is WireFrame.ConnectionDecline
+
+                if (!isControlFrame && !rateLimiter.allowMessage(currentPeer)) {
+                    LayoverFileLogger.log("Dropping rate-limited frame from peer: $currentPeer")
+                    diagnosticsTracker.incrementRateLimitedDrops()
+                    return@collect
+                }
+
+                diagnosticsTracker.incrementMessagesReceived()
+                LayoverFileLogger.log("FRAME INGESTION [3/3]: PASSED frame from sender=$frameSenderId. Messages Received=${diagnosticsTracker.diagnosticsState.value.messagesReceived}")
+
                 when (frame) {
                     is WireFrame.KeyExchange -> {
                         if (frame.senderId.isNotEmpty() && frame.senderId != "local" && frame.senderId != "user") {
@@ -162,7 +269,6 @@ class BleProximityTransport(
                         )
                         LayoverFileLogger.log("KeyExchange establishRemoteKey success=$success for peer=${frame.senderId}")
 
-                        // Always send local KeyExchange response if session is not yet fully established
                         if (!sessionCryptoManager.isSessionKeyEstablished && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
                             hasSentKeyExchange = true
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
@@ -259,17 +365,11 @@ class BleProximityTransport(
     }
 
     fun updateSafetySettings(blocked: Set<String>, muted: Set<String>) {
-        val wasBlocked = activePeerId != null && blockedPeerIds.contains(activePeerId)
         blockedPeerIds = blocked
         mutedPeerIds = muted
-        val isNowBlocked = activePeerId != null && blockedPeerIds.contains(activePeerId)
-
-        if (!wasBlocked && isNowBlocked) {
-            gattSessionManager.disconnect()
-            sessionCryptoManager.clearSession()
-            hasSentKeyExchange = false
-            hasReceivedKeyExchange = false
-        }
+        val activeSessionIds = setOfNotNull(activePeerId, lastGattMac)
+        discoveryManager.updateProtectedIdentifiers(blocked, muted, activeSessionIds)
+        LayoverFileLogger.log("SAFETY SETTINGS UPDATE: blockedPeerIds=$blockedPeerIds, activePeerId=$activePeerId")
     }
 
     private fun initiateE2eeHandshake() {
@@ -356,7 +456,7 @@ class BleProximityTransport(
         lastRequestTimeMap[peerId] = now
 
         LayoverFileLogger.log("sendConnectionRequest to peerId=$peerId")
-        if (blockedPeerIds.contains(peerId)) {
+        if (isPeerIdentifierBlocked(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
@@ -373,7 +473,7 @@ class BleProximityTransport(
 
     override fun acceptConnectionRequest(peerId: String) {
         LayoverFileLogger.log("acceptConnectionRequest for peerId=$peerId")
-        if (blockedPeerIds.contains(peerId)) {
+        if (isPeerIdentifierBlocked(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
@@ -404,6 +504,8 @@ class BleProximityTransport(
 
         val targetDevice = discoveryManager.getDiscoveredDevice(peerId)
         if (targetDevice != null) {
+            lastGattMac = targetDevice.address
+            PeerAliasRegistry.linkAliases(listOf(peerId, targetDevice.address))
             LayoverFileLogger.log("Connecting GATT client to discovered BluetoothDevice: address=${targetDevice.address}")
             discoveryManager.stopScanning()
             gattSessionManager.connectToDevice(targetDevice)
@@ -412,6 +514,8 @@ class BleProximityTransport(
 
         val isMacAddress = BluetoothAdapter.checkBluetoothAddress(peerId)
         if (isMacAddress) {
+            lastGattMac = peerId
+            PeerAliasRegistry.linkAliases(listOf(peerId))
             val device = try {
                 adapter.getRemoteDevice(peerId)
             } catch (e: Exception) {
@@ -433,7 +537,7 @@ class BleProximityTransport(
 
     override fun sendMessage(peerId: String, text: String) {
         LayoverFileLogger.log("sendMessage to peerId=$peerId")
-        if (blockedPeerIds.contains(peerId)) {
+        if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
