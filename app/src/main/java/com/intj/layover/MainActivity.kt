@@ -66,11 +66,13 @@ class MainActivity : ComponentActivity() {
         val savedName = prefs.getString("display_name", "Balaji Eswar") ?: "Balaji Eswar"
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
+        val savedAge = if (prefs.contains("age")) prefs.getInt("age", -1).takeIf { it > 0 } else null
         val savedVisible = prefs.getBoolean("is_visible", true)
         val initialProfile = UserProfile(
             displayName = savedName,
             handle = savedHandle,
             gender = savedGender,
+            age = savedAge,
             isVisibleToNearby = savedVisible
         )
 
@@ -465,12 +467,18 @@ class MainActivity : ComponentActivity() {
                             muted = newState.mutedPeerIds
                         )
                         if (newState.userProfile != oldProfile) {
-                            prefs.edit()
+                            val editor = prefs.edit()
                                 .putString("display_name", newState.userProfile.displayName)
                                 .putString("handle", newState.userProfile.handle)
                                 .putString("gender", newState.userProfile.gender.name)
                                 .putBoolean("is_visible", newState.userProfile.isVisibleToNearby)
-                                .apply()
+                            val ageValue = newState.userProfile.age
+                            if (ageValue != null) {
+                                editor.putInt("age", ageValue)
+                            } else {
+                                editor.remove("age")
+                            }
+                            editor.apply()
 
                             if (newState.userProfile.isVisibleToNearby) {
                                 bleDiscoveryManager.startAdvertising(newState.userProfile)

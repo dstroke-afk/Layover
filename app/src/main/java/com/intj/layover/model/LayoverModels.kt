@@ -103,6 +103,7 @@ data class UserProfile(
     val displayName: String = "Balaji Eswar",
     val handle: String = "balajieswar",
     val gender: GenderOption = GenderOption.MALE,
+    val age: Int? = null,
     val isVisibleToNearby: Boolean = true
 )
 

@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -209,6 +210,20 @@ fun PeopleAroundScreen(
                             onDismissRequest = { showMenu = false },
                             modifier = Modifier.background(ElevatedCardSurface)
                         ) {
+                            DropdownMenuItem(
+                                text = { Text("My Profile", color = LightText) },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = null,
+                                        tint = CyanPrimary
+                                    )
+                                },
+                                onClick = {
+                                    showMenu = false
+                                    onNavigateToProfile()
+                                }
+                            )
                             DropdownMenuItem(
                                 text = { Text("Diagnostics", color = LightText) },
                                 leadingIcon = {
