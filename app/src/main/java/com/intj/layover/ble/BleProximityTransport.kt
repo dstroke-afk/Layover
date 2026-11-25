@@ -283,6 +283,7 @@ class BleProximityTransport(
                             hasSentKeyExchange = true
                             LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId} (algo=${sessionCryptoManager.getAlgorithmName()})...")
                             gattSessionManager.sendFrame(responsePayload)
+                            gattSessionManager.flushQueue()
                         }
 
                         val isEstablished = sessionCryptoManager.isSessionKeyEstablished
@@ -410,7 +411,7 @@ class BleProximityTransport(
         }
         hasSentKeyExchange = true
         LayoverFileLogger.log("Initiating E2EE key exchange handshake over GATT...")
-        val pubKeyB64 = sessionCryptoManager.generateKeyPair()
+        val pubKeyB64 = sessionCryptoManager.getLocalPublicKeyBase64() ?: sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
         val localId = currentUserProfile.handle.ifEmpty { "local" }
 
@@ -424,6 +425,7 @@ class BleProximityTransport(
             diagnosticsTracker.incrementMessagesSent()
             diagnosticsTracker.updateLastErrorMessage(null)
         } else {
+            hasSentKeyExchange = false
             diagnosticsTracker.updateLastErrorMessage("Failed to send key exchange frame")
         }
     }
@@ -604,6 +606,11 @@ class BleProximityTransport(
         } else {
             LayoverFileLogger.logError("Failed to encrypt text for peerId=$peerId. Queueing message & initiating E2EE key exchange...")
             pendingEncryptedRetries.add(peerId to text)
+            if (gattSessionManager.connectionState.value == RfcommConnectionState.DISCONNECTED ||
+                gattSessionManager.connectionState.value == RfcommConnectionState.FAILED
+            ) {
+                connectGattDevice(peerId)
+            }
             hasSentKeyExchange = false
             initiateE2eeHandshake()
             diagnosticsTracker.updateLastErrorMessage("E2EE key session missing - re-initiating handshake")
