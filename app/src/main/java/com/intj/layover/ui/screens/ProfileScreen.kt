@@ -70,6 +70,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -166,6 +167,7 @@ private fun cropCircularAndDownscale(
     source: Bitmap,
     panOffsetPx: Offset,
     zoom: Float,
+    rotationDegrees: Float,
     viewportSizePx: Float,
     transferSizePx: Int = 112
 ): ProcessedAvatarBundle {
@@ -175,38 +177,23 @@ private fun cropCircularAndDownscale(
     val (scaledW, scaledH) = computeScaledBitmapSizePx(srcW, srcH, viewportSizePx, zoom)
     val clampedPan = clampPanOffset(panOffsetPx, srcW, srcH, viewportSizePx, zoom)
 
-    val center = viewportSizePx / 2f
-    val drawLeft = center - scaledW / 2f + clampedPan.x
-    val drawTop = center - scaledH / 2f + clampedPan.y
+    val outDim = max(128, viewportSizePx.roundToInt().coerceAtLeast(1))
+    val renderedViewport = Bitmap.createBitmap(outDim, outDim, Bitmap.Config.ARGB_8888)
+    val vpCanvas = Canvas(renderedViewport)
 
-    val pxPerSrcX = scaledW / srcW
-    val pxPerSrcY = scaledH / srcH
+    val scaleRatio = outDim.toFloat() / viewportSizePx.coerceAtLeast(1f)
+    val centerPx = outDim / 2f
+    val drawScaledW = scaledW * scaleRatio
+    val drawScaledH = scaledH * scaleRatio
+    val drawLeft = centerPx - drawScaledW / 2f + clampedPan.x * scaleRatio
+    val drawTop = centerPx - drawScaledH / 2f + clampedPan.y * scaleRatio
 
-    val srcLeft = ((0f - drawLeft) / pxPerSrcX).coerceIn(0f, srcW - 1f)
-    val srcTop = ((0f - drawTop) / pxPerSrcY).coerceIn(0f, srcH - 1f)
-    val srcRight = ((viewportSizePx - drawLeft) / pxPerSrcX).coerceIn(srcLeft + 1f, srcW)
-    val srcBottom = ((viewportSizePx - drawTop) / pxPerSrcY).coerceIn(srcTop + 1f, srcH)
-
-    val cropW = max(1, (srcRight - srcLeft).roundToInt())
-    val cropH = max(1, (srcBottom - srcTop).roundToInt())
-    val squareSide = max(1, min(cropW, cropH))
-
-    val cx = (srcLeft + srcRight) / 2f
-    val cy = (srcTop + srcBottom) / 2f
-    val sqLeft = (cx - squareSide / 2f).roundToInt().coerceIn(0, max(0, source.width - squareSide))
-    val sqTop = (cy - squareSide / 2f).roundToInt().coerceIn(0, max(0, source.height - squareSide))
-    val actualW = min(squareSide, source.width - sqLeft).coerceAtLeast(1)
-    val actualH = min(squareSide, source.height - sqTop).coerceAtLeast(1)
-
-    val croppedSquare = Bitmap.createBitmap(source, sqLeft, sqTop, actualW, actualH)
-    val outDim = max(1, min(croppedSquare.width, croppedSquare.height))
-    val normalizedSquare = if (croppedSquare.width == outDim && croppedSquare.height == outDim) {
-        croppedSquare
-    } else {
-        Bitmap.createScaledBitmap(croppedSquare, outDim, outDim, true).also {
-            croppedSquare.recycle()
-        }
-    }
+    vpCanvas.save()
+    vpCanvas.rotate(rotationDegrees, centerPx, centerPx)
+    val dstRect = android.graphics.RectF(drawLeft, drawTop, drawLeft + drawScaledW, drawTop + drawScaledH)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    vpCanvas.drawBitmap(source, null, dstRect, paint)
+    vpCanvas.restore()
 
     val maskedCropped = Bitmap.createBitmap(outDim, outDim, Bitmap.Config.ARGB_8888)
     val maskCanvas = Canvas(maskedCropped)
@@ -214,8 +201,8 @@ private fun cropCircularAndDownscale(
     val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     maskCanvas.drawCircle(radius, radius, radius, maskPaint)
     maskPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
-    maskCanvas.drawBitmap(normalizedSquare, 0f, 0f, maskPaint)
-    normalizedSquare.recycle()
+    maskCanvas.drawBitmap(renderedViewport, 0f, 0f, maskPaint)
+    renderedViewport.recycle()
 
     val clampedTransferDim = transferSizePx.coerceIn(96, 128)
     val compactBitmap = Bitmap.createScaledBitmap(
@@ -303,7 +290,7 @@ fun ProfileScreen(
                 sourceBmp.recycle()
                 pendingSourceBitmap = null
             },
-            onConfirmCrop = { panOffsetPx, zoom, viewportSizePx ->
+            onConfirmCrop = { panOffsetPx, zoom, rotationDegrees, viewportSizePx ->
                 scope.launch {
                     isProcessingImage = true
                     val processed = withContext(Dispatchers.Default) {
@@ -311,6 +298,7 @@ fun ProfileScreen(
                             source = sourceBmp,
                             panOffsetPx = panOffsetPx,
                             zoom = zoom,
+                            rotationDegrees = rotationDegrees,
                             viewportSizePx = viewportSizePx,
                             transferSizePx = 112
                         )
@@ -740,7 +728,7 @@ fun ProfileScreen(
 private fun CircularCropperDialog(
     sourceBitmap: Bitmap,
     onDismiss: () -> Unit,
-    onConfirmCrop: (panOffsetPx: Offset, zoom: Float, viewportSizePx: Float) -> Unit
+    onConfirmCrop: (panOffsetPx: Offset, zoom: Float, rotationDegrees: Float, viewportSizePx: Float) -> Unit
 ) {
     val colors = LayoverTheme.colors
     val density = LocalDensity.current
@@ -752,6 +740,7 @@ private fun CircularCropperDialog(
 
     var panOffset by remember { mutableStateOf(Offset.Zero) }
     var zoom by remember { mutableFloatStateOf(1f) }
+    var rotationDegrees by remember { mutableFloatStateOf(0f) }
     val imageBitmap = remember(sourceBitmap) { sourceBitmap.asImageBitmap() }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -774,7 +763,7 @@ private fun CircularCropperDialog(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Drag to pan • Pinch to zoom (${sourceBitmap.width} x ${sourceBitmap.height} px)",
+                    text = "Drag to pan • Pinch to zoom • Twist to rotate",
                     fontSize = 12.sp,
                     color = colors.mutedText,
                     textAlign = TextAlign.Center
@@ -788,9 +777,10 @@ private fun CircularCropperDialog(
                         .clip(RoundedCornerShape(16.dp))
                         .background(Color(0xFF08101A))
                         .pointerInput(srcW, srcH, viewportPx) {
-                            detectTransformGestures { _, pan, gestureZoom, _ ->
+                            detectTransformGestures(panZoomLock = false) { _, pan, gestureZoom, gestureRotation ->
                                 val nextZoom = (zoom * gestureZoom).coerceIn(1f, 5f)
                                 zoom = nextZoom
+                                rotationDegrees = (rotationDegrees + gestureRotation) % 360f
                                 panOffset = clampPanOffset(
                                     rawOffset = panOffset + pan,
                                     srcW = srcW,
@@ -801,7 +791,13 @@ private fun CircularCropperDialog(
                             }
                         }
                 ) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                rotationZ = rotationDegrees
+                            }
+                    ) {
                         val (scaledW, scaledH) = computeScaledBitmapSizePx(
                             srcW = srcW,
                             srcH = srcH,
@@ -825,7 +821,9 @@ private fun CircularCropperDialog(
                             dstOffset = IntOffset(dstLeft.roundToInt(), dstTop.roundToInt()),
                             dstSize = IntSize(scaledW.roundToInt(), scaledH.roundToInt())
                         )
+                    }
 
+                    Canvas(modifier = Modifier.fillMaxSize()) {
                         val radius = size.minDimension / 2f
                         val overlayPath = Path().apply {
                             fillType = PathFillType.EvenOdd
@@ -863,7 +861,7 @@ private fun CircularCropperDialog(
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
-                        onClick = { onConfirmCrop(panOffset, zoom, viewportPx) },
+                        onClick = { onConfirmCrop(panOffset, zoom, rotationDegrees, viewportPx) },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = colors.cyanPrimary,
                             contentColor = if (colors.isDark) colors.darkBackground else Color.White
