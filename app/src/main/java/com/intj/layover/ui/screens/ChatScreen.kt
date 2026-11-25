@@ -90,8 +90,10 @@ fun ChatScreen(
     isBlockedByPeer: Boolean = false,
     isMuted: Boolean = false,
     onSendMessage: (text: String, replyToText: String?) -> Unit,
+    fallbackAvatarBytes: ByteArray? = null,
     onToggleBlockPeer: (String) -> Unit,
     onToggleMutePeer: (String) -> Unit,
+    onOpenPeerProfile: (String) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     chatTrace("ChatScreen:ENTRY", "peerId=${peer?.id ?: "null"}, messagesCount=${messages.size}, isBlocked=$isBlocked, isBlockedByPeer=$isBlockedByPeer, isMuted=$isMuted")
@@ -123,9 +125,10 @@ fun ChatScreen(
     }
     chatTrace("ChatScreen:PEER_RESOLVED", "peerId=$peerId, resolvedName=$resolvedName, initials=$resolvedInitials")
 
-    val peerAvatarBytes = peer?.avatar?.avatarBase64OrBytes
+    val peerAvatarBytes = peer?.avatar?.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
+        ?: fallbackAvatarBytes?.takeIf { it.isNotEmpty() }
     val peerAvatarBitmap = remember(peerAvatarBytes) {
-        peerAvatarBytes?.takeIf { it.isNotEmpty() }?.let { bytes ->
+        peerAvatarBytes?.let { bytes ->
             runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
         }
     }
@@ -186,15 +189,19 @@ fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
-                .navigationBarsPadding()
-                .imePadding()
+                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                 .padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
-            // Header Card with display picture and display name
+            // Header Card with display picture and display name (clickable to view read-only peer profile)
             val headerCardShape = RoundedCornerShape(16.dp)
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .clip(headerCardShape)
+                    .clickable {
+                        chatTrace("TopBar:PEER_PROFILE_CLICK", "peerId=$peerId")
+                        onOpenPeerProfile(peerId)
+                    }
                     .border(1.dp, colors.cyanPrimary, headerCardShape),
                 color = colors.cardSurface,
                 shape = headerCardShape
@@ -416,8 +423,8 @@ fun ChatScreen(
             // Input Bar
             val canSend = !isChatLocked && inputText.isNotBlank()
             chatTrace("ChatScreen:INPUT_BAR_EVAL", "canSend=$canSend, isChatLocked=$isChatLocked, inputLen=${inputText.length}")
-            val idleInputSurface = Color(0xFF1D242E)
-            val idleInputBorder = Color(0xFF333D4B)
+            val idleInputSurface = Color(0xFF4A5260)
+            val idleInputBorder = Color(0xFF6B768A)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -433,7 +440,7 @@ fun ChatScreen(
                     placeholder = {
                         Text(
                             text = inputPlaceholderText,
-                            color = if (isChatLocked) greyDisabledText else colors.mutedText,
+                            color = if (isChatLocked) greyDisabledText else Color.White.copy(alpha = 0.72f),
                             fontSize = 15.sp
                         )
                     },
@@ -448,8 +455,9 @@ fun ChatScreen(
                         focusedBorderColor = colors.cyanPrimary,
                         unfocusedBorderColor = idleInputBorder,
                         disabledBorderColor = greyDisabledBorder,
-                        focusedTextColor = colors.lightText,
-                        unfocusedTextColor = colors.lightText,
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        cursorColor = Color.White,
                         disabledTextColor = greyDisabledText,
                         disabledPlaceholderColor = greyDisabledText
                     ),

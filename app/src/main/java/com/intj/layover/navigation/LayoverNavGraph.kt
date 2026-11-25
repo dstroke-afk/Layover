@@ -44,6 +44,12 @@ sealed class LayoverRoute(val route: String) {
     data object Scan : LayoverRoute("scan")
     data object PeopleAround : LayoverRoute("people_around")
     data object Profile : LayoverRoute("profile")
+    data class PeerProfile(val peerId: String) : LayoverRoute("peer_profile/$peerId") {
+        companion object {
+            const val ROUTE_PATTERN = "peer_profile/{peerId}"
+            fun createRoute(peerId: String) = "peer_profile/$peerId"
+        }
+    }
     data class Chat(val peerId: String) : LayoverRoute("chat/$peerId") {
         companion object {
             const val ROUTE_PATTERN = "chat/{peerId}"
@@ -239,13 +245,17 @@ fun LayoverNavGraph(
         ) { backStackEntry ->
             val peerId = backStackEntry.arguments?.getString("peerId") ?: ""
             val queryAliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
-            val peer = uiState.nearbyPeers.find { p ->
+            val matchingPeers = uiState.nearbyPeers.filter { p ->
                 queryAliases.any { q ->
                     p.id.equals(q, ignoreCase = true) ||
                             p.handle.equals(q, ignoreCase = true) ||
                             p.displayName.equals(q, ignoreCase = true)
                 }
             }
+            val peer = matchingPeers.firstOrNull { it.avatar.avatarBase64OrBytes?.isNotEmpty() == true }
+                ?: matchingPeers.firstOrNull()
+            val resolvedAvatarBytes = matchingPeers
+                .firstNotNullOfOrNull { it.avatar.avatarBase64OrBytes?.takeIf { b -> b.isNotEmpty() } }
 
             val messages = uiState.chatMessages[peerId]
                 ?: peer?.let { uiState.chatMessages[it.id] ?: uiState.chatMessages[it.handle] }
@@ -271,6 +281,7 @@ fun LayoverNavGraph(
                 isBlocked = isBlocked,
                 isBlockedByPeer = isBlockedByPeer,
                 isMuted = isMuted,
+                fallbackAvatarBytes = resolvedAvatarBytes,
                 onSendMessage = { text, replyTo ->
                     uiState.transport.sendMessage(peerId, text)
                     val newMsg = ChatMessage(
@@ -292,6 +303,68 @@ fun LayoverNavGraph(
                 },
                 onToggleBlockPeer = toggleBlockPeer,
                 onToggleMutePeer = toggleMutePeer,
+                onOpenPeerProfile = { targetPeerId ->
+                    val routeTarget = peer?.id?.takeIf { it.isNotBlank() } ?: targetPeerId
+                    if (routeTarget.isNotBlank()) {
+                        navController.navigate(LayoverRoute.PeerProfile.createRoute(routeTarget))
+                    }
+                },
+                onNavigateBack = {
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        composable(
+            route = LayoverRoute.PeerProfile.ROUTE_PATTERN,
+            arguments = listOf(navArgument("peerId") { type = NavType.StringType })
+        ) { backStackEntry ->
+            val targetPeerId = backStackEntry.arguments?.getString("peerId") ?: ""
+            val queryAliases = PeerAliasRegistry.resolveAliases(targetPeerId) + targetPeerId
+            val matchingTargetPeers = uiState.nearbyPeers.filter { p ->
+                queryAliases.any { q ->
+                    p.id.equals(q, ignoreCase = true) ||
+                            p.handle.equals(q, ignoreCase = true) ||
+                            p.displayName.equals(q, ignoreCase = true)
+                }
+            }
+            val targetPeer = matchingTargetPeers.firstOrNull { it.avatar.avatarBase64OrBytes?.isNotEmpty() == true }
+                ?: matchingTargetPeers.firstOrNull()
+            val targetAvatarBytes = matchingTargetPeers
+                .firstNotNullOfOrNull { it.avatar.avatarBase64OrBytes?.takeIf { b -> b.isNotEmpty() } }
+            val resolvedPeerAge: Int? = matchingTargetPeers.firstNotNullOfOrNull { p ->
+                runCatching {
+                    val v = p::class.members.firstOrNull { it.name == "age" }?.call(p)
+                        ?: p.avatar::class.members.firstOrNull { it.name == "age" }?.call(p.avatar)
+                    when (v) {
+                        is Int -> v.takeIf { it > 0 }
+                        is Long -> v.toInt().takeIf { it > 0 }
+                        is Number -> v.toInt().takeIf { it > 0 }
+                        is String -> v.trim().toIntOrNull()?.takeIf { it > 0 }
+                        else -> null
+                    }
+                }.getOrNull()
+            }
+
+            val peerBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
+                ?.isPeerIdentifierBlocked(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName)
+                ?: listOfNotNull(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName).any { candidate ->
+                    val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+                    expanded.any { exp -> uiState.blockedPeerIds.any { it.equals(exp, ignoreCase = true) } }
+                }
+
+            val peerBlockedByPeer = listOfNotNull(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName).any { candidate ->
+                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+                expanded.any { exp -> uiState.blockedByPeerIds.any { it.equals(exp, ignoreCase = true) } }
+            }
+
+            com.intj.layover.ui.screens.PeerProfileScreen(
+                peer = targetPeer,
+                peerIdFallback = targetPeerId,
+                age = resolvedPeerAge,
+                fallbackAvatarBytes = targetAvatarBytes,
+                isBlocked = peerBlocked,
+                isBlockedByPeer = peerBlockedByPeer,
                 onNavigateBack = {
                     navController.popBackStack()
                 }
