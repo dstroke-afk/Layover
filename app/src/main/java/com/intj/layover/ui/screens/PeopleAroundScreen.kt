@@ -65,13 +65,7 @@ import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.navigation.LayoverBackground
-import com.intj.layover.ui.theme.CyanAccent
-import com.intj.layover.ui.theme.CyanPrimary
-import com.intj.layover.ui.theme.DarkNavyBackground
-import com.intj.layover.ui.theme.ElevatedCardSurface
-import com.intj.layover.ui.theme.IncomingBubbleSurface
-import com.intj.layover.ui.theme.LightText
-import com.intj.layover.ui.theme.MutedText
+import com.intj.layover.ui.theme.LayoverTheme
 
 internal fun initialsForName(name: String, fallback: String = "?"): String {
     val computed = name.trim()
@@ -142,6 +136,7 @@ fun PeopleAroundScreen(
     onNavigateToProfile: () -> Unit,
     onNavigateBack: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     var searchActive by remember { mutableStateOf(initialSearchActive) }
     var searchQuery by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
@@ -182,7 +177,7 @@ fun PeopleAroundScreen(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
-                            tint = LightText
+                            tint = colors.lightText
                         )
                     }
                     Text(
@@ -191,7 +186,7 @@ fun PeopleAroundScreen(
                         fontWeight = FontWeight.Bold,
                         fontStyle = FontStyle.Italic,
                         fontFamily = FontFamily.Serif,
-                        color = LightText
+                        color = colors.lightText
                     )
                 }
 
@@ -200,7 +195,7 @@ fun PeopleAroundScreen(
                         Icon(
                             imageVector = if (searchActive) Icons.Default.Close else Icons.Default.Search,
                             contentDescription = "Toggle Search",
-                            tint = if (searchActive) CyanPrimary else LightText
+                            tint = if (searchActive) colors.cyanPrimary else colors.lightText
                         )
                     }
 
@@ -209,22 +204,22 @@ fun PeopleAroundScreen(
                             Icon(
                                 imageVector = Icons.Default.Menu,
                                 contentDescription = "Menu",
-                                tint = LightText
+                                tint = colors.lightText
                             )
                         }
 
                         DropdownMenu(
                             expanded = showMenu,
                             onDismissRequest = { showMenu = false },
-                            modifier = Modifier.background(ElevatedCardSurface)
+                            modifier = Modifier.background(colors.cardSurface)
                         ) {
                             DropdownMenuItem(
-                                text = { Text("My Profile", color = LightText) },
+                                text = { Text("My Profile", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.AccountCircle,
                                         contentDescription = null,
-                                        tint = CyanPrimary
+                                        tint = colors.cyanPrimary
                                     )
                                 },
                                 onClick = {
@@ -233,12 +228,12 @@ fun PeopleAroundScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Diagnostics", color = LightText) },
+                                text = { Text("Diagnostics", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.BugReport,
                                         contentDescription = null,
-                                        tint = CyanPrimary
+                                        tint = colors.cyanPrimary
                                     )
                                 },
                                 onClick = {
@@ -247,12 +242,12 @@ fun PeopleAroundScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("About", color = LightText) },
+                                text = { Text("About", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.Info,
                                         contentDescription = null,
-                                        tint = CyanAccent
+                                        tint = colors.cyanAccent
                                     )
                                 },
                                 onClick = {
@@ -270,16 +265,16 @@ fun PeopleAroundScreen(
                 OutlinedTextField(
                     value = searchQuery,
                     onValueChange = { searchQuery = it },
-                    placeholder = { Text("Filter nearby people...", color = MutedText) },
+                    placeholder = { Text("Filter nearby people...", color = colors.mutedText) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = ElevatedCardSurface,
-                        unfocusedContainerColor = ElevatedCardSurface,
-                        focusedBorderColor = CyanPrimary,
-                        unfocusedBorderColor = IncomingBubbleSurface,
-                        focusedTextColor = LightText,
-                        unfocusedTextColor = LightText
+                        focusedContainerColor = colors.cardSurface,
+                        unfocusedContainerColor = colors.cardSurface,
+                        focusedBorderColor = colors.cyanPrimary,
+                        unfocusedBorderColor = colors.incomingBubble,
+                        focusedTextColor = colors.lightText,
+                        unfocusedTextColor = colors.lightText
                     ),
                     shape = RoundedCornerShape(16.dp),
                     trailingIcon = {
@@ -288,7 +283,7 @@ fun PeopleAroundScreen(
                                 Icon(
                                     imageVector = Icons.Default.Close,
                                     contentDescription = "Clear",
-                                    tint = MutedText
+                                    tint = colors.mutedText
                                 )
                             }
                         }
@@ -302,7 +297,7 @@ fun PeopleAroundScreen(
                 text = "People Around (${filteredPeers.size})",
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
-                color = LightText,
+                color = colors.lightText,
                 modifier = Modifier.padding(bottom = 12.dp)
             )
 
@@ -341,6 +336,7 @@ fun PeerListItemCard(
     onToggleBlock: () -> Unit,
     onToggleMute: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
     val displayInitials = remember(peer.displayName, peer.avatar.initials) {
         if (peer.displayName.isNotBlank()) initialsForName(peer.displayName) else peer.avatar.initials
@@ -366,7 +362,7 @@ fun PeerListItemCard(
                 onChat()
             },
         colors = CardDefaults.cardColors(
-            containerColor = if (isBlocked) ElevatedCardSurface.copy(alpha = 0.6f) else ElevatedCardSurface
+            containerColor = if (isBlocked) colors.cardSurface.copy(alpha = 0.6f) else colors.cardSurface
         ),
         shape = RoundedCornerShape(16.dp)
     ) {
@@ -385,10 +381,10 @@ fun PeerListItemCard(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .background(IncomingBubbleSurface)
+                        .background(colors.incomingBubble)
                         .border(
                             1.5.dp,
-                            if (isBlocked) MutedText else CyanPrimary,
+                            if (isBlocked) colors.mutedText else colors.cyanPrimary,
                             CircleShape
                         ),
                     contentAlignment = Alignment.Center
@@ -406,7 +402,7 @@ fun PeerListItemCard(
                         Text(
                             text = displayInitials,
                             fontWeight = FontWeight.Bold,
-                            color = if (isBlocked) MutedText else CyanPrimary,
+                            color = if (isBlocked) colors.mutedText else colors.cyanPrimary,
                             fontSize = 17.sp
                         )
                     }
@@ -419,7 +415,7 @@ fun PeerListItemCard(
                         Text(
                             text = peer.displayName,
                             fontWeight = FontWeight.SemiBold,
-                            color = if (isBlocked) MutedText else LightText,
+                            color = if (isBlocked) colors.mutedText else colors.lightText,
                             fontSize = 16.sp
                         )
                         if (isMuted) {
@@ -427,7 +423,7 @@ fun PeerListItemCard(
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.VolumeOff,
                                 contentDescription = "Muted",
-                                tint = MutedText,
+                                tint = colors.mutedText,
                                 modifier = Modifier.size(14.dp)
                             )
                         }
@@ -435,13 +431,13 @@ fun PeerListItemCard(
                     if (isBlocked) {
                         Text(
                             text = "[BLOCKED]",
-                            color = MutedText,
+                            color = colors.mutedText,
                             fontSize = 13.sp
                         )
                     } else if (peer.handle.isNotEmpty()) {
                         Text(
                             text = "@${peer.handle}",
-                            color = MutedText,
+                            color = colors.mutedText,
                             fontSize = 13.sp
                         )
                     }
@@ -454,12 +450,12 @@ fun PeerListItemCard(
                 if (isBlocked) {
                     Surface(
                         modifier = Modifier.clickable { onToggleBlock() },
-                        color = IncomingBubbleSurface,
+                        color = colors.incomingBubble,
                         shape = RoundedCornerShape(20.dp)
                     ) {
                         Text(
                             text = "Unblock",
-                            color = LightText,
+                            color = colors.lightText,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                         )
@@ -469,12 +465,12 @@ fun PeerListItemCard(
                         ConnectionStatus.NONE -> {
                             Surface(
                                 modifier = Modifier.clickable { onConnect() },
-                                color = CyanPrimary,
+                                color = colors.cyanPrimary,
                                 shape = RoundedCornerShape(20.dp)
                             ) {
                                 Text(
                                     text = "Request",
-                                    color = DarkNavyBackground,
+                                    color = colors.darkBackground,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 13.sp,
                                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
@@ -484,7 +480,7 @@ fun PeerListItemCard(
 
                         ConnectionStatus.REQUESTED -> {
                             Surface(
-                                color = IncomingBubbleSurface,
+                                color = colors.incomingBubble,
                                 shape = RoundedCornerShape(20.dp)
                             ) {
                                 Row(
@@ -494,13 +490,13 @@ fun PeerListItemCard(
                                     Icon(
                                         imageVector = Icons.Default.Check,
                                         contentDescription = null,
-                                        tint = MutedText,
+                                        tint = colors.mutedText,
                                         modifier = Modifier.size(14.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
                                         text = "Requested",
-                                        color = MutedText,
+                                        color = colors.mutedText,
                                         fontWeight = FontWeight.Medium,
                                         fontSize = 13.sp
                                     )
@@ -537,12 +533,12 @@ fun PeerListItemCard(
 
                         ConnectionStatus.DECLINED -> {
                             Surface(
-                                color = IncomingBubbleSurface,
+                                color = colors.incomingBubble,
                                 shape = RoundedCornerShape(20.dp)
                             ) {
                                 Text(
                                     text = "Declined",
-                                    color = MutedText,
+                                    color = colors.mutedText,
                                     fontSize = 12.sp,
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                                 )
@@ -559,6 +555,7 @@ fun PeerListItemCard(
 fun OneTimeUsernameDialog(
     onConfirmUsername: (username: String, gender: GenderOption) -> Unit
 ) {
+    val colors = LayoverTheme.colors
     var usernameInput by remember { mutableStateOf("") }
     var selectedGender by remember { mutableStateOf<GenderOption?>(null) }
 
@@ -575,24 +572,24 @@ fun OneTimeUsernameDialog(
 
     androidx.compose.material3.AlertDialog(
         onDismissRequest = {},
-        containerColor = ElevatedCardSurface,
+        containerColor = colors.cardSurface,
         title = {
             Text(
                 text = "Set Your Username",
-                color = LightText,
+                color = colors.lightText,
                 fontWeight = FontWeight.Bold
             )
         },
         text = {
             Column {
                 Surface(
-                    color = IncomingBubbleSurface,
+                    color = colors.incomingBubble,
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
                         text = "Your username can only be set once and cannot be changed later.",
-                        color = CyanAccent,
+                        color = colors.cyanAccent,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         modifier = Modifier.padding(10.dp)
@@ -606,12 +603,12 @@ fun OneTimeUsernameDialog(
                     onValueChange = { usernameInput = it },
                     singleLine = true,
                     placeholder = {
-                        Text("Up to 8 chars, no spaces", color = MutedText)
+                        Text("Up to 8 chars, no spaces", color = colors.mutedText)
                     },
                     supportingText = {
                         Text(
                             text = errorMessage ?: "${usernameInput.length}/8 characters • No spaces",
-                            color = if (errorMessage != null) Color(0xFFFF5252) else MutedText,
+                            color = if (errorMessage != null) Color(0xFFFF5252) else colors.mutedText,
                             fontSize = 12.sp
                         )
                     },
@@ -623,7 +620,7 @@ fun OneTimeUsernameDialog(
 
                 Text(
                     text = "Select Gender",
-                    color = LightText,
+                    color = colors.lightText,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -641,11 +638,11 @@ fun OneTimeUsernameDialog(
                                 .weight(1f)
                                 .clip(RoundedCornerShape(12.dp))
                                 .clickable { selectedGender = option },
-                            color = if (isSelected) CyanPrimary.copy(alpha = 0.18f) else IncomingBubbleSurface,
+                            color = if (isSelected) colors.cyanPrimary.copy(alpha = 0.18f) else colors.incomingBubble,
                             shape = RoundedCornerShape(12.dp),
                             border = BorderStroke(
                                 width = 1.5.dp,
-                                color = if (isSelected) CyanPrimary else Color.Transparent
+                                color = if (isSelected) colors.cyanPrimary else Color.Transparent
                             )
                         ) {
                             Box(
@@ -654,7 +651,7 @@ fun OneTimeUsernameDialog(
                             ) {
                                 Text(
                                     text = option.label,
-                                    color = if (isSelected) CyanPrimary else LightText,
+                                    color = if (isSelected) colors.cyanPrimary else colors.lightText,
                                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                                     fontSize = 14.sp
                                 )

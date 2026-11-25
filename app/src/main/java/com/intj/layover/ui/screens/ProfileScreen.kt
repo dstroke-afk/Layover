@@ -86,13 +86,7 @@ import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverBackground
-import com.intj.layover.ui.theme.CyanAccent
-import com.intj.layover.ui.theme.CyanPrimary
-import com.intj.layover.ui.theme.DarkNavyBackground
-import com.intj.layover.ui.theme.ElevatedCardSurface
-import com.intj.layover.ui.theme.IncomingBubbleSurface
-import com.intj.layover.ui.theme.LightText
-import com.intj.layover.ui.theme.MutedText
+import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -251,6 +245,7 @@ fun ProfileScreen(
     onSaveProfile: (UserProfile) -> Unit,
     onNavigateBack: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -336,11 +331,11 @@ fun ProfileScreen(
     if (showAgeDialog) {
         AlertDialog(
             onDismissRequest = { showAgeDialog = false },
-            containerColor = ElevatedCardSurface,
+            containerColor = colors.cardSurface,
             title = {
                 Text(
                     text = "Set Age",
-                    color = LightText,
+                    color = colors.lightText,
                     fontWeight = FontWeight.Bold
                 )
             },
@@ -348,7 +343,7 @@ fun ProfileScreen(
                 Column {
                     Text(
                         text = "Enter your age (13–120) or leave blank.",
-                        color = MutedText,
+                        color = colors.mutedText,
                         fontSize = 13.sp
                     )
                     Spacer(modifier = Modifier.height(12.dp))
@@ -361,7 +356,7 @@ fun ProfileScreen(
                         },
                         singleLine = true,
                         isError = !isDraftAgeValid,
-                        placeholder = { Text("e.g. 29", color = MutedText) },
+                        placeholder = { Text("e.g. 29", color = colors.mutedText) },
                         supportingText = {
                             if (!isDraftAgeValid) {
                                 Text(
@@ -373,12 +368,12 @@ fun ProfileScreen(
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.fillMaxWidth(),
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = DarkNavyBackground,
-                            unfocusedContainerColor = DarkNavyBackground,
-                            focusedBorderColor = CyanPrimary,
-                            unfocusedBorderColor = IncomingBubbleSurface,
-                            focusedTextColor = LightText,
-                            unfocusedTextColor = LightText
+                            focusedContainerColor = colors.darkBackground,
+                            unfocusedContainerColor = colors.darkBackground,
+                            focusedBorderColor = colors.cyanPrimary,
+                            unfocusedBorderColor = colors.incomingBubble,
+                            focusedTextColor = colors.lightText,
+                            unfocusedTextColor = colors.lightText
                         ),
                         shape = RoundedCornerShape(12.dp)
                     )
@@ -392,8 +387,8 @@ fun ProfileScreen(
                         showAgeDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = CyanPrimary,
-                        contentColor = DarkNavyBackground
+                        containerColor = colors.cyanPrimary,
+                        contentColor = colors.darkBackground
                     )
                 ) {
                     Text("Done", fontWeight = FontWeight.Bold)
@@ -401,7 +396,7 @@ fun ProfileScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showAgeDialog = false }) {
-                    Text("Cancel", color = MutedText)
+                    Text("Cancel", color = colors.mutedText)
                 }
             }
         )
@@ -412,18 +407,18 @@ fun ProfileScreen(
             onDismissRequest = {
                 showSavedDialog = false
             },
-            containerColor = ElevatedCardSurface,
+            containerColor = colors.cardSurface,
             title = {
                 Text(
                     text = "Changes saved",
-                    color = LightText,
+                    color = colors.lightText,
                     fontWeight = FontWeight.Bold
                 )
             },
             text = {
                 Text(
                     text = "Changes are saved.",
-                    color = MutedText
+                    color = colors.mutedText
                 )
             },
             confirmButton = {
@@ -432,8 +427,8 @@ fun ProfileScreen(
                         showSavedDialog = false
                     },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = CyanPrimary,
-                        contentColor = DarkNavyBackground
+                        containerColor = colors.cyanPrimary,
+                        contentColor = colors.darkBackground
                     )
                 ) {
                     Text("OK", fontWeight = FontWeight.Bold)
@@ -458,14 +453,14 @@ fun ProfileScreen(
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Back",
-                        tint = LightText
+                        tint = colors.lightText
                     )
                 }
                 Text(
                     text = "My Profile",
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Bold,
-                    color = LightText
+                    color = colors.lightText
                 )
             }
 
@@ -473,7 +468,7 @@ fun ProfileScreen(
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = ElevatedCardSurface),
+                colors = CardDefaults.cardColors(containerColor = colors.cardSurface),
                 shape = RoundedCornerShape(24.dp)
             ) {
                 Column(
@@ -489,16 +484,16 @@ fun ProfileScreen(
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .shadow(16.dp, CircleShape, ambientColor = CyanPrimary, spotColor = CyanPrimary)
+                                .shadow(16.dp, CircleShape, ambientColor = colors.cyanPrimary, spotColor = colors.cyanPrimary)
                                 .clip(CircleShape)
-                                .background(IncomingBubbleSurface)
-                                .border(3.dp, CyanPrimary, CircleShape)
+                                .background(colors.incomingBubble)
+                                .border(3.dp, colors.cyanPrimary, CircleShape)
                                 .clickable { pickerLauncher.launch(arrayOf("image/*")) },
                             contentAlignment = Alignment.Center
                         ) {
                             if (isProcessingImage) {
                                 CircularProgressIndicator(
-                                    color = CyanPrimary,
+                                    color = colors.cyanPrimary,
                                     modifier = Modifier.size(36.dp)
                                 )
                             } else if (avatarBitmap != null) {
@@ -514,7 +509,7 @@ fun ProfileScreen(
                                 Icon(
                                     imageVector = Icons.Default.Person,
                                     contentDescription = "Profile Avatar",
-                                    tint = CyanAccent,
+                                    tint = colors.cyanAccent,
                                     modifier = Modifier.size(86.dp)
                                 )
                             }
@@ -527,7 +522,7 @@ fun ProfileScreen(
                                 .size(40.dp)
                                 .clip(CircleShape)
                                 .clickable { pickerLauncher.launch(arrayOf("image/*")) },
-                            color = CyanPrimary,
+                            color = colors.cyanPrimary,
                             shape = CircleShape,
                             shadowElevation = 6.dp
                         ) {
@@ -535,7 +530,7 @@ fun ProfileScreen(
                                 Icon(
                                     imageVector = Icons.Default.Edit,
                                     contentDescription = "Edit profile picture",
-                                    tint = DarkNavyBackground,
+                                    tint = colors.darkBackground,
                                     modifier = Modifier.size(20.dp)
                                 )
                             }
@@ -548,7 +543,7 @@ fun ProfileScreen(
                             text = "Cropped: $resolutionLabel",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium,
-                            color = MutedText
+                            color = colors.mutedText
                         )
                     }
 
@@ -558,7 +553,7 @@ fun ProfileScreen(
                         text = "Display Name",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
-                        color = CyanAccent
+                        color = colors.cyanAccent
                     )
 
                     Spacer(modifier = Modifier.height(4.dp))
@@ -567,7 +562,7 @@ fun ProfileScreen(
                         text = profile.displayName,
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
-                        color = LightText,
+                        color = colors.lightText,
                         textAlign = TextAlign.Center
                     )
 
@@ -582,8 +577,8 @@ fun ProfileScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(14.dp))
-                                .background(DarkNavyBackground)
-                                .border(1.dp, IncomingBubbleSurface, RoundedCornerShape(14.dp))
+                                .background(colors.darkBackground)
+                                .border(1.dp, colors.incomingBubble, RoundedCornerShape(14.dp))
                                 .padding(horizontal = 14.dp, vertical = 12.dp)
                         ) {
                             Row(
@@ -594,13 +589,13 @@ fun ProfileScreen(
                                 Text(
                                     text = "Gender",
                                     fontSize = 12.sp,
-                                    color = MutedText,
+                                    color = colors.mutedText,
                                     fontWeight = FontWeight.Medium
                                 )
                                 Icon(
                                     imageVector = Icons.Default.Lock,
                                     contentDescription = "Gender non-modifiable",
-                                    tint = MutedText,
+                                    tint = colors.mutedText,
                                     modifier = Modifier.size(13.dp)
                                 )
                             }
@@ -609,7 +604,7 @@ fun ProfileScreen(
                                 text = profile.gender.label,
                                 fontSize = 16.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = LightText
+                                color = colors.lightText
                             )
                         }
 
@@ -617,8 +612,8 @@ fun ProfileScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(14.dp))
-                                .background(DarkNavyBackground)
-                                .border(1.dp, IncomingBubbleSurface, RoundedCornerShape(14.dp))
+                                .background(colors.darkBackground)
+                                .border(1.dp, colors.incomingBubble, RoundedCornerShape(14.dp))
                                 .clickable {
                                     ageDraft = selectedAge?.toString() ?: ""
                                     showAgeDialog = true
@@ -633,13 +628,13 @@ fun ProfileScreen(
                                 Text(
                                     text = "Age",
                                     fontSize = 12.sp,
-                                    color = MutedText,
+                                    color = colors.mutedText,
                                     fontWeight = FontWeight.Medium
                                 )
                                 Icon(
                                     imageVector = Icons.Default.Edit,
                                     contentDescription = "Edit age",
-                                    tint = CyanAccent,
+                                    tint = colors.cyanAccent,
                                     modifier = Modifier.size(13.dp)
                                 )
                             }
@@ -648,7 +643,7 @@ fun ProfileScreen(
                                 text = selectedAge?.toString() ?: "Set age",
                                 fontSize = 16.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = if (selectedAge != null) LightText else MutedText
+                                color = if (selectedAge != null) colors.lightText else colors.mutedText
                             )
                         }
                     }
@@ -673,8 +668,8 @@ fun ProfileScreen(
                             .fillMaxWidth()
                             .height(50.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = CyanPrimary,
-                            contentColor = DarkNavyBackground
+                            containerColor = colors.cyanPrimary,
+                            contentColor = if (colors.isDark) colors.darkBackground else Color.White
                         ),
                         shape = RoundedCornerShape(14.dp)
                     ) {
@@ -689,7 +684,7 @@ fun ProfileScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(14.dp))
-                            .background(IncomingBubbleSurface)
+                            .background(colors.incomingBubble)
                             .padding(16.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -698,12 +693,12 @@ fun ProfileScreen(
                             Text(
                                 text = "Visible to nearby users",
                                 fontWeight = FontWeight.SemiBold,
-                                color = LightText,
+                                color = colors.lightText,
                                 fontSize = 15.sp
                             )
                             Text(
                                 text = "Allows nearby BLE nodes to discover your profile",
-                                color = MutedText,
+                                color = colors.mutedText,
                                 fontSize = 12.sp,
                                 modifier = Modifier.padding(top = 2.dp)
                             )
@@ -728,10 +723,10 @@ fun ProfileScreen(
                                 onSaveProfile(updatedProfile)
                             },
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = DarkNavyBackground,
-                                checkedTrackColor = CyanPrimary,
-                                uncheckedThumbColor = MutedText,
-                                uncheckedTrackColor = DarkNavyBackground
+                                checkedThumbColor = colors.darkBackground,
+                                checkedTrackColor = colors.cyanPrimary,
+                                uncheckedThumbColor = colors.mutedText,
+                                uncheckedTrackColor = colors.darkBackground
                             )
                         )
                     }
@@ -747,6 +742,7 @@ private fun CircularCropperDialog(
     onDismiss: () -> Unit,
     onConfirmCrop: (panOffsetPx: Offset, zoom: Float, viewportSizePx: Float) -> Unit
 ) {
+    val colors = LayoverTheme.colors
     val density = LocalDensity.current
     val viewportDp = 260.dp
     val viewportPx = with(density) { viewportDp.toPx() }
@@ -760,7 +756,7 @@ private fun CircularCropperDialog(
 
     Dialog(onDismissRequest = onDismiss) {
         Card(
-            colors = CardDefaults.cardColors(containerColor = ElevatedCardSurface),
+            colors = CardDefaults.cardColors(containerColor = colors.cardSurface),
             shape = RoundedCornerShape(24.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -774,13 +770,13 @@ private fun CircularCropperDialog(
                     text = "Crop Profile Picture",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
-                    color = LightText
+                    color = colors.lightText
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = "Drag to pan • Pinch to zoom (${sourceBitmap.width} x ${sourceBitmap.height} px)",
                     fontSize = 12.sp,
-                    color = MutedText,
+                    color = colors.mutedText,
                     textAlign = TextAlign.Center
                 )
 
@@ -790,7 +786,7 @@ private fun CircularCropperDialog(
                     modifier = Modifier
                         .size(viewportDp)
                         .clip(RoundedCornerShape(16.dp))
-                        .background(DarkNavyBackground)
+                        .background(Color(0xFF08101A))
                         .pointerInput(srcW, srcH, viewportPx) {
                             detectTransformGestures { _, pan, gestureZoom, _ ->
                                 val nextZoom = (zoom * gestureZoom).coerceIn(1f, 5f)
@@ -848,7 +844,7 @@ private fun CircularCropperDialog(
                             color = Color.Black.copy(alpha = 0.52f)
                         )
                         drawCircle(
-                            color = CyanPrimary,
+                            color = colors.cyanPrimary,
                             radius = radius,
                             center = center,
                             style = Stroke(width = 3.dp.toPx())
@@ -863,14 +859,14 @@ private fun CircularCropperDialog(
                     horizontalArrangement = Arrangement.End
                 ) {
                     TextButton(onClick = onDismiss) {
-                        Text("Cancel", color = MutedText)
+                        Text("Cancel", color = colors.mutedText)
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = { onConfirmCrop(panOffset, zoom, viewportPx) },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = CyanPrimary,
-                            contentColor = DarkNavyBackground
+                            containerColor = colors.cyanPrimary,
+                            contentColor = if (colors.isDark) colors.darkBackground else Color.White
                         )
                     ) {
                         Text("Use Photo", fontWeight = FontWeight.Bold)

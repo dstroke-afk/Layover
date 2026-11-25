@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -63,14 +62,7 @@ import androidx.compose.ui.unit.sp
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.navigation.LayoverBackground
-import com.intj.layover.ui.theme.CyanAccent
-import com.intj.layover.ui.theme.CyanPrimary
-import com.intj.layover.ui.theme.DarkNavyBackground
-import com.intj.layover.ui.theme.ElevatedCardSurface
-import com.intj.layover.ui.theme.IncomingBubbleSurface
-import com.intj.layover.ui.theme.LightText
-import com.intj.layover.ui.theme.MutedText
-import com.intj.layover.ui.theme.OutgoingCyanBubble
+import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.delay
 
 @Composable
@@ -85,6 +77,7 @@ fun ChatScreen(
     onToggleMutePeer: (String) -> Unit,
     onNavigateBack: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
@@ -153,23 +146,30 @@ fun ChatScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
-                .padding(16.dp)
+                .padding(horizontal = 12.dp, vertical = 6.dp)
                 .navigationBarsPadding()
                 .imePadding()
         ) {
-            // Header
-            Row(
+            // Header Card with display picture and display name
+            val headerCardShape = RoundedCornerShape(16.dp)
+            Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                    .border(1.dp, colors.cyanPrimary, headerCardShape),
+                color = colors.cardSurface,
+                shape = headerCardShape
             ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                 IconButton(onClick = onNavigateBack) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Back",
-                        tint = LightText
+                        tint = colors.lightText
                     )
                 }
 
@@ -177,10 +177,10 @@ fun ChatScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .background(if (isChatLocked) greyDisabledFill else IncomingBubbleSurface)
+                        .background(if (isChatLocked) greyDisabledFill else colors.incomingBubble)
                         .border(
                             1.5.dp,
-                            if (isChatLocked) greyDisabledBorder else CyanPrimary,
+                            if (isChatLocked) greyDisabledBorder else colors.cyanPrimary,
                             CircleShape
                         ),
                     contentAlignment = Alignment.Center
@@ -199,7 +199,7 @@ fun ChatScreen(
                         Text(
                             text = resolvedInitials,
                             fontWeight = FontWeight.Bold,
-                            color = if (isChatLocked) greyDisabledText else CyanPrimary,
+                            color = if (isChatLocked) greyDisabledText else colors.cyanPrimary,
                             fontSize = 15.sp
                         )
                     }
@@ -213,20 +213,20 @@ fun ChatScreen(
                             text = resolvedName,
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (isChatLocked) greyDisabledText else LightText
+                            color = if (isChatLocked) greyDisabledText else colors.lightText
                         )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = Icons.Default.Lock,
                             contentDescription = null,
-                            tint = if (isChatLocked) greyDisabledText else CyanAccent,
+                            tint = if (isChatLocked) greyDisabledText else colors.cyanAccent,
                             modifier = Modifier.size(11.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = statusText,
-                            color = if (isChatLocked) greyDisabledText else CyanAccent,
+                            color = if (isChatLocked) greyDisabledText else colors.cyanAccent,
                             fontSize = 11.sp
                         )
                     }
@@ -237,14 +237,14 @@ fun ChatScreen(
                         Icon(
                             imageVector = Icons.Default.MoreVert,
                             contentDescription = "Options",
-                            tint = MutedText
+                            tint = colors.mutedText
                         )
                     }
 
                     DropdownMenu(
                         expanded = showChatMenu,
                         onDismissRequest = { showChatMenu = false },
-                        modifier = Modifier.background(ElevatedCardSurface)
+                        modifier = Modifier.background(colors.cardSurface)
                     ) {
                         DropdownMenuItem(
                             text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
@@ -262,9 +262,10 @@ fun ChatScreen(
                         )
                     }
                 }
+                }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             // Messages List (greyed out when chat is locked)
             LazyColumn(
@@ -327,7 +328,7 @@ fun ChatScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(bottom = 8.dp),
-                    color = ElevatedCardSurface,
+                    color = colors.cardSurface,
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Row(
@@ -340,13 +341,13 @@ fun ChatScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = "Replying to:",
-                                color = CyanPrimary,
+                                color = colors.cyanPrimary,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
                                 text = replyingToMessage!!.text,
-                                color = LightText,
+                                color = colors.lightText,
                                 fontSize = 13.sp,
                                 maxLines = 1
                             )
@@ -355,7 +356,7 @@ fun ChatScreen(
                             Icon(
                                 imageVector = Icons.Default.Close,
                                 contentDescription = "Cancel Reply",
-                                tint = MutedText
+                                tint = colors.mutedText
                             )
                         }
                     }
@@ -376,7 +377,7 @@ fun ChatScreen(
                     placeholder = {
                         Text(
                             text = inputPlaceholderText,
-                            color = if (isChatLocked) greyDisabledText else MutedText
+                            color = if (isChatLocked) greyDisabledText else colors.mutedText
                         )
                     },
                     enabled = !isChatLocked,
@@ -384,14 +385,14 @@ fun ChatScreen(
                         .weight(1f)
                         .focusRequester(focusRequester),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = ElevatedCardSurface,
-                        unfocusedContainerColor = ElevatedCardSurface,
+                        focusedContainerColor = colors.cardSurface,
+                        unfocusedContainerColor = colors.cardSurface,
                         disabledContainerColor = greyDisabledFill,
-                        focusedBorderColor = CyanPrimary,
-                        unfocusedBorderColor = IncomingBubbleSurface,
+                        focusedBorderColor = colors.cyanPrimary,
+                        unfocusedBorderColor = colors.incomingBubble,
                         disabledBorderColor = greyDisabledBorder,
-                        focusedTextColor = LightText,
-                        unfocusedTextColor = LightText,
+                        focusedTextColor = colors.lightText,
+                        unfocusedTextColor = colors.lightText,
                         disabledTextColor = greyDisabledText,
                         disabledPlaceholderColor = greyDisabledText
                     ),
@@ -414,8 +415,8 @@ fun ChatScreen(
                         },
                     color = when {
                         isChatLocked -> greyDisabledFill
-                        canSend -> CyanPrimary
-                        else -> ElevatedCardSurface
+                        canSend -> colors.cyanPrimary
+                        else -> colors.cardSurface
                     }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
@@ -424,8 +425,8 @@ fun ChatScreen(
                             contentDescription = "Send",
                             tint = when {
                                 isChatLocked -> greyDisabledText
-                                canSend -> DarkNavyBackground
-                                else -> MutedText
+                                canSend -> colors.darkBackground
+                                else -> colors.mutedText
                             },
                             modifier = Modifier.size(20.dp)
                         )
@@ -441,21 +442,26 @@ fun ChatMessageBubble(
     message: ChatMessage,
     onReply: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     val isOutgoing = message.isOutgoing
+    val outgoingTextColor = if (colors.isDark) colors.darkBackground else Color.White
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = if (isOutgoing) Alignment.End else Alignment.Start
     ) {
+        val bubbleShape = RoundedCornerShape(
+            topStart = 16.dp,
+            topEnd = 16.dp,
+            bottomStart = if (isOutgoing) 16.dp else 4.dp,
+            bottomEnd = if (isOutgoing) 4.dp else 16.dp
+        )
         Surface(
-            color = if (isOutgoing) OutgoingCyanBubble else IncomingBubbleSurface,
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isOutgoing) 16.dp else 4.dp,
-                bottomEnd = if (isOutgoing) 4.dp else 16.dp
-            ),
-            modifier = Modifier.width(width = 280.dp)
+            color = if (isOutgoing) colors.outgoingBubble else colors.incomingBubble,
+            shape = bubbleShape,
+            modifier = Modifier
+                .width(width = 280.dp)
+                .border(1.dp, colors.cyanPrimary, bubbleShape)
         ) {
             Column(
                 modifier = Modifier.padding(12.dp)
@@ -475,13 +481,13 @@ fun ChatMessageBubble(
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.Reply,
                                 contentDescription = null,
-                                tint = if (isOutgoing) DarkNavyBackground else CyanAccent,
+                                tint = if (isOutgoing) outgoingTextColor else colors.cyanAccent,
                                 modifier = Modifier.size(12.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = message.replyToText,
-                                color = if (isOutgoing) DarkNavyBackground else LightText,
+                                color = if (isOutgoing) outgoingTextColor else colors.lightText,
                                 fontSize = 12.sp,
                                 maxLines = 1
                             )
@@ -491,7 +497,7 @@ fun ChatMessageBubble(
 
                 Text(
                     text = message.text,
-                    color = if (isOutgoing) DarkNavyBackground else LightText,
+                    color = if (isOutgoing) outgoingTextColor else colors.lightText,
                     fontSize = 15.sp
                 )
 
@@ -503,7 +509,7 @@ fun ChatMessageBubble(
                 ) {
                     Text(
                         text = message.timestampLabel,
-                        color = if (isOutgoing) DarkNavyBackground.copy(alpha = 0.7f) else MutedText,
+                        color = if (isOutgoing) outgoingTextColor.copy(alpha = 0.75f) else colors.mutedText,
                         fontSize = 10.sp
                     )
                 }

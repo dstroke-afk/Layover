@@ -1,11 +1,18 @@
 package com.intj.layover.navigation
 
+import android.content.res.Configuration
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -30,7 +37,7 @@ import com.intj.layover.ui.screens.PeopleAroundScreen
 import com.intj.layover.ui.screens.ProfileScreen
 import com.intj.layover.ui.screens.ScanScreen
 import com.intj.layover.ui.screens.SplashScreen
-import com.intj.layover.ui.theme.DarkNavyBackground
+import com.intj.layover.ui.theme.LayoverTheme
 
 sealed class LayoverRoute(val route: String) {
     data object Splash : LayoverRoute("splash")
@@ -50,15 +57,16 @@ fun LayoverBackground(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
                     colors = listOf(
-                        DarkNavyBackground,
-                        Color(0xFF0E1A29),
-                        DarkNavyBackground
+                        colors.gradientStart,
+                        colors.gradientMid,
+                        colors.gradientEnd
                     )
                 )
             )
@@ -74,7 +82,7 @@ fun LayoverBackground(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .fillMaxSize()
-                    .alpha(0.12f)
+                    .alpha(colors.overlayAlpha)
             )
         }
         content()
@@ -157,11 +165,26 @@ fun LayoverNavGraph(
         onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
     }
 
-    NavHost(
-        navController = navController,
-        startDestination = LayoverRoute.PeopleAround.route,
-        modifier = modifier.statusBarsPadding()
-    ) {
+    val isSystemDark = (LocalConfiguration.current.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    val statusBarBandColor = if (isSystemDark) Color.Black else Color.White
+    val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+
+    Column(modifier = modifier.fillMaxSize()) {
+        if (statusBarHeight.value > 0f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(statusBarHeight)
+                    .background(statusBarBandColor)
+            )
+        }
+        NavHost(
+            navController = navController,
+            startDestination = LayoverRoute.PeopleAround.route,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+        ) {
         composable(LayoverRoute.Splash.route) {
             SplashScreen(
                 onNavigateToScan = {
@@ -289,5 +312,6 @@ fun LayoverNavGraph(
                 }
             )
         }
+    }
     }
 }

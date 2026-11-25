@@ -66,18 +66,13 @@ import androidx.compose.ui.unit.sp
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.navigation.LayoverBackground
-import com.intj.layover.ui.theme.CyanAccent
-import com.intj.layover.ui.theme.CyanPrimary
-import com.intj.layover.ui.theme.DarkNavyBackground
-import com.intj.layover.ui.theme.ElevatedCardSurface
-import com.intj.layover.ui.theme.IncomingBubbleSurface
-import com.intj.layover.ui.theme.LightText
-import com.intj.layover.ui.theme.MutedText
+import com.intj.layover.ui.theme.LayoverTheme
 
 @Composable
 fun SplashScreen(
     onNavigateToScan: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     var hasNavigated by remember { mutableStateOf(false) }
 
     val navigateNext = {
@@ -108,14 +103,14 @@ fun SplashScreen(
                 modifier = Modifier
                     .size(90.dp)
                     .clip(CircleShape)
-                    .background(ElevatedCardSurface)
-                    .border(2.dp, CyanPrimary, CircleShape),
+                    .background(colors.cardSurface)
+                    .border(2.dp, colors.cyanPrimary, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = Icons.Default.Radar,
                     contentDescription = null,
-                    tint = CyanPrimary,
+                    tint = colors.cyanPrimary,
                     modifier = Modifier.size(48.dp)
                 )
             }
@@ -128,7 +123,7 @@ fun SplashScreen(
                 fontWeight = FontWeight.Bold,
                 fontStyle = FontStyle.Italic,
                 fontFamily = FontFamily.Serif,
-                color = LightText,
+                color = colors.lightText,
                 letterSpacing = 2.sp
             )
 
@@ -137,7 +132,7 @@ fun SplashScreen(
             Text(
                 text = "Offline Nearby Social Mesh",
                 fontSize = 14.sp,
-                color = MutedText,
+                color = colors.mutedText,
                 letterSpacing = 1.sp,
                 textAlign = TextAlign.Center
             )
@@ -147,7 +142,7 @@ fun SplashScreen(
             Text(
                 text = "Tap anywhere to skip",
                 fontSize = 12.sp,
-                color = MutedText.copy(alpha = 0.6f)
+                color = colors.mutedText.copy(alpha = 0.6f)
             )
         }
     }
@@ -160,6 +155,7 @@ fun ScanScreen(
     onNavigateToPeople: (Boolean) -> Unit,
     onNavigateToProfile: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     var showMenu by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showDiagnosticsDialog by remember { mutableStateOf(false) }
@@ -214,7 +210,7 @@ fun ScanScreen(
                     fontWeight = FontWeight.Bold,
                     fontStyle = FontStyle.Italic,
                     fontFamily = FontFamily.Serif,
-                    color = LightText
+                    color = colors.lightText
                 )
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -222,7 +218,7 @@ fun ScanScreen(
                         Icon(
                             imageVector = Icons.Default.Search,
                             contentDescription = "Search",
-                            tint = LightText
+                            tint = colors.lightText
                         )
                     }
 
@@ -231,22 +227,22 @@ fun ScanScreen(
                             Icon(
                                 imageVector = Icons.Default.Menu,
                                 contentDescription = "Menu",
-                                tint = LightText
+                                tint = colors.lightText
                             )
                         }
 
                         DropdownMenu(
                             expanded = showMenu,
                             onDismissRequest = { showMenu = false },
-                            modifier = Modifier.background(ElevatedCardSurface)
+                            modifier = Modifier.background(colors.cardSurface)
                         ) {
                             DropdownMenuItem(
-                                text = { Text("Your Profile", color = LightText) },
+                                text = { Text("Your Profile", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.AccountCircle,
                                         contentDescription = null,
-                                        tint = CyanPrimary
+                                        tint = colors.cyanPrimary
                                     )
                                 },
                                 onClick = {
@@ -255,12 +251,12 @@ fun ScanScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Diagnostics", color = LightText) },
+                                text = { Text("Diagnostics", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.BugReport,
                                         contentDescription = null,
-                                        tint = CyanPrimary
+                                        tint = colors.cyanPrimary
                                     )
                                 },
                                 onClick = {
@@ -269,12 +265,12 @@ fun ScanScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("About", color = LightText) },
+                                text = { Text("About", color = colors.lightText) },
                                 leadingIcon = {
                                     Icon(
                                         imageVector = Icons.Default.Info,
                                         contentDescription = null,
-                                        tint = CyanAccent
+                                        tint = colors.cyanAccent
                                     )
                                 },
                                 onClick = {
@@ -299,8 +295,8 @@ fun ScanScreen(
                         .size(280.dp)
                         .scale(scale2)
                         .clip(CircleShape)
-                        .background(CyanPrimary.copy(alpha = 0.05f))
-                        .border(1.dp, CyanPrimary.copy(alpha = 0.2f), CircleShape)
+                        .background(colors.cyanPrimary.copy(alpha = 0.05f))
+                        .border(1.dp, colors.cyanPrimary.copy(alpha = 0.2f), CircleShape)
                 )
 
                 Box(
@@ -308,8 +304,8 @@ fun ScanScreen(
                         .size(210.dp)
                         .scale(scale1)
                         .clip(CircleShape)
-                        .background(CyanPrimary.copy(alpha = 0.1f))
-                        .border(1.5.dp, CyanPrimary.copy(alpha = 0.4f), CircleShape)
+                        .background(colors.cyanPrimary.copy(alpha = 0.1f))
+                        .border(1.5.dp, colors.cyanPrimary.copy(alpha = 0.4f), CircleShape)
                 )
 
                 Surface(
@@ -321,7 +317,7 @@ fun ScanScreen(
                             onNavigateToPeople(false)
                         },
                     shape = CircleShape,
-                    color = CyanPrimary,
+                    color = colors.cyanPrimary,
                     shadowElevation = 12.dp
                 ) {
                     Box(
@@ -334,7 +330,7 @@ fun ScanScreen(
                             Icon(
                                 imageVector = Icons.Default.Radar,
                                 contentDescription = "Scan",
-                                tint = DarkNavyBackground,
+                                tint = colors.darkBackground,
                                 modifier = Modifier.size(36.dp)
                             )
                             Spacer(modifier = Modifier.height(4.dp))
@@ -342,7 +338,7 @@ fun ScanScreen(
                                 text = "SCAN",
                                 fontSize = 18.sp,
                                 fontWeight = FontWeight.Black,
-                                color = DarkNavyBackground,
+                                color = colors.darkBackground,
                                 letterSpacing = 2.sp
                             )
                         }
@@ -356,14 +352,14 @@ fun ScanScreen(
                 text = if (uiState.isScanning) "Searching for nearby peers..." else "Tap SCAN to discover nearby travelers",
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
-                color = LightText,
+                color = colors.lightText,
                 textAlign = TextAlign.Center
             )
 
             Text(
                 text = "Zero Internet Required • Bluetooth Mesh & Wi-Fi Direct",
                 fontSize = 12.sp,
-                color = MutedText,
+                color = colors.mutedText,
                 modifier = Modifier.padding(top = 6.dp),
                 textAlign = TextAlign.Center
             )
@@ -373,8 +369,8 @@ fun ScanScreen(
             Button(
                 onClick = { onNavigateToPeople(false) },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = ElevatedCardSurface,
-                    contentColor = LightText
+                    containerColor = colors.cardSurface,
+                    contentColor = colors.lightText
                 ),
                 shape = RoundedCornerShape(14.dp),
                 modifier = Modifier
@@ -395,17 +391,18 @@ fun ScanScreen(
 
 @Composable
 fun AboutDialog(onDismiss: () -> Unit) {
+    val colors = LayoverTheme.colors
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = ElevatedCardSurface,
-        titleContentColor = LightText,
-        textContentColor = LightText,
+        containerColor = colors.cardSurface,
+        titleContentColor = colors.lightText,
+        textContentColor = colors.lightText,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     imageVector = Icons.Default.Radar,
                     contentDescription = null,
-                    tint = CyanPrimary,
+                    tint = colors.cyanPrimary,
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -421,10 +418,10 @@ fun AboutDialog(onDismiss: () -> Unit) {
                 Text(
                     text = "Layover is a decentralized, off-grid peer-to-peer social messaging application designed for travelers in transit.",
                     fontSize = 14.sp,
-                    color = LightText
+                    color = colors.lightText
                 )
                 Surface(
-                    color = IncomingBubbleSurface,
+                    color = colors.incomingBubble,
                     shape = RoundedCornerShape(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
@@ -432,14 +429,14 @@ fun AboutDialog(onDismiss: () -> Unit) {
                         Text(
                             text = "• Transport: BLE Discovery & Wi-Fi Direct Mesh",
                             fontSize = 12.sp,
-                            color = CyanAccent,
+                            color = colors.cyanAccent,
                             fontWeight = FontWeight.Medium
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = "• Security: End-to-End Encrypted (E2EE) Signal Channels",
                             fontSize = 12.sp,
-                            color = CyanAccent,
+                            color = colors.cyanAccent,
                             fontWeight = FontWeight.Medium
                         )
                     }
@@ -448,7 +445,7 @@ fun AboutDialog(onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = onDismiss) {
-                Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold)
+                Text("Close", color = colors.cyanPrimary, fontWeight = FontWeight.Bold)
             }
         }
     )
@@ -459,21 +456,22 @@ fun DiagnosticsDialog(
     uiState: LayoverUiState,
     onDismiss: () -> Unit
 ) {
+    val colors = LayoverTheme.colors
     val diag = uiState.diagnostics
     val context = LocalContext.current
     var exportStatusText by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = ElevatedCardSurface,
-        titleContentColor = LightText,
-        textContentColor = LightText,
+        containerColor = colors.cardSurface,
+        titleContentColor = colors.lightText,
+        textContentColor = colors.lightText,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     imageVector = Icons.Default.BugReport,
                     contentDescription = null,
-                    tint = CyanPrimary,
+                    tint = colors.cyanPrimary,
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -515,7 +513,7 @@ fun DiagnosticsDialog(
                         text = exportStatusText!!,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
-                        color = CyanAccent
+                        color = colors.cyanAccent
                     )
                 }
 
@@ -530,8 +528,8 @@ fun DiagnosticsDialog(
                             context.startActivity(intent)
                         },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = CyanAccent,
-                            contentColor = DarkNavyBackground
+                            containerColor = colors.cyanAccent,
+                            contentColor = colors.darkBackground
                         ),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
@@ -562,7 +560,7 @@ fun DiagnosticsDialog(
                             val result = LayoverFileLogger.exportLogToDownloads(context, diag)
                             exportStatusText = result.getOrElse { e -> e.message ?: "Export failed" }
                         },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = CyanPrimary),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.cyanPrimary),
                         shape = RoundedCornerShape(8.dp)
                     ) {
                         Icon(
@@ -580,8 +578,8 @@ fun DiagnosticsDialog(
                             exportStatusText = null
                         },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = CyanPrimary,
-                            contentColor = DarkNavyBackground
+                            containerColor = colors.cyanPrimary,
+                            contentColor = colors.darkBackground
                         ),
                         shape = RoundedCornerShape(8.dp)
                     ) {
@@ -589,7 +587,7 @@ fun DiagnosticsDialog(
                     }
 
                     TextButton(onClick = onDismiss) {
-                        Text("Close", color = CyanPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text("Close", color = colors.cyanPrimary, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
                 }
             }
@@ -603,6 +601,7 @@ private fun DiagnosticMetricRow(
     value: String,
     isError: Boolean = false
 ) {
+    val colors = LayoverTheme.colors
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -611,13 +610,13 @@ private fun DiagnosticMetricRow(
         Text(
             text = label,
             fontSize = 13.sp,
-            color = MutedText
+            color = colors.mutedText
         )
         Text(
             text = value,
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
-            color = if (isError) Color(0xFFFF5252) else CyanAccent,
+            color = if (isError) Color(0xFFFF5252) else colors.cyanAccent,
             modifier = Modifier.padding(start = 8.dp)
         )
     }
