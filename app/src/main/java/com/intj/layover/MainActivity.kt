@@ -1,7 +1,10 @@
 package com.intj.layover
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.widget.Toast
@@ -42,6 +45,7 @@ import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.ui.screens.OneTimeUsernameDialog
 import com.intj.layover.ui.theme.LayoverTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import java.util.UUID
 
@@ -58,17 +62,33 @@ class MainActivity : ComponentActivity() {
     private fun UserProfile.effectiveCompactAvatarBytes(): ByteArray? =
         compactTransferAvatarBytes ?: avatarBytes
 
+    private fun openAppPermissionSettings(context: Context) {
+        val missing = BlePermissionHelper.getRequiredPermissions().joinToString()
+        LayoverFileLogger.log("Opening Settings.ACTION_APPLICATION_DETAILS_SETTINGS for package=${context.packageName}; blePerms=$missing")
+        Log.d(TAG, "Opening app permission settings for package=${context.packageName}")
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", context.packageName, null)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        LayoverFileLogger.log("MainActivity.onCreate: initializing profile prefs and BLE stack.")
+        Log.d(TAG, "MainActivity.onCreate called; savedInstanceStateNull=${savedInstanceState == null}")
 
         val prefs = applicationContext.getSharedPreferences("layover_user_profile", Context.MODE_PRIVATE)
         val savedDeviceId = prefs.getString("device_id", null) ?: run {
             val newId = "dev_" + UUID.randomUUID().toString().take(8)
             prefs.edit().putString("device_id", newId).apply()
+            LayoverFileLogger.log("Generated new deviceId=$newId")
+            Log.d(TAG, "Generated new deviceId=$newId")
             newId
         }
         val usernameAlreadySet = prefs.getBoolean("username_set", false)
+        val initialPermissionFlowDone = prefs.getBoolean("initial_permission_flow_done", false)
         val savedName = if (usernameAlreadySet) (prefs.getString("display_name", "") ?: "") else ""
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
@@ -92,6 +112,17 @@ class MainActivity : ComponentActivity() {
             isVisibleToNearby = savedVisible
         )
 
+        LayoverFileLogger.log(
+            "Loaded profile: deviceId=$savedDeviceId, handle=$savedHandle, usernameSet=$usernameAlreadySet, " +
+                "initialPermissionFlowDone=$initialPermissionFlowDone, visible=$savedVisible, " +
+                "hasAvatar=${savedAvatarBytes != null}, hasCompactAvatar=${savedCompactAvatarBytes != null}"
+        )
+        Log.d(
+            TAG,
+            "Loaded profile: deviceId=$savedDeviceId, usernameSet=$usernameAlreadySet, " +
+                "initialPermissionFlowDone=$initialPermissionFlowDone, visible=$savedVisible"
+        )
+
         var transportRef: BleProximityTransport? = null
 
         bleStateController = BleStateController(applicationContext)
@@ -99,6 +130,8 @@ class MainActivity : ComponentActivity() {
             context = applicationContext,
             bleStateController = bleStateController,
             onRequestAvatarFetch = { device, mapKey, onLoaded ->
+                LayoverFileLogger.log("onRequestAvatarFetch invoked: mapKey=$mapKey, transportReady=${transportRef != null}")
+                Log.d(TAG, "onRequestAvatarFetch invoked: mapKey=$mapKey")
                 transportRef?.requestAvatarFetch(device, mapKey, onLoaded)
             }
         )
@@ -134,11 +167,28 @@ class MainActivity : ComponentActivity() {
 
             var incomingRequestPeer by remember { mutableStateOf<Pair<String, String>?>(null) }
             var acceptedRequestPeer by remember { mutableStateOf<String?>(null) }
-            var hasPermissions by remember {
+            var hasBlePermissions by remember {
                 mutableStateOf(BlePermissionHelper.hasAllRequiredPermissions(context))
+            }
+            var blePermissionDeniedOrDismissed by remember {
+                mutableStateOf(
+                    initialPermissionFlowDone && !BlePermissionHelper.hasAllRequiredPermissions(context)
+                )
+            }
+            var hasCompletedInitialPermissionFlow by remember {
+                mutableStateOf(initialPermissionFlowDone)
             }
             var hasSetUsername by remember {
                 mutableStateOf(usernameAlreadySet)
+            }
+            var showUsernameAfterPermissions by remember {
+                mutableStateOf(false)
+            }
+            var blePromptLaunchedInSession by remember {
+                mutableStateOf(false)
+            }
+            var isBlePermissionPromptVisible by remember {
+                mutableStateOf(false)
             }
 
             LaunchedEffect(diagnostics) {
@@ -196,6 +246,7 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 bleTransport.incomingMessagesFlow.collect { (peerId, message) ->
+                    LayoverFileLogger.log("Incoming message collected: from=$peerId, msgId=${message.id}")
                     val updatedMap = uiState.chatMessages.toMutableMap()
 
                     fun addMsgToKey(key: String) {
@@ -228,10 +279,12 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionRequestFlow.collectLatest { (peerId, displayName) ->
                     if (bleTransport.isPeerIdentifierBlocked(peerId, displayName)) {
+                        LayoverFileLogger.log("Dropped CONNECTION_REQUEST for blocked peer: id=$peerId, name=$displayName")
                         Log.d(TAG, "Dropped CONNECTION_REQUEST popup for blocked peer: $peerId ($displayName)")
                         return@collectLatest
                     }
 
+                    LayoverFileLogger.log("Incoming CONNECTION_REQUEST: id=$peerId, name=$displayName")
                     incomingRequestPeer = Pair(peerId, displayName)
 
                     val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
@@ -269,6 +322,7 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionAcceptFlow.collectLatest { peerId ->
+                    LayoverFileLogger.log("Incoming CONNECTION_ACCEPT: peerId=$peerId")
                     acceptedRequestPeer = peerId
                     val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
                     val existingPeer = uiState.nearbyPeers.find { p ->
@@ -288,6 +342,7 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(Unit) {
                 bleTransport.incomingConnectionDeclineFlow.collectLatest { peerId ->
+                    LayoverFileLogger.log("Incoming CONNECTION_DECLINE: peerId=$peerId")
                     val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
                     val updatedPeers = uiState.nearbyPeers.map { p ->
                         if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
@@ -304,6 +359,7 @@ class MainActivity : ComponentActivity() {
                 bleTransport.incomingPeerBlockStateFlow.collectLatest { event: Pair<String, Boolean> ->
                     val peerId = event.first
                     val isBlockedByPeer = event.second
+                    LayoverFileLogger.log("Incoming peer block state: peerId=$peerId, isBlockedByPeer=$isBlockedByPeer")
                     val aliases = (PeerAliasRegistry.resolveAliases(peerId) + peerId)
                         .filter { alias: String -> alias.isNotBlank() && alias != "00000000" && alias != "user" }
                         .toSet()
@@ -322,46 +378,82 @@ class MainActivity : ComponentActivity() {
             val permissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestMultiplePermissions()
             ) { permsMap ->
-                val allGranted = permsMap.values.all { it }
+                isBlePermissionPromptVisible = false
+                val actualBleGranted = BlePermissionHelper.hasAllRequiredPermissions(context)
+                val allBleGranted = if (permsMap.isEmpty()) actualBleGranted else (permsMap.values.all { it } || actualBleGranted)
                 bleStateController.refreshPermissionAndAdapterState()
-                hasPermissions = allGranted || BlePermissionHelper.hasAllRequiredPermissions(context)
-                if (allGranted) {
-                    Log.d(TAG, "Permissions granted via system dialog.")
+                hasBlePermissions = allBleGranted
+
+                LayoverFileLogger.log(
+                    "BLE permission result: mapEmpty=${permsMap.isEmpty()}, actualBleGranted=$actualBleGranted, " +
+                        "allBleGranted=$allBleGranted, hasBlePermissions=$hasBlePermissions, details=$permsMap"
+                )
+                Log.d(TAG, "BLE permission result: allBleGranted=$allBleGranted, details=$permsMap")
+
+                if (permsMap.isEmpty() && !actualBleGranted) {
+                    LayoverFileLogger.log("Ignoring empty BLE permission map while actualBleGranted=false (activity recreate during prompt).")
+                    return@rememberLauncherForActivityResult
+                }
+
+                hasCompletedInitialPermissionFlow = true
+                prefs.edit()
+                    .putBoolean("initial_permission_flow_done", true)
+                    .putBoolean("ble_permission_prompt_open", false)
+                    .apply()
+
+                if (allBleGranted) {
+                    blePermissionDeniedOrDismissed = false
+                    prefs.edit().putBoolean("ble_permission_denied_or_dismissed", false).apply()
+                    Log.d(TAG, "BLE permissions granted via system dialog.")
                     bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                 } else {
-                    Log.e(TAG, "Permissions rejected by user.")
-                    Toast.makeText(
-                        context,
-                        "Bluetooth permissions are required for nearby scanning",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    blePermissionDeniedOrDismissed = true
+                    prefs.edit().putBoolean("ble_permission_denied_or_dismissed", true).apply()
+                    Log.w(TAG, "BLE permissions denied or dismissed by user; showing persistent card on People Around.")
+                }
+
+                if (!hasSetUsername) {
+                    showUsernameAfterPermissions = true
                 }
             }
 
+            // Keep missing-permission transport callback non-looping: rely on first-launch flow + persistent card in PeopleAroundScreen
             bleTransport.onMissingPermissions = {
-                Log.d(TAG, "Transport requested missing permissions. Launching permission dialog...")
-                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
+                val bleGrantedNow = BlePermissionHelper.hasAllRequiredPermissions(context)
+                hasBlePermissions = bleGrantedNow
+                LayoverFileLogger.log("Transport reported missing BLE permissions (bleGrantedNow=$bleGrantedNow); avoiding automatic popup loop.")
+                Log.d(TAG, "Transport reported missing BLE permissions; avoiding automatic popup loop.")
             }
 
-            LaunchedEffect(uiState.isScanning) {
+            LaunchedEffect(uiState.isScanning, hasCompletedInitialPermissionFlow, hasBlePermissions) {
+                if (!hasCompletedInitialPermissionFlow) {
+                    LayoverFileLogger.log(
+                        "Skipping discovery effect while initial permission flow active: done=$hasCompletedInitialPermissionFlow"
+                    )
+                    return@LaunchedEffect
+                }
                 if (uiState.isScanning) {
-                    if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-                        hasPermissions = false
-                        Log.d(TAG, "Requesting missing BLE runtime permissions...")
-                        permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
+                    val bleGrantedNow = BlePermissionHelper.hasAllRequiredPermissions(context)
+                    hasBlePermissions = bleGrantedNow
+                    if (!bleGrantedNow) {
+                        LayoverFileLogger.log("BLE permissions missing after initial flow; keeping discovery idle without looping popups.")
+                        Log.d(TAG, "BLE permissions missing; skipping automatic popup loop.")
                     } else {
-                        hasPermissions = true
+                        blePermissionDeniedOrDismissed = false
+                        LayoverFileLogger.log("Discovery active; starting BLE transport (visible=${uiState.userProfile.isVisibleToNearby && hasSetUsername}).")
                         bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                     }
                 } else {
+                    LayoverFileLogger.log("isScanning=false; stopping BLE discovery.")
                     bleTransport.stopDiscovery()
                 }
             }
 
             LaunchedEffect(bleStatus.lastError) {
                 bleStatus.lastError?.let { err ->
+                    LayoverFileLogger.log("bleStatus.lastError observed: $err")
                     bleTransport.diagnosticsTracker.updateLastErrorMessage(err)
-                    if (uiState.isScanning) {
+                    if (uiState.isScanning && hasBlePermissions) {
                         Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -371,17 +463,33 @@ class MainActivity : ComponentActivity() {
                 val observer = LifecycleEventObserver { _, event ->
                     when (event) {
                         Lifecycle.Event.ON_STOP -> {
+                            LayoverFileLogger.log("Lifecycle ON_STOP: stopping BLE discovery.")
                             Log.d(TAG, "App ON_STOP: Stopping BLE discovery.")
                             bleTransport.stopDiscovery()
                         }
                         Lifecycle.Event.ON_START, Lifecycle.Event.ON_RESUME -> {
                             bleStateController.refreshPermissionAndAdapterState()
-                            val granted = BlePermissionHelper.hasAllRequiredPermissions(context)
-                            hasPermissions = granted
-                            if (!granted) {
-                                Log.d(TAG, "Lifecycle $event: Missing permissions detected. Launching prompt.")
-                                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
-                            } else {
+                            val bleGrantedNow = BlePermissionHelper.hasAllRequiredPermissions(context)
+                            hasBlePermissions = bleGrantedNow
+                            if (bleGrantedNow) {
+                                blePermissionDeniedOrDismissed = false
+                            }
+
+                            LayoverFileLogger.log(
+                                "Lifecycle $event: bleGranted=$bleGrantedNow, " +
+                                    "initialFlowDone=$hasCompletedInitialPermissionFlow, usernameSet=$hasSetUsername, " +
+                                    "blePromptLaunched=$blePromptLaunchedInSession, deniedOrDismissed=$blePermissionDeniedOrDismissed"
+                            )
+
+                            if (!hasCompletedInitialPermissionFlow && !blePromptLaunchedInSession) {
+                                blePromptLaunchedInSession = true
+                                isBlePermissionPromptVisible = true
+                                val blePerms = BlePermissionHelper.getRequiredPermissions()
+                                prefs.edit().putBoolean("ble_permission_prompt_open", true).apply()
+                                LayoverFileLogger.log("Starting first-launch BLE permission prompt (${blePerms.joinToString()})")
+                                Log.d(TAG, "Lifecycle $event: Launching first-launch BLE permission prompt once.")
+                                permissionLauncher.launch(blePerms)
+                            } else if (bleGrantedNow) {
                                 bleTransport.startDiscovery(uiState.userProfile.isVisibleToNearby && hasSetUsername)
                             }
                         }
@@ -391,6 +499,7 @@ class MainActivity : ComponentActivity() {
                 lifecycleOwner.lifecycle.addObserver(observer)
                 onDispose {
                     lifecycleOwner.lifecycle.removeObserver(observer)
+                    LayoverFileLogger.log("MainActivity DisposableEffect disposed; cleaning up BLE transport.")
                     bleTransport.cleanup()
                 }
             }
@@ -398,8 +507,13 @@ class MainActivity : ComponentActivity() {
             LayoverTheme {
                 val navController = androidx.navigation.compose.rememberNavController()
 
-                if (!hasSetUsername) {
-                    LayoverFileLogger.log("Showing OneTimeUsernameDialog (username_set=false)")
+                val shouldShowUsernameDialog = !hasSetUsername &&
+                    (hasCompletedInitialPermissionFlow || showUsernameAfterPermissions)
+
+                if (shouldShowUsernameDialog) {
+                    LayoverFileLogger.log(
+                        "Showing OneTimeUsernameDialog (username_set=false, initialFlowDone=$hasCompletedInitialPermissionFlow)"
+                    )
                     OneTimeUsernameDialog(
                         onConfirmUsername = { chosenName, chosenGender ->
                             val cleanedName = chosenName.trim()
@@ -413,13 +527,18 @@ class MainActivity : ComponentActivity() {
                                 .putString("display_name", cleanedName)
                                 .putString("gender", chosenGender.name)
                                 .putBoolean("username_set", true)
+                                .putBoolean("initial_permission_flow_done", true)
                                 .apply()
+                            LayoverFileLogger.log("Confirmed profile: name=$cleanedName, gender=${chosenGender.name}, visible=$visiblePref")
+                            Log.d(TAG, "Confirmed profile: name=$cleanedName, gender=${chosenGender.name}")
                             bleTransport.updateProfile(updatedProfile)
                             uiState = uiState.copy(userProfile = updatedProfile)
                             hasSetUsername = true
+                            showUsernameAfterPermissions = false
                             if (!BlePermissionHelper.hasAllRequiredPermissions(context)) {
-                                permissionLauncher.launch(BlePermissionHelper.getRequiredPermissions())
+                                LayoverFileLogger.log("Profile saved and BLE permissions missing; relying on PeopleAroundScreen recovery card.")
                             } else if (updatedProfile.isVisibleToNearby) {
+                                LayoverFileLogger.log("Starting BLE advertising and discovery after profile setup.")
                                 bleDiscoveryManager.startAdvertising(updatedProfile)
                                 bleTransport.startDiscovery(true)
                             }
@@ -429,11 +548,15 @@ class MainActivity : ComponentActivity() {
 
                 incomingRequestPeer?.let { (peerId, displayName) ->
                     AlertDialog(
-                        onDismissRequest = { incomingRequestPeer = null },
+                        onDismissRequest = {
+                            LayoverFileLogger.log("Incoming connection request dismissed for peerId=$peerId")
+                            incomingRequestPeer = null
+                        },
                         title = { Text("Connection Request") },
                         text = { Text("$displayName would like to connect with you.") },
                         confirmButton = {
                             Button(onClick = {
+                                LayoverFileLogger.log("Accepted connection request from peerId=$peerId ($displayName)")
                                 incomingRequestPeer = null
                                 bleTransport.acceptConnectionRequest(peerId)
                                 val updatedPeers = uiState.nearbyPeers.map { p ->
@@ -451,6 +574,7 @@ class MainActivity : ComponentActivity() {
                         },
                         dismissButton = {
                             Button(onClick = {
+                                LayoverFileLogger.log("Declined connection request from peerId=$peerId ($displayName)")
                                 incomingRequestPeer = null
                                 bleTransport.declineConnectionRequest(peerId)
                                 val updatedPeers = uiState.nearbyPeers.map { p ->
@@ -476,6 +600,7 @@ class MainActivity : ComponentActivity() {
                         text = { Text("$name accepted your connection request!") },
                         confirmButton = {
                             Button(onClick = {
+                                LayoverFileLogger.log("Navigating to chat with accepted peerId=$peerId (routeId=${peer?.id ?: peerId})")
                                 acceptedRequestPeer = null
                                 val targetRouteId = peer?.id ?: peerId
                                 navController.navigate(LayoverRoute.Chat.createRoute(targetRouteId))
@@ -507,6 +632,10 @@ class MainActivity : ComponentActivity() {
                             muted = newState.mutedPeerIds
                         )
                         if (newState.userProfile != oldProfile) {
+                            LayoverFileLogger.log(
+                                "UserProfile updated: name=${newState.userProfile.displayName}, " +
+                                    "gender=${newState.userProfile.gender.name}, visible=${newState.userProfile.isVisibleToNearby}"
+                            )
                             val editor = prefs.edit()
                                 .putString("display_name", newState.userProfile.displayName)
                                 .putString("handle", newState.userProfile.handle)
@@ -530,6 +659,7 @@ class MainActivity : ComponentActivity() {
                             val avatarChanged = !oldProfile.compactTransferAvatarBytes.contentEquals(newState.userProfile.compactTransferAvatarBytes) ||
                                 !oldProfile.avatarBytes.contentEquals(newState.userProfile.avatarBytes)
                             if (avatarChanged) {
+                                LayoverFileLogger.log("Avatar bytes changed; updating avatar_updated_at timestamp.")
                                 editor.putLong("avatar_updated_at", System.currentTimeMillis())
                             }
                             editor.apply()
@@ -566,6 +696,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        LayoverFileLogger.log("MainActivity.onDestroy called.")
+        Log.d(TAG, "MainActivity.onDestroy called.")
         super.onDestroy()
         bleTransport.cleanup()
     }

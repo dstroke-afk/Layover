@@ -165,26 +165,11 @@ fun LayoverNavGraph(
         onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
     }
 
-    val isSystemDark = (LocalConfiguration.current.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-    val statusBarBandColor = if (isSystemDark) Color.Black else Color.White
-    val statusBarHeight = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-
-    Column(modifier = modifier.fillMaxSize()) {
-        if (statusBarHeight.value > 0f) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(statusBarHeight)
-                    .background(statusBarBandColor)
-            )
-        }
-        NavHost(
-            navController = navController,
-            startDestination = LayoverRoute.PeopleAround.route,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-        ) {
+    NavHost(
+        navController = navController,
+        startDestination = LayoverRoute.PeopleAround.route,
+        modifier = modifier.fillMaxSize()
+    ) {
         composable(LayoverRoute.Splash.route) {
             SplashScreen(
                 onNavigateToScan = {
@@ -312,6 +297,5 @@ fun LayoverNavGraph(
                 }
             )
         }
-    }
     }
 }

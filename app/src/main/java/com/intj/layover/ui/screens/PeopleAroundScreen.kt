@@ -1,6 +1,10 @@
 package com.intj.layover.ui.screens
 
+import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.Settings
+import android.util.Log
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -27,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -54,11 +59,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
@@ -129,19 +136,37 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
 fun PeopleAroundScreen(
     uiState: LayoverUiState,
     initialSearchActive: Boolean = false,
+    blePermissionDeniedOrDismissed: Boolean = false,
     onConnectPeer: (String) -> Unit,
     onOpenChat: (String) -> Unit,
     onToggleBlockPeer: (String) -> Unit,
     onToggleMutePeer: (String) -> Unit,
     onNavigateToProfile: () -> Unit,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onOpenAppSettings: (() -> Unit)? = null
 ) {
+    val context = LocalContext.current
     val colors = LayoverTheme.colors
     var searchActive by remember { mutableStateOf(initialSearchActive) }
     var searchQuery by remember { mutableStateOf("") }
     var showMenu by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showDiagnosticsDialog by remember { mutableStateOf(false) }
+
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var hasBlePermissions by remember {
+        mutableStateOf(BlePermissionHelper.hasAllRequiredPermissions(context))
+    }
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner, uiState.nearbyPeers.size, uiState.diagnostics.discoveredPeersCount) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME || event == androidx.lifecycle.Lifecycle.Event.ON_START) {
+                hasBlePermissions = BlePermissionHelper.hasAllRequiredPermissions(context)
+            }
+        }
+        hasBlePermissions = BlePermissionHelper.hasAllRequiredPermissions(context)
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     if (showAboutDialog) {
         AboutDialog(onDismiss = { showAboutDialog = false })
@@ -157,6 +182,17 @@ fun PeopleAroundScreen(
                     peer.displayName.contains(searchQuery, ignoreCase = true) ||
                     (peer.handle.isNotEmpty() && peer.handle.contains(searchQuery, ignoreCase = true))
         }
+    }
+
+    val openSettingsAction: () -> Unit = onOpenAppSettings ?: {
+        val missingPerms = BlePermissionHelper.getRequiredPermissions().joinToString()
+        LayoverFileLogger.log("PeopleAroundScreen: opening app permission settings for missing BLE perms: $missingPerms")
+        Log.d("LayoverBLE", "PeopleAroundScreen: opening app permission settings for BLE perms: $missingPerms")
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", context.packageName, null)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
     }
 
     LayoverBackground {
@@ -305,6 +341,23 @@ fun PeopleAroundScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 contentPadding = PaddingValues(bottom = 16.dp)
             ) {
+                val currentBleGranted = BlePermissionHelper.hasAllRequiredPermissions(context)
+                hasBlePermissions = currentBleGranted
+                val prefsHandle = context.getSharedPreferences("layover_user_profile", android.content.Context.MODE_PRIVATE)
+                val prefsFlowDone = prefsHandle.getBoolean("initial_permission_flow_done", false)
+                val prefsDenied = prefsHandle.getBoolean("ble_permission_denied_or_dismissed", false)
+                val promptCurrentlyOpen = prefsHandle.getBoolean("ble_permission_prompt_open", false)
+                val shouldShowCard = !currentBleGranted && !promptCurrentlyOpen && (blePermissionDeniedOrDismissed || prefsDenied || prefsFlowDone)
+                if (shouldShowCard) {
+                    item(key = "ble_permission_recovery_card") {
+                        LayoverFileLogger.logThrottled(
+                            "people_around_ble_card",
+                            "PeopleAroundScreen: rendering pinned BLE permission recovery card in first-peer slot."
+                        )
+                        BlePermissionRecoveryCard(onClick = openSettingsAction)
+                    }
+                }
+
                 items(filteredPeers, key = { it.id }) { peer ->
                     PeerListItemCard(
                         peer = peer,
@@ -322,6 +375,58 @@ fun PeopleAroundScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun BlePermissionRecoveryCard(
+    onClick: () -> Unit
+) {
+    val colors = LayoverTheme.colors
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable {
+                LayoverFileLogger.log("BlePermissionRecoveryCard clicked -> opening App Settings.")
+                Log.d("LayoverBLE", "BlePermissionRecoveryCard clicked -> opening App Settings.")
+                onClick()
+            },
+        colors = CardDefaults.cardColors(containerColor = colors.cardSurface),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.5.dp, colors.cyanPrimary.copy(alpha = 0.7f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(colors.incomingBubble)
+                    .border(1.5.dp, colors.cyanPrimary, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.BluetoothDisabled,
+                    contentDescription = null,
+                    tint = colors.cyanPrimary,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(14.dp))
+
+            Text(
+                text = "BLE permission needed for discovery - click to allow",
+                color = colors.lightText,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }

@@ -1,6 +1,7 @@
 package com.intj.layover.ui.screens
 
 import android.graphics.BitmapFactory
+import android.util.Log
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -14,11 +15,18 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.lazy.LazyColumn
@@ -61,9 +69,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.NearbyPeer
-import com.intj.layover.navigation.LayoverBackground
 import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.delay
+
+private const val TAG = "LayoverChatTrace"
+
+private fun chatTrace(step: String, detail: String = "") {
+    if (detail.isEmpty()) {
+        Log.d(TAG, "[$step]")
+    } else {
+        Log.d(TAG, "[$step] $detail")
+    }
+}
 
 @Composable
 fun ChatScreen(
@@ -77,16 +94,21 @@ fun ChatScreen(
     onToggleMutePeer: (String) -> Unit,
     onNavigateBack: () -> Unit
 ) {
+    chatTrace("ChatScreen:ENTRY", "peerId=${peer?.id ?: "null"}, messagesCount=${messages.size}, isBlocked=$isBlocked, isBlockedByPeer=$isBlockedByPeer, isMuted=$isMuted")
     val colors = LayoverTheme.colors
+    chatTrace("ChatScreen:THEME", "isDark=${colors.isDark}")
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
+    chatTrace("ChatScreen:STATE_INIT", "inputLen=${inputText.length}, replyingTo=${replyingToMessage?.id}, showChatMenu=$showChatMenu")
 
     val listState = rememberLazyListState()
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
+    chatTrace("ChatScreen:REMEMBER_REFS", "focusRequesterCreated=true, keyboardControllerNull=${keyboardController == null}, firstVisibleIdx=${listState.firstVisibleItemIndex}")
 
     val isChatLocked = isBlocked || isBlockedByPeer
+    chatTrace("ChatScreen:LOCK_EVAL", "isChatLocked=$isChatLocked")
 
     val peerId = peer?.id ?: ""
     val resolvedName = peer?.displayName?.takeIf { it.isNotBlank() }
@@ -99,6 +121,7 @@ fun ChatScreen(
                 ?: initialsForName(resolvedName)
         }
     }
+    chatTrace("ChatScreen:PEER_RESOLVED", "peerId=$peerId, resolvedName=$resolvedName, initials=$resolvedInitials")
 
     val peerAvatarBytes = peer?.avatar?.avatarBase64OrBytes
     val peerAvatarBitmap = remember(peerAvatarBytes) {
@@ -106,23 +129,32 @@ fun ChatScreen(
             runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
         }
     }
+    chatTrace("ChatScreen:AVATAR_DECODE", "avatarBytesLen=${peerAvatarBytes?.size ?: 0}, bitmapDecoded=${peerAvatarBitmap != null}")
 
     LaunchedEffect(peerId, isChatLocked) {
+        chatTrace("LaunchedEffect(peerId,isChatLocked):START", "peerId=$peerId, isChatLocked=$isChatLocked")
         if (!isChatLocked) {
+            chatTrace("LaunchedEffect(peerId,isChatLocked):DELAY_BEFORE_FOCUS", "waiting 100ms")
             delay(100)
-            runCatching {
-                focusRequester.requestFocus()
-                keyboardController?.show()
-            }
+            val reqResult = runCatching { focusRequester.requestFocus() }
+            chatTrace("LaunchedEffect(peerId,isChatLocked):FOCUS_REQUEST", "success=${reqResult.isSuccess}, err=${reqResult.exceptionOrNull()?.message}")
+            val showResult = runCatching { keyboardController?.show() }
+            chatTrace("LaunchedEffect(peerId,isChatLocked):KEYBOARD_SHOW", "controllerNull=${keyboardController == null}, success=${showResult.isSuccess}, err=${showResult.exceptionOrNull()?.message}")
         } else {
-            keyboardController?.hide()
+            chatTrace("LaunchedEffect(peerId,isChatLocked):LOCKED_HIDE_KEYBOARD", "hiding keyboard")
+            val hideResult = runCatching { keyboardController?.hide() }
+            chatTrace("LaunchedEffect(peerId,isChatLocked):KEYBOARD_HIDE_DONE", "success=${hideResult.isSuccess}")
         }
+        chatTrace("LaunchedEffect(peerId,isChatLocked):END", "peerId=$peerId, isChatLocked=$isChatLocked")
     }
 
     val latestMessageId = messages.lastOrNull()?.id
     LaunchedEffect(messages.size, latestMessageId) {
+        chatTrace("LaunchedEffect(messages):START", "messagesSize=${messages.size}, latestMessageId=$latestMessageId")
         if (messages.isNotEmpty()) {
+            chatTrace("LaunchedEffect(messages):SCROLL_TO_ZERO", "animating listState to index=0")
             listState.animateScrollToItem(index = 0)
+            chatTrace("LaunchedEffect(messages):SCROLL_DONE", "firstVisibleItemIndex=${listState.firstVisibleItemIndex}")
         }
     }
 
@@ -141,14 +173,22 @@ fun ChatScreen(
         isBlocked -> "Peer is blocked"
         else -> "Type encrypted message..."
     }
+    chatTrace("ChatScreen:LABELS", "statusText=$statusText, placeholder=$inputPlaceholderText")
 
-    LayoverBackground {
+    chatTrace("ChatScreen:RENDER_ROOT_BOX", "entering root Box")
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.darkBackground)
+    ) {
+        chatTrace("ChatScreen:RENDER_ROOT_COLUMN", "applying statusBarsPadding + padding + WindowInsets.ime")
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 6.dp)
+                .statusBarsPadding()
                 .navigationBarsPadding()
                 .imePadding()
+                .padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
             // Header Card with display picture and display name
             val headerCardShape = RoundedCornerShape(16.dp)
@@ -165,7 +205,10 @@ fun ChatScreen(
                         .padding(horizontal = 4.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                IconButton(onClick = onNavigateBack) {
+                IconButton(onClick = {
+                    chatTrace("TopBar:BACK_CLICK", "peerId=$peerId")
+                    onNavigateBack()
+                }) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Back",
@@ -233,7 +276,10 @@ fun ChatScreen(
                 }
 
                 Box {
-                    IconButton(onClick = { showChatMenu = true }) {
+                    IconButton(onClick = {
+                        chatTrace("TopBar:MENU_CLICK", "opening dropdown")
+                        showChatMenu = true
+                    }) {
                         Icon(
                             imageVector = Icons.Default.MoreVert,
                             contentDescription = "Options",
@@ -256,6 +302,7 @@ fun ChatScreen(
                                 )
                             },
                             onClick = {
+                                chatTrace("TopBar:BLOCK_TOGGLE", "peerId=$peerId, currentBlocked=$isBlocked")
                                 showChatMenu = false
                                 onToggleBlockPeer(peerId)
                             }
@@ -268,6 +315,7 @@ fun ChatScreen(
             Spacer(modifier = Modifier.height(6.dp))
 
             // Messages List (greyed out when chat is locked)
+            chatTrace("ChatScreen:LAZY_COLUMN", "count=${messages.size}, reverseLayout=true, locked=$isChatLocked")
             LazyColumn(
                 state = listState,
                 modifier = Modifier
@@ -279,9 +327,11 @@ fun ChatScreen(
                 reverseLayout = true
             ) {
                 items(messages.reversed(), key = { it.id }) { msg ->
+                    chatTrace("ChatScreen:LAZY_ITEM", "msgId=${msg.id}, isOutgoing=${msg.isOutgoing}")
                     ChatMessageBubble(
                         message = msg,
                         onReply = {
+                            chatTrace("ChatScreen:MSG_REPLY_CLICK", "msgId=${msg.id}, locked=$isChatLocked")
                             if (!isChatLocked) {
                                 replyingToMessage = msg
                             }
@@ -365,19 +415,26 @@ fun ChatScreen(
 
             // Input Bar
             val canSend = !isChatLocked && inputText.isNotBlank()
+            chatTrace("ChatScreen:INPUT_BAR_EVAL", "canSend=$canSend, isChatLocked=$isChatLocked, inputLen=${inputText.length}")
+            val idleInputSurface = Color(0xFF1D242E)
+            val idleInputBorder = Color(0xFF333D4B)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 4.dp),
+                    .padding(top = 4.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
                     value = if (isChatLocked) "" else inputText,
-                    onValueChange = { if (!isChatLocked) inputText = it },
+                    onValueChange = { newVal ->
+                        chatTrace("InputField:VALUE_CHANGE", "locked=$isChatLocked, newLen=${newVal.length}")
+                        if (!isChatLocked) inputText = newVal
+                    },
                     placeholder = {
                         Text(
                             text = inputPlaceholderText,
-                            color = if (isChatLocked) greyDisabledText else colors.mutedText
+                            color = if (isChatLocked) greyDisabledText else colors.mutedText,
+                            fontSize = 15.sp
                         )
                     },
                     enabled = !isChatLocked,
@@ -385,11 +442,11 @@ fun ChatScreen(
                         .weight(1f)
                         .focusRequester(focusRequester),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = colors.cardSurface,
-                        unfocusedContainerColor = colors.cardSurface,
+                        focusedContainerColor = idleInputSurface,
+                        unfocusedContainerColor = idleInputSurface,
                         disabledContainerColor = greyDisabledFill,
                         focusedBorderColor = colors.cyanPrimary,
-                        unfocusedBorderColor = colors.incomingBubble,
+                        unfocusedBorderColor = idleInputBorder,
                         disabledBorderColor = greyDisabledBorder,
                         focusedTextColor = colors.lightText,
                         unfocusedTextColor = colors.lightText,
@@ -400,23 +457,28 @@ fun ChatScreen(
                     maxLines = 4
                 )
 
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(10.dp))
 
                 Surface(
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(50.dp)
                         .clip(CircleShape)
                         .clickable(enabled = canSend) {
+                            chatTrace("SendButton:CLICK", "canSend=$canSend, trimmedLen=${inputText.trim().length}, replyId=${replyingToMessage?.id}")
                             if (canSend) {
-                                onSendMessage(inputText.trim(), replyingToMessage?.text)
+                                val trimmed = inputText.trim()
+                                val replyText = replyingToMessage?.text
+                                chatTrace("SendButton:DISPATCH", "sending len=${trimmed.length}, hasReply=${replyText != null}")
+                                onSendMessage(trimmed, replyText)
                                 inputText = ""
                                 replyingToMessage = null
+                                chatTrace("SendButton:RESET_STATE", "cleared inputText and replyingToMessage")
                             }
                         },
                     color = when {
                         isChatLocked -> greyDisabledFill
                         canSend -> colors.cyanPrimary
-                        else -> colors.cardSurface
+                        else -> Color(0xFF28303D)
                     }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
@@ -428,7 +490,7 @@ fun ChatScreen(
                                 canSend -> colors.darkBackground
                                 else -> colors.mutedText
                             },
-                            modifier = Modifier.size(20.dp)
+                            modifier = Modifier.size(22.dp)
                         )
                     }
                 }
@@ -442,6 +504,7 @@ fun ChatMessageBubble(
     message: ChatMessage,
     onReply: () -> Unit
 ) {
+    chatTrace("ChatMessageBubble:ENTRY", "msgId=${message.id}, isOutgoing=${message.isOutgoing}, hasReply=${message.replyToText != null}, textLen=${message.text.length}")
     val colors = LayoverTheme.colors
     val isOutgoing = message.isOutgoing
     val outgoingTextColor = if (colors.isDark) colors.darkBackground else Color.White
@@ -460,7 +523,7 @@ fun ChatMessageBubble(
             color = if (isOutgoing) colors.outgoingBubble else colors.incomingBubble,
             shape = bubbleShape,
             modifier = Modifier
-                .width(width = 280.dp)
+                .widthIn(min = 72.dp, max = 280.dp)
                 .border(1.dp, colors.cyanPrimary, bubbleShape)
         ) {
             Column(
