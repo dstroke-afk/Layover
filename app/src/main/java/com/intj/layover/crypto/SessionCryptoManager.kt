@@ -100,22 +100,66 @@ class SessionCryptoManager {
 
     fun getAlgorithmName(): String = currentAlgorithm.algorithmName
 
+    fun generateKeyPairForAlgorithm(targetAlgo: String): String {
+        val prevSecret = secretKey
+        val prevRemote = remotePublicKey
+        val prevFingerprint = sessionFingerprint
+        clearSession()
+        val pair = if (targetAlgo.equals("X25519", ignoreCase = true) || targetAlgo.equals("XDH", ignoreCase = true)) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    currentAlgorithm = KeyAlgorithm.X25519
+                    KeyPairGenerator.getInstance("X25519").generateKeyPair()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Requested X25519 not supported, using EC secp256r1", e)
+                    generateEcFallback()
+                }
+            } else {
+                generateEcFallback()
+            }
+        } else {
+            generateEcFallback()
+        }
+        localKeyPair = pair
+        remotePublicKey = prevRemote
+        secretKey = prevSecret
+        sessionFingerprint = prevFingerprint
+        return Base64.encodeToString(pair.public.encoded, Base64.NO_WRAP)
+    }
+
     fun establishRemoteKey(remotePublicKeyBase64: String, algorithmName: String = "EC"): Boolean {
-        val localPair = localKeyPair ?: return false
         return try {
-            val keyBytes = Base64.decode(remotePublicKeyBase64, Base64.NO_WRAP)
-            val algo = if (algorithmName == "X25519" || algorithmName == "XDH") "X25519" else "EC"
-            val keyFactory = KeyFactory.getInstance(algo)
+            val trimmedB64 = remotePublicKeyBase64.trim()
+            val keyBytes = Base64.decode(trimmedB64, Base64.NO_WRAP)
+            val normalizedAlgo = if (algorithmName.equals("X25519", ignoreCase = true) || algorithmName.equals("XDH", ignoreCase = true)) {
+                "X25519"
+            } else {
+                "EC"
+            }
+
+            // Ensure local keypair uses the matching algorithm so KeyAgreement succeeds across peers
+            var localPair = localKeyPair
+            if (localPair == null || !currentAlgorithm.algorithmName.equals(normalizedAlgo, ignoreCase = true)) {
+                generateKeyPairForAlgorithm(normalizedAlgo)
+                localPair = localKeyPair ?: return false
+            }
+
+            // If X25519 was requested but this device had to fall back to EC, we cannot combine EC private + X25519 public
+            if (!currentAlgorithm.algorithmName.equals(normalizedAlgo, ignoreCase = true)) {
+                Log.e(TAG, "Key algorithm mismatch: local=${currentAlgorithm.algorithmName}, remote=$normalizedAlgo")
+                return false
+            }
+
+            val keyFactory = KeyFactory.getInstance(normalizedAlgo)
             val pubKey = keyFactory.generatePublic(X509EncodedKeySpec(keyBytes))
 
-            remotePublicKey = pubKey
-
             val keyAgreement = KeyAgreement.getInstance(
-                if (algo == "X25519") "X25519" else "ECDH"
+                if (normalizedAlgo == "X25519") "X25519" else "ECDH"
             )
             keyAgreement.init(localPair.private)
             keyAgreement.doPhase(pubKey, true)
             val rawSharedSecret = keyAgreement.generateSecret()
+            remotePublicKey = pubKey
 
             // Derive 256-bit AES key via SHA-256 HKDF-like context digest
             val md = MessageDigest.getInstance("SHA-256")

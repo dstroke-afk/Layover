@@ -121,6 +121,7 @@ class BleProximityTransport(
 
     private var hasSentKeyExchange = false
     private var hasReceivedKeyExchange = false
+    private val pendingEncryptedRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
 
     val isE2eeEstablished: Boolean
         get() = sessionCryptoManager.isSessionKeyEstablished
@@ -271,8 +272,7 @@ class BleProximityTransport(
                         )
                         LayoverFileLogger.log("KeyExchange establishRemoteKey success=$success for peer=${frame.senderId}")
 
-                        if (!sessionCryptoManager.isSessionKeyEstablished && sessionCryptoManager.getLocalPublicKeyBase64() != null) {
-                            hasSentKeyExchange = true
+                        if (sessionCryptoManager.getLocalPublicKeyBase64() != null && success) {
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
                             val localId = currentUserProfile.handle.ifEmpty { "local" }
                             val responsePayload = WireFrameCodec.encodeKeyExchange(
@@ -280,7 +280,8 @@ class BleProximityTransport(
                                 publicKeyBase64 = localPub,
                                 algorithm = sessionCryptoManager.getAlgorithmName()
                             )
-                            LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId}...")
+                            hasSentKeyExchange = true
+                            LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId} (algo=${sessionCryptoManager.getAlgorithmName()})...")
                             gattSessionManager.sendFrame(responsePayload)
                         }
 
@@ -290,6 +291,7 @@ class BleProximityTransport(
                         if (isEstablished) {
                             LayoverFileLogger.log("SUCCESS: E2EE Key Exchange completed successfully for peer=${frame.senderId}. Fingerprint=${sessionCryptoManager.sessionFingerprint}")
                             diagnosticsTracker.updateLastErrorMessage(null)
+                            flushPendingRetries()
                         } else {
                             LayoverFileLogger.logError("Key exchange establishment pending for peer=${frame.senderId}.")
                             diagnosticsTracker.updateLastErrorMessage("E2EE key exchange pending")
@@ -564,13 +566,23 @@ class BleProximityTransport(
         }
     }
 
+    private fun flushPendingRetries() {
+        if (!sessionCryptoManager.isSessionKeyEstablished) return
+        while (pendingEncryptedRetries.isNotEmpty()) {
+            val item = pendingEncryptedRetries.poll() ?: break
+            sendMessage(item.first, item.second)
+        }
+    }
+
     override fun sendMessage(peerId: String, text: String) {
         LayoverFileLogger.log("sendMessage to peerId=$peerId")
         if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
         }
-        activePeerId = peerId
+        if (peerId.isNotEmpty()) {
+            activePeerId = peerId
+        }
         val localId = currentUserProfile.handle.ifEmpty { "user" }
         val msgId = "msg_${System.currentTimeMillis()}"
 
@@ -590,7 +602,9 @@ class BleProximityTransport(
                 diagnosticsTracker.updateLastErrorMessage("Failed to send message frame")
             }
         } else {
-            LayoverFileLogger.logError("Failed to encrypt text for peerId=$peerId. Re-initiating E2EE key exchange...")
+            LayoverFileLogger.logError("Failed to encrypt text for peerId=$peerId. Queueing message & initiating E2EE key exchange...")
+            pendingEncryptedRetries.add(peerId to text)
+            hasSentKeyExchange = false
             initiateE2eeHandshake()
             diagnosticsTracker.updateLastErrorMessage("E2EE key session missing - re-initiating handshake")
         }

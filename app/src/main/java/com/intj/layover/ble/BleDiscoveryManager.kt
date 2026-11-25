@@ -40,7 +40,8 @@ data class DiscoveredPeerRecord(
 class BleDiscoveryManager(
     private val context: Context,
     private val bleStateController: BleStateController,
-    private val onRequestAvatarFetch: ((BluetoothDevice, String, (ByteArray) -> Unit) -> Unit)? = null
+    private val onRequestAvatarFetch: ((BluetoothDevice, String, (ByteArray) -> Unit) -> Unit)? = null,
+    private val isChatSessionActiveOrConnecting: ((BluetoothDevice, String) -> Boolean)? = null
 ) {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
 
@@ -55,6 +56,8 @@ class BleDiscoveryManager(
     private val fetchedAvatarKeys = ConcurrentHashMap.newKeySet<String>()
     private val inFlightAvatarKeys = ConcurrentHashMap.newKeySet<String>()
     private val cachedAvatarsByKey = ConcurrentHashMap<String, ByteArray>()
+    private val avatarVersionByKey = ConcurrentHashMap<String, String>()
+    private val lastAvatarFetchTimeByKey = ConcurrentHashMap<String, Long>()
     private var pruneJob: Job? = null
 
     private var protectedIdentifiers: Set<String> = emptySet()
@@ -336,13 +339,42 @@ class BleDiscoveryManager(
 
         val mapKey = payload?.instanceIdHex?.ifBlank { macAddress } ?: macAddress
 
+        val incomingAvatarVersion: String? = serviceData?.takeIf { it.isNotEmpty() }?.let { bytes ->
+            // Extract trailing 2-4 bytes if payload is longer than base advertisement payload, or hash full serviceData
+            if (bytes.size >= 14) {
+                bytes.copyOfRange(bytes.size - 4, bytes.size).joinToString("") { "%02X".format(it) }
+            } else {
+                bytes.joinToString("") { "%02X".format(it) }
+            }
+        }
+
         val existingRecord = peerMap[mapKey] ?: peerMap.values.find {
             it.peer.id == macAddress || it.peer.handle == mapKey || it.device.address.equals(macAddress, ignoreCase = true)
         }
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
-        val preservedAvatarBytes = existingRecord?.peer?.avatar?.avatarBase64OrBytes
-            ?: cachedAvatarsByKey[mapKey]
-            ?: PeerAliasRegistry.resolveAliases(mapKey).firstNotNullOfOrNull { cachedAvatarsByKey[it] }
+
+        val previousVersion = avatarVersionByKey[mapKey]
+            ?: PeerAliasRegistry.resolveAliases(mapKey).firstNotNullOfOrNull { avatarVersionByKey[it] }
+        val avatarVersionChanged = incomingAvatarVersion != null &&
+            previousVersion != null &&
+            !previousVersion.equals(incomingAvatarVersion, ignoreCase = true)
+
+        if (avatarVersionChanged) {
+            LayoverFileLogger.log("Avatar version changed for Key=$mapKey ($previousVersion -> $incomingAvatarVersion). Invalidating cache & re-fetching immediately.")
+            invalidateAvatarCache(mapKey)
+        }
+        if (incomingAvatarVersion != null) {
+            avatarVersionByKey[mapKey] = incomingAvatarVersion
+            PeerAliasRegistry.resolveAliases(mapKey).forEach { avatarVersionByKey[it] = incomingAvatarVersion }
+        }
+
+        val preservedAvatarBytes = if (avatarVersionChanged) {
+            null
+        } else {
+            existingRecord?.peer?.avatar?.avatarBase64OrBytes
+                ?: cachedAvatarsByKey[mapKey]
+                ?: PeerAliasRegistry.resolveAliases(mapKey).firstNotNullOfOrNull { cachedAvatarsByKey[it] }
+        }
 
         val updatedPeer = NearbyPeer(
             id = mapKey,
@@ -383,6 +415,35 @@ class BleDiscoveryManager(
         maybeFetchAvatar(result.device, mapKey)
     }
 
+    fun invalidateAvatarCache(key: String) {
+        val aliases = (PeerAliasRegistry.resolveAliases(key) + key).filter { it.isNotBlank() }
+        aliases.forEach { alias ->
+            fetchedAvatarKeys.remove(alias)
+            cachedAvatarsByKey.remove(alias)
+            inFlightAvatarKeys.remove(alias)
+        }
+    }
+
+    fun forceRefreshAvatar(peerId: String, newVersionTag: String? = null) {
+        val record = peerMap[peerId] ?: peerMap.values.find {
+            it.peer.id.equals(peerId, ignoreCase = true) ||
+                it.peer.handle.equals(peerId, ignoreCase = true) ||
+                it.device.address.equals(peerId, ignoreCase = true)
+        } ?: return
+        val targetKey = peerMap.entries.find { it.value.peer.id == record.peer.id }?.key ?: record.peer.id
+        invalidateAvatarCache(targetKey)
+        if (newVersionTag != null) {
+            avatarVersionByKey[targetKey] = newVersionTag
+            PeerAliasRegistry.resolveAliases(targetKey).forEach { avatarVersionByKey[it] = newVersionTag }
+        }
+        maybeFetchAvatar(record.device, targetKey, force = true)
+    }
+
+    private fun computeAvatarDigest(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.take(4).joinToString("") { "%02X".format(it) }
+    }
+
     private fun isValidDecodedAvatar(bytes: ByteArray): Boolean {
         if (bytes.isEmpty()) return false
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -390,23 +451,40 @@ class BleDiscoveryManager(
         return opts.outWidth > 0 && opts.outHeight > 0
     }
 
-    private fun maybeFetchAvatar(device: BluetoothDevice, mapKey: String) {
+    private fun maybeFetchAvatar(device: BluetoothDevice, mapKey: String, force: Boolean = false) {
         val fetcher = onRequestAvatarFetch ?: run {
             LayoverFileLogger.logThrottled("no_fetcher_$mapKey", "Avatar fetcher callback is null for Key=$mapKey")
             return
         }
         val aliases = PeerAliasRegistry.resolveAliases(mapKey) + mapKey
-        val alreadyFetched = aliases.any { fetchedAvatarKeys.contains(it) } || cachedAvatarsByKey.containsKey(mapKey)
+        val now = System.currentTimeMillis()
+        val lastFetch = aliases.firstNotNullOfOrNull { lastAvatarFetchTimeByKey[it] } ?: 0L
+        val refreshDue = (now - lastFetch) >= 15_000L
+        val alreadyFetched = !force && !refreshDue && (aliases.any { fetchedAvatarKeys.contains(it) } || cachedAvatarsByKey.containsKey(mapKey))
         if (alreadyFetched || !inFlightAvatarKeys.add(mapKey)) return
 
-        LayoverFileLogger.log("Scheduling avatar fetch for Key=$mapKey, MAC=${device.address}")
+        if (isChatSessionActiveOrConnecting?.invoke(device, mapKey) == true) {
+            LayoverFileLogger.logThrottled("skip_avatar_gatt_$mapKey", "Skipping avatar GATT probe for Key=$mapKey (${device.address}): active or connecting chat GATT session in progress.")
+            return
+        }
+
+        lastAvatarFetchTimeByKey[mapKey] = now
+        aliases.forEach { lastAvatarFetchTimeByKey[it] = now }
+
+        LayoverFileLogger.log("Scheduling avatar fetch for Key=$mapKey, MAC=${device.address} (force=$force, refreshDue=$refreshDue)")
         fetcher(device, mapKey) { avatarBytes ->
             inFlightAvatarKeys.remove(mapKey)
             if (isValidDecodedAvatar(avatarBytes)) {
+                val newDigest = computeAvatarDigest(avatarBytes)
+                val prevDigest = aliases.firstNotNullOfOrNull { avatarVersionByKey[it] }
+                val digestChanged = prevDigest == null || !prevDigest.equals(newDigest, ignoreCase = true)
+
                 fetchedAvatarKeys.add(mapKey)
                 PeerAliasRegistry.resolveAliases(mapKey).forEach { fetchedAvatarKeys.add(it) }
                 cachedAvatarsByKey[mapKey] = avatarBytes
                 PeerAliasRegistry.resolveAliases(mapKey).forEach { cachedAvatarsByKey[it] = avatarBytes }
+                avatarVersionByKey[mapKey] = newDigest
+                PeerAliasRegistry.resolveAliases(mapKey).forEach { avatarVersionByKey[it] = newDigest }
 
                 val currentRecord = peerMap[mapKey] ?: peerMap.values.find {
                     it.peer.id.equals(mapKey, ignoreCase = true) ||
@@ -419,7 +497,7 @@ class BleDiscoveryManager(
                     )
                     peerMap[targetKey] = currentRecord.copy(peer = updatedPeer)
                     _discoveredPeers.value = peerMap.values.map { it.peer }
-                    LayoverFileLogger.log("Updated peer avatar in discovery list for Key=$mapKey (${avatarBytes.size} bytes)")
+                    LayoverFileLogger.log("Updated peer avatar in discovery list for Key=$mapKey (${avatarBytes.size} bytes, digest=$newDigest, changed=$digestChanged)")
                 }
             } else {
                 LayoverFileLogger.log("Avatar fetch returned invalid/undecodable image (${avatarBytes.size} bytes) for Key=$mapKey; not caching.")
@@ -446,6 +524,8 @@ class BleDiscoveryManager(
         fetchedAvatarKeys.clear()
         inFlightAvatarKeys.clear()
         cachedAvatarsByKey.clear()
+        avatarVersionByKey.clear()
+        lastAvatarFetchTimeByKey.clear()
         pruneJob?.cancel()
     }
 }

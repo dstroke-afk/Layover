@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
             runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
         }
         val savedResolutionLabel = prefs.getString("cropped_resolution", null)
-        val savedVisible = prefs.getBoolean("is_visible", true) && usernameAlreadySet
+        val savedVisible = usernameAlreadySet && prefs.getBoolean("is_visible", true)
         val initialProfile = UserProfile(
             displayName = savedName,
             handle = savedHandle,
@@ -399,6 +399,7 @@ class MainActivity : ComponentActivity() {
                 val navController = androidx.navigation.compose.rememberNavController()
 
                 if (!hasSetUsername) {
+                    LayoverFileLogger.log("Showing OneTimeUsernameDialog (username_set=false)")
                     OneTimeUsernameDialog(
                         onConfirmUsername = { chosenName, chosenGender ->
                             val cleanedName = chosenName.trim()
@@ -525,6 +526,11 @@ class MainActivity : ComponentActivity() {
                             }
                             newState.userProfile.croppedResolutionLabel?.let {
                                 editor.putString("cropped_resolution", it)
+                            }
+                            val avatarChanged = !oldProfile.compactTransferAvatarBytes.contentEquals(newState.userProfile.compactTransferAvatarBytes) ||
+                                !oldProfile.avatarBytes.contentEquals(newState.userProfile.avatarBytes)
+                            if (avatarChanged) {
+                                editor.putLong("avatar_updated_at", System.currentTimeMillis())
                             }
                             editor.apply()
 
