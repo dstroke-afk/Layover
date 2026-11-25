@@ -1,5 +1,7 @@
 package com.intj.layover.ui.screens
 
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,7 +18,10 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -102,6 +107,13 @@ fun ChatScreen(
         }
     }
 
+    val peerAvatarBytes = peer?.avatar?.avatarBase64OrBytes
+    val peerAvatarBitmap = remember(peerAvatarBytes) {
+        peerAvatarBytes?.takeIf { it.isNotEmpty() }?.let { bytes ->
+            runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }.getOrNull()
+        }
+    }
+
     LaunchedEffect(peerId, isChatLocked) {
         if (!isChatLocked) {
             delay(100)
@@ -141,6 +153,7 @@ fun ChatScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .statusBarsPadding()
                 .padding(16.dp)
                 .navigationBarsPadding()
                 .imePadding()
@@ -172,12 +185,24 @@ fun ChatScreen(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = resolvedInitials,
-                        fontWeight = FontWeight.Bold,
-                        color = if (isChatLocked) greyDisabledText else CyanPrimary,
-                        fontSize = 15.sp
-                    )
+                    if (peerAvatarBitmap != null) {
+                        Image(
+                            bitmap = peerAvatarBitmap.asImageBitmap(),
+                            contentDescription = "$resolvedName profile picture",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(CircleShape)
+                                .alpha(if (isChatLocked) 0.5f else 1f)
+                        )
+                    } else {
+                        Text(
+                            text = resolvedInitials,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isChatLocked) greyDisabledText else CyanPrimary,
+                            fontSize = 15.sp
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.width(12.dp))
