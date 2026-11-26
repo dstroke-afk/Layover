@@ -1,20 +1,31 @@
 package com.intj.layover.ui.screens
 
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.util.Log
+import android.view.Gravity
+import android.view.WindowManager
+import androidx.core.graphics.drawable.toDrawable
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -22,8 +33,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -33,20 +42,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
-import android.content.Intent
-import android.net.Uri
-import android.provider.Settings
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.WifiOff
-import androidx.compose.ui.platform.LocalContext
-import com.intj.layover.ble.BlePermissionHelper
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -57,6 +57,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -68,14 +69,24 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
+import com.intj.layover.R
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.ui.theme.LayoverTheme
-import kotlinx.coroutines.delay
 
 private const val TAG = "LayoverChatTrace"
 
@@ -109,16 +120,28 @@ fun ChatScreen(
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
-    val context = LocalContext.current
-    val hasWifiPerm = remember(showAttachmentSheet) {
-        BlePermissionHelper.hasWifiHotspotPermissions(context)
-    }
+    val density = LocalDensity.current
+    val isInspectionMode = LocalInspectionMode.current
+    val imeBottomPx = WindowInsets.ime.getBottom(density)
+    val inputInteractionSource = remember { MutableInteractionSource() }
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         showAttachmentSheet = false
         if (uri != null) {
             onSendPhotoUri(uri)
+        }
+    }
+
+    BackHandler(enabled = showAttachmentSheet) {
+        showAttachmentSheet = false
+    }
+
+    LaunchedEffect(inputInteractionSource) {
+        inputInteractionSource.interactions.collect { interaction ->
+            if (interaction is PressInteraction.Release) {
+                showAttachmentSheet = false
+            }
         }
     }
     chatTrace("ChatScreen:STATE_INIT", "inputLen=${inputText.length}, replyingTo=${replyingToMessage?.id}, showChatMenu=$showChatMenu")
@@ -439,222 +462,309 @@ fun ChatScreen(
                 }
             }
 
-            // Attachment Bottom Overlay Sheet (over lower/keyboard area)
-            if (showAttachmentSheet && !isChatLocked) {
-                Surface(
+            // Input Bar (perceptually matched lighter slate grey in white theme so it matches the black theme's visual appearance)
+            val canSend = !isChatLocked && inputText.isNotBlank()
+            chatTrace("ChatScreen:INPUT_BAR_EVAL", "canSend=$canSend, isChatLocked=$isChatLocked, inputLen=${inputText.length}")
+            val idleInputSurface = if (colors.isDark) Color(0xFF4A5260) else Color(0xFF6B7585)
+            val idleInputBorder = if (colors.isDark) Color(0xFF6B768A) else Color(0xFF8A96A8)
+            val idleSendSurface = if (colors.isDark) Color(0xFF28303D) else Color(0xFF465060)
+            LayoverTheme(darkTheme = true) {
+                val inputBarColors = LayoverTheme.colors
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                        .border(1.dp, colors.cyanPrimary, RoundedCornerShape(16.dp)),
-                    color = colors.cardSurface,
-                    shape = RoundedCornerShape(16.dp)
+                        .padding(top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(14.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    OutlinedTextField(
+                        value = if (isChatLocked) "" else inputText,
+                        onValueChange = { newVal ->
+                            chatTrace("InputField:VALUE_CHANGE", "locked=$isChatLocked, newLen=${newVal.length}")
+                            if (!isChatLocked) {
+                                showAttachmentSheet = false
+                                inputText = newVal
+                            }
+                        },
+                        placeholder = {
                             Text(
-                                text = "Attachments",
-                                color = colors.cyanAccent,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold
+                                text = inputPlaceholderText,
+                                color = if (isChatLocked) greyDisabledText else Color.White.copy(alpha = 0.72f),
+                                fontSize = 15.sp
                             )
+                        },
+                        trailingIcon = {
                             IconButton(
-                                onClick = { showAttachmentSheet = false },
-                                modifier = Modifier.size(28.dp)
+                                onClick = {
+                                    if (!isChatLocked) {
+                                        showAttachmentSheet = !showAttachmentSheet
+                                    }
+                                },
+                                enabled = !isChatLocked,
+                                modifier = Modifier.padding(end = 4.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Close attachments",
-                                    tint = colors.mutedText,
-                                    modifier = Modifier.size(16.dp)
+                                    imageVector = Icons.Default.AttachFile,
+                                    contentDescription = "Attach photo",
+                                    tint = if (isChatLocked) greyDisabledText else inputBarColors.cyanPrimary
                                 )
                             }
+                        },
+                        interactionSource = inputInteractionSource,
+                        enabled = !isChatLocked,
+                        modifier = Modifier
+                            .weight(1f)
+                            .focusRequester(focusRequester),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = idleInputSurface,
+                            unfocusedContainerColor = idleInputSurface,
+                            disabledContainerColor = greyDisabledFill,
+                            focusedBorderColor = inputBarColors.cyanPrimary,
+                            unfocusedBorderColor = idleInputBorder,
+                            disabledBorderColor = greyDisabledBorder,
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            cursorColor = Color.White,
+                            disabledTextColor = greyDisabledText,
+                            disabledPlaceholderColor = greyDisabledText
+                        ),
+                        shape = RoundedCornerShape(24.dp),
+                        maxLines = 4
+                    )
+
+                    Spacer(modifier = Modifier.width(10.dp))
+
+                    Surface(
+                        modifier = Modifier
+                            .size(50.dp)
+                            .clip(CircleShape)
+                            .clickable(enabled = canSend) {
+                                chatTrace("SendButton:CLICK", "canSend=$canSend, trimmedLen=${inputText.trim().length}, replyId=${replyingToMessage?.id}")
+                                if (canSend) {
+                                    val trimmed = inputText.trim()
+                                    val replyText = replyingToMessage?.text
+                                    chatTrace("SendButton:DISPATCH", "sending len=${trimmed.length}, hasReply=${replyText != null}")
+                                    onSendMessage(trimmed, replyText)
+                                    inputText = ""
+                                    replyingToMessage = null
+                                    showAttachmentSheet = false
+                                    chatTrace("SendButton:RESET_STATE", "cleared inputText and replyingToMessage")
+                                }
+                            },
+                        color = when {
+                            isChatLocked -> greyDisabledFill
+                            canSend -> inputBarColors.cyanPrimary
+                            else -> idleSendSurface
                         }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        if (hasWifiPerm) {
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        photoPickerLauncher.launch(arrayOf("image/*"))
-                                    },
-                                color = colors.incomingBubble,
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Image,
-                                        contentDescription = null,
-                                        tint = colors.cyanPrimary,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text(
-                                        text = "Upload a photo",
-                                        color = colors.lightText,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-                        } else {
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        showAttachmentSheet = false
-                                        val intent = Intent(
-                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                            Uri.fromParts("package", context.packageName, null)
-                                        ).apply {
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        }
-                                        context.startActivity(intent)
-                                    },
-                                color = colors.darkBackground,
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 14.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.WifiOff,
-                                        contentDescription = null,
-                                        tint = colors.cyanPrimary,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Text(
-                                        text = "To display profile picture / attach photos, the app needs Wi-Fi / necessary permissions - click to allow",
-                                        color = colors.lightText,
-                                        fontSize = 12.sp,
-                                        lineHeight = 16.sp,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                }
-                            }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send",
+                                tint = when {
+                                    isChatLocked -> greyDisabledText
+                                    canSend -> inputBarColors.darkBackground
+                                    else -> inputBarColors.mutedText
+                                },
+                                modifier = Modifier.size(22.dp)
+                            )
                         }
                     }
                 }
             }
 
-            // Input Bar
-            val canSend = !isChatLocked && inputText.isNotBlank()
-            chatTrace("ChatScreen:INPUT_BAR_EVAL", "canSend=$canSend, isChatLocked=$isChatLocked, inputLen=${inputText.length}")
-            val idleInputSurface = Color(0xFF4A5260)
-            val idleInputBorder = Color(0xFF6B768A)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp, bottom = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = {
-                        if (!isChatLocked) {
-                            showAttachmentSheet = !showAttachmentSheet
-                        }
-                    },
-                    enabled = !isChatLocked
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.AttachFile,
-                        contentDescription = "Attach photo",
-                        tint = if (isChatLocked) greyDisabledText else colors.cyanPrimary
-                    )
-                }
-
-                OutlinedTextField(
-                    value = if (isChatLocked) "" else inputText,
-                    onValueChange = { newVal ->
-                        chatTrace("InputField:VALUE_CHANGE", "locked=$isChatLocked, newLen=${newVal.length}")
-                        if (!isChatLocked) inputText = newVal
-                    },
-                    placeholder = {
-                        Text(
-                            text = inputPlaceholderText,
-                            color = if (isChatLocked) greyDisabledText else Color.White.copy(alpha = 0.72f),
-                            fontSize = 15.sp
-                        )
-                    },
-                    enabled = !isChatLocked,
+            // Inline bottom overflow panel when the software keyboard is not currently visible
+            if (showAttachmentSheet && !isChatLocked && (imeBottomPx == 0 || isInspectionMode)) {
+                ClippyPhotoOverflowCard(
+                    onAddPhotosClick = { photoPickerLauncher.launch(arrayOf("image/*")) },
                     modifier = Modifier
-                        .weight(1f)
-                        .focusRequester(focusRequester),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedContainerColor = idleInputSurface,
-                        unfocusedContainerColor = idleInputSurface,
-                        disabledContainerColor = greyDisabledFill,
-                        focusedBorderColor = colors.cyanPrimary,
-                        unfocusedBorderColor = idleInputBorder,
-                        disabledBorderColor = greyDisabledBorder,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        cursorColor = Color.White,
-                        disabledTextColor = greyDisabledText,
-                        disabledPlaceholderColor = greyDisabledText
-                    ),
-                    shape = RoundedCornerShape(24.dp),
-                    maxLines = 4
+                        .fillMaxWidth()
+                        .padding(top = 6.dp, bottom = 4.dp)
+                        .height(220.dp)
                 )
-
-                Spacer(modifier = Modifier.width(10.dp))
-
-                Surface(
-                    modifier = Modifier
-                        .size(50.dp)
-                        .clip(CircleShape)
-                        .clickable(enabled = canSend) {
-                            chatTrace("SendButton:CLICK", "canSend=$canSend, trimmedLen=${inputText.trim().length}, replyId=${replyingToMessage?.id}")
-                            if (canSend) {
-                                val trimmed = inputText.trim()
-                                val replyText = replyingToMessage?.text
-                                chatTrace("SendButton:DISPATCH", "sending len=${trimmed.length}, hasReply=${replyText != null}")
-                                onSendMessage(trimmed, replyText)
-                                inputText = ""
-                                replyingToMessage = null
-                                chatTrace("SendButton:RESET_STATE", "cleared inputText and replyingToMessage")
-                            }
-                        },
-                    color = when {
-                        isChatLocked -> greyDisabledFill
-                        canSend -> colors.cyanPrimary
-                        else -> Color(0xFF28303D)
-                    }
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = "Send",
-                            tint = when {
-                                isChatLocked -> greyDisabledText
-                                canSend -> colors.darkBackground
-                                else -> colors.mutedText
-                            },
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                }
             }
             }
         }
+
+        // Semi-transparent keyboard overlay when the software keyboard is visible
+        if (showAttachmentSheet && !isChatLocked && imeBottomPx > 0 && !isInspectionMode) {
+            KeyboardPhotoOverflowWindow(
+                imeHeightPx = imeBottomPx,
+                onDismissRequest = { showAttachmentSheet = false },
+                onAddPhotosClick = { photoPickerLauncher.launch(arrayOf("image/*")) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun KeyboardPhotoOverflowWindow(
+    imeHeightPx: Int,
+    onDismissRequest: () -> Unit,
+    onAddPhotosClick: () -> Unit
+) {
+    val density = LocalDensity.current
+    val imeHeightDp = with(density) { imeHeightPx.toDp() }
+
+    Dialog(
+        onDismissRequest = onDismissRequest,
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false
+        )
+    ) {
+        val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+        SideEffect {
+            dialogWindow?.apply {
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                addFlags(
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                )
+                setBackgroundDrawable(android.graphics.Color.TRANSPARENT.toDrawable())
+                setGravity(Gravity.BOTTOM)
+                setWindowAnimations(0)
+                setLayout(WindowManager.LayoutParams.MATCH_PARENT, imeHeightPx)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(imeHeightDp)
+                .padding(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+            ClippyPhotoOverflowCard(
+                onAddPhotosClick = onAddPhotosClick,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+@Composable
+private fun ClippyPhotoOverflowCard(
+    onAddPhotosClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val colors = LayoverTheme.colors
+    val cardShape = RoundedCornerShape(16.dp)
+    val overlayAlpha = if (colors.isDark) 0.76f else 0.80f
+    Box(
+        modifier = modifier
+            .clip(cardShape)
+            .background(colors.cardSurface.copy(alpha = overlayAlpha))
+            .border(1.dp, colors.cyanPrimary.copy(alpha = 0.65f), cardShape)
+            .clickable { onAddPhotosClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(16.dp)
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.img_add_photos_sunrise),
+                contentDescription = "Add Photos",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(96.dp)
+                    .clip(RoundedCornerShape(12.dp))
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+            Text(
+                text = "Click to add Photos",
+                color = colors.lightText,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Preview(showBackground = true, widthDp = 380, heightDp = 760)
+@Composable
+private fun ChatScreenClippyPreview() {
+    LayoverTheme(darkTheme = true) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(LayoverTheme.colors.darkBackground)
+                .padding(12.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = "",
+                        onValueChange = {},
+                        placeholder = { Text("Type encrypted message...", color = Color.White.copy(alpha = 0.72f)) },
+                        trailingIcon = {
+                            IconButton(onClick = {}, modifier = Modifier.padding(end = 4.dp)) {
+                                Icon(
+                                    imageVector = Icons.Default.AttachFile,
+                                    contentDescription = "Attach photo",
+                                    tint = LayoverTheme.colors.cyanPrimary
+                                )
+                            }
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = Color(0xFF4A5260),
+                            unfocusedContainerColor = Color(0xFF4A5260),
+                            unfocusedBorderColor = Color(0xFF6B768A)
+                        ),
+                        shape = RoundedCornerShape(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Surface(
+                        modifier = Modifier
+                            .size(50.dp)
+                            .clip(CircleShape),
+                        color = Color(0xFF28303D)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send",
+                                tint = LayoverTheme.colors.mutedText,
+                                modifier = Modifier.size(22.dp)
+                            )
+                        }
+                    }
+                }
+                ClippyPhotoOverflowCard(
+                    onAddPhotosClick = {},
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
+                        .height(220.dp)
+                )
+            }
+        }
+    }
+}
+
+@Preview(showBackground = true, widthDp = 380, heightDp = 760)
+@Composable
+private fun ChatScreenLightInputBarPreview() {
+    LayoverTheme(darkTheme = false) {
+        ChatScreen(
+            peer = NearbyPeer(id = "peer_1", displayName = "Balaji", handle = "balaji"),
+            messages = emptyList(),
+            onSendMessage = { _, _ -> },
+            onToggleBlockPeer = {},
+            onToggleMutePeer = {},
+            onNavigateBack = {}
+        )
     }
 }
 
