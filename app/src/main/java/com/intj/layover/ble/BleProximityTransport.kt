@@ -11,6 +11,7 @@ import com.intj.layover.crypto.SessionCryptoManager
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.diagnostics.SessionDiagnosticsTracker
 import com.intj.layover.model.ChatMessage
+import com.intj.layover.model.GenderOption
 import com.intj.layover.model.ProximityTransport
 import com.intj.layover.model.UserProfile
 import com.intj.layover.p2p.RfcommConnectionState
@@ -112,6 +113,36 @@ class BleProximityTransport(
     private val _incomingPeerBlockStateFlow = MutableSharedFlow<Pair<String, Boolean>>()
     val incomingPeerBlockStateFlow: SharedFlow<Pair<String, Boolean>> = _incomingPeerBlockStateFlow.asSharedFlow()
 
+    private val _incomingProfileSyncFlow = MutableSharedFlow<WireFrame.ProfileSync>()
+    val incomingProfileSyncFlow: SharedFlow<WireFrame.ProfileSync> = _incomingProfileSyncFlow.asSharedFlow()
+
+    var onPeerProfileUpdated: ((
+        peerId: String,
+        displayName: String?,
+        gender: GenderOption,
+        age: Int?,
+        avatarBytes: ByteArray?
+    ) -> Unit)? = null
+
+    fun sendProfileSync(targetPeerId: String? = null) {
+        val localId = currentUserProfile.handle.ifEmpty { "user" }
+        val compactBytes = currentUserProfile.compactTransferAvatarBytes ?: currentUserProfile.avatarBytes
+        val frame = WireFrameCodec.encodeProfileSync(
+            senderId = localId,
+            displayName = currentUserProfile.displayName,
+            gender = currentUserProfile.gender,
+            age = currentUserProfile.age,
+            compactAvatarBytes = compactBytes
+        )
+        if (targetPeerId != null && targetPeerId.isNotBlank()) {
+            activePeerId = targetPeerId
+        }
+        val sent = gattSessionManager.sendFrame(frame)
+        if (sent) {
+            diagnosticsTracker.incrementMessagesSent()
+        }
+    }
+
     private var activePeerId: String? = null
     private var lastGattMac: String? = null
 
@@ -209,6 +240,7 @@ class BleProximityTransport(
                     is WireFrame.ConnectionRequest -> frame.senderId
                     is WireFrame.ConnectionAccept -> frame.senderId
                     is WireFrame.ConnectionDecline -> frame.senderId
+                    is WireFrame.ProfileSync -> frame.senderId
                     is WireFrame.PeerBlockState -> frame.senderId
                     is WireFrame.ChatEncrypted -> frame.senderId
                 }
@@ -245,6 +277,7 @@ class BleProximityTransport(
                         frame is WireFrame.ConnectionRequest ||
                         frame is WireFrame.ConnectionAccept ||
                         frame is WireFrame.ConnectionDecline ||
+                        frame is WireFrame.ProfileSync ||
                         frame is WireFrame.PeerBlockState
 
                 if (!isControlFrame && !rateLimiter.allowMessage(currentPeer)) {
@@ -272,13 +305,14 @@ class BleProximityTransport(
                         )
                         LayoverFileLogger.log("KeyExchange establishRemoteKey success=$success for peer=${frame.senderId}")
 
-                        if (sessionCryptoManager.getLocalPublicKeyBase64() != null && success) {
+                        if (sessionCryptoManager.getLocalPublicKeyBase64() != null && success && !frame.isResponse) {
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
                             val localId = currentUserProfile.handle.ifEmpty { "local" }
                             val responsePayload = WireFrameCodec.encodeKeyExchange(
                                 senderId = localId,
                                 publicKeyBase64 = localPub,
-                                algorithm = sessionCryptoManager.getAlgorithmName()
+                                algorithm = sessionCryptoManager.getAlgorithmName(),
+                                isResponse = true
                             )
                             hasSentKeyExchange = true
                             LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId} (algo=${sessionCryptoManager.getAlgorithmName()})...")
@@ -303,8 +337,33 @@ class BleProximityTransport(
                         if (frame.senderId.isNotEmpty()) {
                             activePeerId = frame.senderId
                         }
-                        LayoverFileLogger.log("Received ConnectionRequest from ${frame.senderId} (${frame.displayName})")
+                        onPeerProfileUpdated?.invoke(
+                            frame.senderId,
+                            frame.displayName,
+                            frame.gender,
+                            frame.age,
+                            null
+                        )
+                        LayoverFileLogger.log("Received ConnectionRequest from ${frame.senderId} (${frame.displayName}, age=${frame.age})")
                         _incomingConnectionRequestFlow.emit(Pair(frame.senderId, frame.displayName))
+                    }
+
+                    is WireFrame.ProfileSync -> {
+                        if (frame.senderId.isNotEmpty()) {
+                            activePeerId = frame.senderId
+                        }
+                        val decodedAvatar = frame.compactAvatarBase64
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { b64 -> runCatching { Base64.decode(b64, Base64.NO_WRAP) }.getOrNull() }
+                        onPeerProfileUpdated?.invoke(
+                            frame.senderId,
+                            frame.displayName,
+                            frame.gender,
+                            frame.age,
+                            decodedAvatar
+                        )
+                        LayoverFileLogger.log("Received ProfileSync from ${frame.senderId}: age=${frame.age}, gender=${frame.gender}")
+                        _incomingProfileSyncFlow.emit(frame)
                     }
 
                     is WireFrame.ConnectionAccept -> {
@@ -499,9 +558,12 @@ class BleProximityTransport(
         val localName = currentUserProfile.displayName.ifEmpty { "Layover User" }
         val reqFrame = WireFrameCodec.encodeConnectionRequest(
             senderId = currentUserProfile.handle.ifEmpty { "user" },
-            displayName = localName
+            displayName = localName,
+            gender = currentUserProfile.gender,
+            age = currentUserProfile.age
         )
         gattSessionManager.sendFrame(reqFrame)
+        sendProfileSync(peerId)
     }
 
     override fun acceptConnectionRequest(peerId: String) {
@@ -517,6 +579,7 @@ class BleProximityTransport(
             senderId = currentUserProfile.handle.ifEmpty { "user" }
         )
         gattSessionManager.sendFrame(acceptFrame)
+        sendProfileSync(peerId)
     }
 
     override fun declineConnectionRequest(peerId: String) {

@@ -75,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
         LayoverFileLogger.log("MainActivity.onCreate: initializing profile prefs and BLE stack.")
         Log.d(TAG, "MainActivity.onCreate called; savedInstanceStateNull=${savedInstanceState == null}")

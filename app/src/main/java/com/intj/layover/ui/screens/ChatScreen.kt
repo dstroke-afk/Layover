@@ -15,16 +15,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.union
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.ui.graphics.asImageBitmap
@@ -41,7 +36,17 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.WifiOff
+import androidx.compose.ui.platform.LocalContext
+import com.intj.layover.ble.BlePermissionHelper
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -94,6 +99,7 @@ fun ChatScreen(
     onToggleBlockPeer: (String) -> Unit,
     onToggleMutePeer: (String) -> Unit,
     onOpenPeerProfile: (String) -> Unit = {},
+    onSendPhotoUri: (Uri) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     chatTrace("ChatScreen:ENTRY", "peerId=${peer?.id ?: "null"}, messagesCount=${messages.size}, isBlocked=$isBlocked, isBlockedByPeer=$isBlockedByPeer, isMuted=$isMuted")
@@ -102,6 +108,19 @@ fun ChatScreen(
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
+    var showAttachmentSheet by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val hasWifiPerm = remember(showAttachmentSheet) {
+        BlePermissionHelper.hasWifiHotspotPermissions(context)
+    }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        showAttachmentSheet = false
+        if (uri != null) {
+            onSendPhotoUri(uri)
+        }
+    }
     chatTrace("ChatScreen:STATE_INIT", "inputLen=${inputText.length}, replyingTo=${replyingToMessage?.id}, showChatMenu=$showChatMenu")
 
     val listState = rememberLazyListState()
@@ -134,29 +153,23 @@ fun ChatScreen(
     }
     chatTrace("ChatScreen:AVATAR_DECODE", "avatarBytesLen=${peerAvatarBytes?.size ?: 0}, bitmapDecoded=${peerAvatarBitmap != null}")
 
-    LaunchedEffect(peerId, isChatLocked) {
-        chatTrace("LaunchedEffect(peerId,isChatLocked):START", "peerId=$peerId, isChatLocked=$isChatLocked")
-        if (!isChatLocked) {
-            chatTrace("LaunchedEffect(peerId,isChatLocked):DELAY_BEFORE_FOCUS", "waiting 100ms")
-            delay(100)
-            val reqResult = runCatching { focusRequester.requestFocus() }
-            chatTrace("LaunchedEffect(peerId,isChatLocked):FOCUS_REQUEST", "success=${reqResult.isSuccess}, err=${reqResult.exceptionOrNull()?.message}")
-            val showResult = runCatching { keyboardController?.show() }
-            chatTrace("LaunchedEffect(peerId,isChatLocked):KEYBOARD_SHOW", "controllerNull=${keyboardController == null}, success=${showResult.isSuccess}, err=${showResult.exceptionOrNull()?.message}")
-        } else {
-            chatTrace("LaunchedEffect(peerId,isChatLocked):LOCKED_HIDE_KEYBOARD", "hiding keyboard")
+    LaunchedEffect(isChatLocked) {
+        chatTrace("LaunchedEffect(isChatLocked):START", "isChatLocked=$isChatLocked")
+        if (isChatLocked) {
+            chatTrace("LaunchedEffect(isChatLocked):LOCKED_HIDE_KEYBOARD", "hiding keyboard")
             val hideResult = runCatching { keyboardController?.hide() }
-            chatTrace("LaunchedEffect(peerId,isChatLocked):KEYBOARD_HIDE_DONE", "success=${hideResult.isSuccess}")
+            chatTrace("LaunchedEffect(isChatLocked):KEYBOARD_HIDE_DONE", "success=${hideResult.isSuccess}")
         }
-        chatTrace("LaunchedEffect(peerId,isChatLocked):END", "peerId=$peerId, isChatLocked=$isChatLocked")
+        chatTrace("LaunchedEffect(isChatLocked):END", "isChatLocked=$isChatLocked")
     }
 
     val latestMessageId = messages.lastOrNull()?.id
     LaunchedEffect(messages.size, latestMessageId) {
         chatTrace("LaunchedEffect(messages):START", "messagesSize=${messages.size}, latestMessageId=$latestMessageId")
         if (messages.isNotEmpty()) {
-            chatTrace("LaunchedEffect(messages):SCROLL_TO_ZERO", "animating listState to index=0")
-            listState.animateScrollToItem(index = 0)
+            val targetIdx = (messages.size - 1).coerceAtLeast(0)
+            chatTrace("LaunchedEffect(messages):SCROLL_TO_BOTTOM", "snapping listState to index=$targetIdx")
+            listState.scrollToItem(index = targetIdx)
             chatTrace("LaunchedEffect(messages):SCROLL_DONE", "firstVisibleItemIndex=${listState.firstVisibleItemIndex}")
         }
     }
@@ -184,14 +197,13 @@ fun ChatScreen(
             .fillMaxSize()
             .background(colors.darkBackground)
     ) {
-        chatTrace("ChatScreen:RENDER_ROOT_COLUMN", "applying statusBarsPadding + padding + WindowInsets.ime")
+        chatTrace("ChatScreen:RENDER_ROOT_COLUMN", "pinning header to top and applying nav+ime insets to bottom bar")
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
-                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                 .padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
+            Box(modifier = Modifier.statusBarsPadding().padding(top = 4.dp)) {
             // Header Card with display picture and display name (clickable to view read-only peer profile)
             val headerCardShape = RoundedCornerShape(16.dp)
             Surface(
@@ -318,22 +330,23 @@ fun ChatScreen(
                 }
                 }
             }
+            }
 
             Spacer(modifier = Modifier.height(6.dp))
 
             // Messages List (greyed out when chat is locked)
-            chatTrace("ChatScreen:LAZY_COLUMN", "count=${messages.size}, reverseLayout=true, locked=$isChatLocked")
+            chatTrace("ChatScreen:LAZY_COLUMN", "count=${messages.size}, reverseLayout=false, locked=$isChatLocked")
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
                     .alpha(if (isChatLocked) 0.45f else 1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Bottom),
                 contentPadding = PaddingValues(vertical = 8.dp),
-                reverseLayout = true
+                reverseLayout = false
             ) {
-                items(messages.reversed(), key = { it.id }) { msg ->
+                items(messages, key = { it.id }) { msg ->
                     chatTrace("ChatScreen:LAZY_ITEM", "msgId=${msg.id}, isOutgoing=${msg.isOutgoing}")
                     ChatMessageBubble(
                         message = msg,
@@ -347,6 +360,12 @@ fun ChatScreen(
                 }
             }
 
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
+            ) {
             if (isBlockedByPeer) {
                 Surface(
                     modifier = Modifier
@@ -420,6 +439,122 @@ fun ChatScreen(
                 }
             }
 
+            // Attachment Bottom Overlay Sheet (over lower/keyboard area)
+            if (showAttachmentSheet && !isChatLocked) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp)
+                        .border(1.dp, colors.cyanPrimary, RoundedCornerShape(16.dp)),
+                    color = colors.cardSurface,
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Attachments",
+                                color = colors.cyanAccent,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            IconButton(
+                                onClick = { showAttachmentSheet = false },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Close attachments",
+                                    tint = colors.mutedText,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        if (hasWifiPerm) {
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        photoPickerLauncher.launch(arrayOf("image/*"))
+                                    },
+                                color = colors.incomingBubble,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Image,
+                                        contentDescription = null,
+                                        tint = colors.cyanPrimary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "Upload a photo",
+                                        color = colors.lightText,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        } else {
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        showAttachmentSheet = false
+                                        val intent = Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null)
+                                        ).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        context.startActivity(intent)
+                                    },
+                                color = colors.darkBackground,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.WifiOff,
+                                        contentDescription = null,
+                                        tint = colors.cyanPrimary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = "To display profile picture / attach photos, the app needs Wi-Fi / necessary permissions - click to allow",
+                                        color = colors.lightText,
+                                        fontSize = 12.sp,
+                                        lineHeight = 16.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Input Bar
             val canSend = !isChatLocked && inputText.isNotBlank()
             chatTrace("ChatScreen:INPUT_BAR_EVAL", "canSend=$canSend, isChatLocked=$isChatLocked, inputLen=${inputText.length}")
@@ -431,6 +566,21 @@ fun ChatScreen(
                     .padding(top = 4.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(
+                    onClick = {
+                        if (!isChatLocked) {
+                            showAttachmentSheet = !showAttachmentSheet
+                        }
+                    },
+                    enabled = !isChatLocked
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AttachFile,
+                        contentDescription = "Attach photo",
+                        tint = if (isChatLocked) greyDisabledText else colors.cyanPrimary
+                    )
+                }
+
                 OutlinedTextField(
                     value = if (isChatLocked) "" else inputText,
                     onValueChange = { newVal ->
@@ -503,6 +653,7 @@ fun ChatScreen(
                     }
                 }
             }
+            }
         }
     }
 }
@@ -533,6 +684,7 @@ fun ChatMessageBubble(
             modifier = Modifier
                 .widthIn(min = 72.dp, max = 280.dp)
                 .border(1.dp, colors.cyanPrimary, bubbleShape)
+                .clickable { onReply() }
         ) {
             Column(
                 modifier = Modifier.padding(12.dp)

@@ -83,6 +83,7 @@ data class NearbyPeer(
     val id: String,
     val displayName: String,
     val handle: String = "",
+    val gender: GenderOption = GenderOption.MALE,
     val age: Int? = null,
     val status: ConnectionStatus = ConnectionStatus.NONE,
     val avatar: PeerAvatar = PeerAvatar(
@@ -166,21 +167,29 @@ val SampleMockPeers = listOf(
     NearbyPeer(
         id = "peer_1",
         displayName = "Alex Rivera",
+        gender = GenderOption.MALE,
+        age = 28,
         status = ConnectionStatus.ACCEPTED
     ),
     NearbyPeer(
         id = "peer_2",
         displayName = "Sarah Chen",
+        gender = GenderOption.FEMALE,
+        age = 26,
         status = ConnectionStatus.REQUESTED
     ),
     NearbyPeer(
         id = "peer_3",
         displayName = "David Kim",
+        gender = GenderOption.MALE,
+        age = 31,
         status = ConnectionStatus.NONE
     ),
     NearbyPeer(
         id = "peer_4",
         displayName = "Elena Rostova",
+        gender = GenderOption.FEMALE,
+        age = 29,
         status = ConnectionStatus.ACCEPTED
     )
 )
