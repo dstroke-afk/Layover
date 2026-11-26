@@ -224,16 +224,18 @@ class MainActivity : ComponentActivity() {
                             existing != null && existing.avatar.avatarBase64OrBytes != null -> existing.avatar
                             else -> discovered.avatar
                         }
+                        val resolvedAge = discovered.age ?: existing?.age
                         if (existing != null && existing.status != ConnectionStatus.NONE) {
                             discovered.copy(
                                 id = existing.id,
                                 handle = existing.handle.ifEmpty { discovered.handle },
                                 displayName = discovered.displayName.ifBlank { existing.displayName },
+                                age = resolvedAge,
                                 status = existing.status,
                                 avatar = resolvedAvatar
                             )
                         } else {
-                            discovered.copy(avatar = resolvedAvatar)
+                            discovered.copy(age = resolvedAge, avatar = resolvedAvatar)
                         }
                     }
                 uiState = uiState.copy(nearbyPeers = merged)
@@ -515,22 +517,24 @@ class MainActivity : ComponentActivity() {
                         "Showing OneTimeUsernameDialog (username_set=false, initialFlowDone=$hasCompletedInitialPermissionFlow)"
                     )
                     OneTimeUsernameDialog(
-                        onConfirmUsername = { chosenName, chosenGender ->
+                        onConfirmUsername = { chosenName, chosenGender, chosenAge ->
                             val cleanedName = chosenName.trim()
                             val visiblePref = prefs.getBoolean("is_visible", true)
                             val updatedProfile = uiState.userProfile.copy(
                                 displayName = cleanedName,
                                 gender = chosenGender,
+                                age = chosenAge,
                                 isVisibleToNearby = visiblePref
                             )
                             prefs.edit()
                                 .putString("display_name", cleanedName)
                                 .putString("gender", chosenGender.name)
+                                .putInt("age", chosenAge)
                                 .putBoolean("username_set", true)
                                 .putBoolean("initial_permission_flow_done", true)
                                 .apply()
-                            LayoverFileLogger.log("Confirmed profile: name=$cleanedName, gender=${chosenGender.name}, visible=$visiblePref")
-                            Log.d(TAG, "Confirmed profile: name=$cleanedName, gender=${chosenGender.name}")
+                            LayoverFileLogger.log("Confirmed profile: name=$cleanedName, gender=${chosenGender.name}, age=$chosenAge, visible=$visiblePref")
+                            Log.d(TAG, "Confirmed profile: name=$cleanedName, gender=${chosenGender.name}, age=$chosenAge")
                             bleTransport.updateProfile(updatedProfile)
                             uiState = uiState.copy(userProfile = updatedProfile)
                             hasSetUsername = true

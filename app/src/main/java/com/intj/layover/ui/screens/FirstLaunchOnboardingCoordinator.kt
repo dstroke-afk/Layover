@@ -63,8 +63,8 @@ fun FirstLaunchOnboardingCoordinator(
 
     if (showProfileDialog && !isProfileConfigured) {
         OneTimeUsernameDialog(
-            onConfirmUsername = { username, gender ->
-                onConfirmUsername(username, gender)
+            onConfirmUsername = { chosenName, chosenGender, chosenAge ->
+                val cleanedName = chosenName.trim()
                 showProfileDialog = false
             }
         )

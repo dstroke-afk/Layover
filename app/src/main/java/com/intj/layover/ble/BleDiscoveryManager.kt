@@ -178,7 +178,8 @@ class BleDiscoveryManager(
         val payload = LayoverBlePayloadEncoder.encodePayload(
             displayName = userProfile.displayName,
             isVisible = userProfile.isVisibleToNearby,
-            handleOrDeviceId = userProfile.handle
+            handleOrDeviceId = userProfile.handle,
+            age = userProfile.age
         )
 
         val advertiseData = AdvertiseData.Builder()
@@ -375,10 +376,13 @@ class BleDiscoveryManager(
                 ?: PeerAliasRegistry.resolveAliases(mapKey).firstNotNullOfOrNull { cachedAvatarsByKey[it] }
         }
 
+        val resolvedAge = payload?.age ?: existingRecord?.peer?.age
+
         val updatedPeer = NearbyPeer(
             id = mapKey,
             displayName = fallbackName,
             handle = mapKey,
+            age = resolvedAge,
             status = currentStatus,
             avatar = PeerAvatar(
                 peerId = mapKey,

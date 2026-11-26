@@ -113,6 +113,7 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
             val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
             val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
             val bestName = if (p.displayName.isNotBlank()) p.displayName else existing.displayName
+            val bestAge = p.age ?: existing.age
             val bestAvatar = when {
                 p.avatar.avatarBase64OrBytes != null -> p.avatar
                 existing.avatar.avatarBase64OrBytes != null -> existing.avatar
@@ -123,6 +124,7 @@ fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
                 id = bestId,
                 handle = bestHandle,
                 displayName = bestName,
+                age = bestAge,
                 status = bestStatus,
                 avatar = bestAvatar
             )
@@ -658,20 +660,33 @@ fun PeerListItemCard(
 
 @Composable
 fun OneTimeUsernameDialog(
-    onConfirmUsername: (username: String, gender: GenderOption) -> Unit
+    onConfirmUsername: (username: String, gender: GenderOption, age: Int) -> Unit
 ) {
     val colors = LayoverTheme.colors
     var usernameInput by remember { mutableStateOf("") }
     var selectedGender by remember { mutableStateOf<GenderOption?>(null) }
+    var ageInput by remember { mutableStateOf("") }
 
     val hasSpace = usernameInput.any { it.isWhitespace() }
     val tooLong = usernameInput.length > 8
     val isUsernameValid = usernameInput.isNotEmpty() && !hasSpace && !tooLong
-    val isValid = isUsernameValid && selectedGender != null
+
+    val trimmedAge = ageInput.trim()
+    val parsedAge = trimmedAge.toIntOrNull()
+    val isAgeValid = parsedAge != null && parsedAge in 13..120
+
+    val isValid = isUsernameValid && selectedGender != null && isAgeValid
 
     val errorMessage = when {
         hasSpace -> "Spaces are not allowed in your username."
         tooLong -> "Username must be 8 characters or fewer."
+        else -> null
+    }
+
+    val ageErrorMessage = when {
+        trimmedAge.isEmpty() -> null
+        parsedAge == null -> "Enter a valid age in years."
+        parsedAge !in 13..120 -> "Age must be between 13 and 120."
         else -> null
     }
 
@@ -718,6 +733,35 @@ fun OneTimeUsernameDialog(
                         )
                     },
                     isError = errorMessage != null,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "Your Age",
+                    color = colors.lightText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                OutlinedTextField(
+                    value = ageInput,
+                    onValueChange = { ageInput = it },
+                    singleLine = true,
+                    placeholder = {
+                        Text("Enter age (e.g. 25)", color = colors.mutedText)
+                    },
+                    supportingText = {
+                        Text(
+                            text = ageErrorMessage ?: "Required (13–120 years)",
+                            color = if (ageErrorMessage != null) Color(0xFFFF5252) else colors.mutedText,
+                            fontSize = 12.sp
+                        )
+                    },
+                    isError = ageErrorMessage != null,
                     modifier = Modifier.fillMaxWidth()
                 )
 
@@ -771,7 +815,8 @@ fun OneTimeUsernameDialog(
                 enabled = isValid,
                 onClick = {
                     val chosenGender = selectedGender ?: GenderOption.MALE
-                    onConfirmUsername(usernameInput, chosenGender)
+                    val chosenAge = parsedAge ?: return@Button
+                    onConfirmUsername(usernameInput, chosenGender, chosenAge)
                 }
             ) {
                 Text("Save Profile")

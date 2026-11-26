@@ -83,6 +83,7 @@ data class NearbyPeer(
     val id: String,
     val displayName: String,
     val handle: String = "",
+    val age: Int? = null,
     val status: ConnectionStatus = ConnectionStatus.NONE,
     val avatar: PeerAvatar = PeerAvatar(
         peerId = id,
