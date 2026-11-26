@@ -98,22 +98,22 @@ class BleProximityTransport(
     private var blockedPeerIds: Set<String> = emptySet()
     private var mutedPeerIds: Set<String> = emptySet()
 
-    private val _incomingMessagesFlow = MutableSharedFlow<Pair<String, ChatMessage>>()
+    private val _incomingMessagesFlow = MutableSharedFlow<Pair<String, ChatMessage>>(extraBufferCapacity = 32)
     val incomingMessagesFlow: SharedFlow<Pair<String, ChatMessage>> = _incomingMessagesFlow.asSharedFlow()
 
-    private val _incomingConnectionRequestFlow = MutableSharedFlow<Pair<String, String>>()
+    private val _incomingConnectionRequestFlow = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
     val incomingConnectionRequestFlow: SharedFlow<Pair<String, String>> = _incomingConnectionRequestFlow.asSharedFlow()
 
-    private val _incomingConnectionAcceptFlow = MutableSharedFlow<String>()
+    private val _incomingConnectionAcceptFlow = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val incomingConnectionAcceptFlow: SharedFlow<String> = _incomingConnectionAcceptFlow.asSharedFlow()
 
-    private val _incomingConnectionDeclineFlow = MutableSharedFlow<String>()
+    private val _incomingConnectionDeclineFlow = MutableSharedFlow<String>(extraBufferCapacity = 16)
     val incomingConnectionDeclineFlow: SharedFlow<String> = _incomingConnectionDeclineFlow.asSharedFlow()
 
-    private val _incomingPeerBlockStateFlow = MutableSharedFlow<Pair<String, Boolean>>()
+    private val _incomingPeerBlockStateFlow = MutableSharedFlow<Pair<String, Boolean>>(extraBufferCapacity = 16)
     val incomingPeerBlockStateFlow: SharedFlow<Pair<String, Boolean>> = _incomingPeerBlockStateFlow.asSharedFlow()
 
-    private val _incomingProfileSyncFlow = MutableSharedFlow<WireFrame.ProfileSync>()
+    private val _incomingProfileSyncFlow = MutableSharedFlow<WireFrame.ProfileSync>(extraBufferCapacity = 16)
     val incomingProfileSyncFlow: SharedFlow<WireFrame.ProfileSync> = _incomingProfileSyncFlow.asSharedFlow()
 
     var onPeerProfileUpdated: ((
@@ -392,8 +392,11 @@ class BleProximityTransport(
                     }
 
                     is WireFrame.ChatEncrypted -> {
-                        if (frame.senderId.isNotEmpty()) {
-                            activePeerId = frame.senderId
+                        val effectivePeerId = frame.senderId
+                            .takeIf { it.isNotBlank() && it != "user" && it != "local" }
+                            ?: currentPeer
+                        if (effectivePeerId.isNotEmpty()) {
+                            activePeerId = effectivePeerId
                         }
                         val iv = try {
                             Base64.decode(frame.ivBase64, Base64.NO_WRAP)
@@ -413,18 +416,18 @@ class BleProximityTransport(
                         )
 
                         if (decryptedText != null) {
-                            LayoverFileLogger.log("Successfully decrypted chat message from $currentPeer")
+                            LayoverFileLogger.log("Successfully decrypted chat message from $effectivePeerId")
                             diagnosticsTracker.updateLastErrorMessage(null)
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
-                                senderId = currentPeer,
+                                senderId = effectivePeerId,
                                 text = decryptedText,
                                 timestampLabel = "Just now",
                                 isOutgoing = false
                             )
-                            _incomingMessagesFlow.emit(Pair(currentPeer, newMsg))
+                            _incomingMessagesFlow.emit(Pair(effectivePeerId, newMsg))
                         } else {
-                            LayoverFileLogger.logError("Failed to decrypt incoming chat message from $currentPeer")
+                            LayoverFileLogger.logError("Failed to decrypt incoming chat message from $effectivePeerId")
                             diagnosticsTracker.updateLastErrorMessage("Failed to decrypt chat message")
                         }
                     }

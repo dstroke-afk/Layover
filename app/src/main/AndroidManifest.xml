@@ -38,6 +38,7 @@
         android:required="true" />
 
     <application
+        android:name=".LayoverApplication"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
@@ -52,6 +53,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.Layover"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -59,6 +61,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".ble.BleProximityService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice"
+            android:stopWithTask="false" />
 
     </application>
 

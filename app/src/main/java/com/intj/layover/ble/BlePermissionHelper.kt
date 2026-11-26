@@ -55,4 +55,17 @@ object BlePermissionHelper {
     fun hasAllLaunchPermissions(context: Context): Boolean {
         return hasAllRequiredPermissions(context) && hasWifiHotspotPermissions(context)
     }
+
+    fun getNotificationPermissionOrNull(): String? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.POST_NOTIFICATIONS
+        } else {
+            null
+        }
+    }
+
+    fun hasNotificationPermission(context: Context): Boolean {
+        val perm = getNotificationPermissionOrNull() ?: return true
+        return ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+    }
 }
