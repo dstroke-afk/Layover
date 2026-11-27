@@ -96,6 +96,9 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     private val _activeChatPeerId = MutableStateFlow<String?>(null)
     val activeChatPeerId: StateFlow<String?> = _activeChatPeerId.asStateFlow()
 
+    private val _isRuntimeReady = MutableStateFlow(false)
+    val isRuntimeReady: StateFlow<Boolean> = _isRuntimeReady.asStateFlow()
+
     @Volatile
     private var acceptedPeerIds: Set<String> = emptySet()
 
@@ -214,6 +217,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
 
         registerBluetoothReceiver()
         wireTransportCollectors()
+        _isRuntimeReady.value = true
     }
 
     private fun registerBluetoothReceiver() {

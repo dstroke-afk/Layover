@@ -33,10 +33,11 @@ import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.ui.screens.ChatScreen
+import com.intj.layover.ui.screens.DEFAULT_LOADING_DISPLAY_MS
+import com.intj.layover.ui.screens.LayoverLoadingScreen
 import com.intj.layover.ui.screens.PeopleAroundScreen
 import com.intj.layover.ui.screens.ProfileScreen
 import com.intj.layover.ui.screens.ScanScreen
-import com.intj.layover.ui.screens.SplashScreen
 import com.intj.layover.ui.screens.canonicalDeduplicatePeers
 import com.intj.layover.ui.theme.LayoverTheme
 
@@ -101,7 +102,9 @@ fun LayoverNavGraph(
     uiState: LayoverUiState,
     onUpdateUiState: (LayoverUiState) -> Unit,
     modifier: Modifier = Modifier,
-    navController: NavHostController = rememberNavController()
+    navController: NavHostController = rememberNavController(),
+    skipSplash: Boolean = false,
+    isRuntimeReady: Boolean = true
 ) {
     val toggleBlockPeer = { rawPeerId: String ->
         val queryAliases = PeerAliasRegistry.resolveAliases(rawPeerId) + rawPeerId
@@ -213,16 +216,25 @@ fun LayoverNavGraph(
         }
     }
 
+    val startDestination = remember(skipSplash) {
+        if (skipSplash) LayoverRoute.PeopleAround.route else LayoverRoute.Splash.route
+    }
+
     NavHost(
         navController = navController,
-        startDestination = LayoverRoute.PeopleAround.route,
+        startDestination = startDestination,
         modifier = modifier.fillMaxSize()
     ) {
         composable(LayoverRoute.Splash.route) {
-            SplashScreen(
-                onNavigateToScan = {
-                    navController.navigate(LayoverRoute.Scan.route) {
-                        popUpTo(LayoverRoute.Splash.route) { inclusive = true }
+            LayoverLoadingScreen(
+                autoFinishDelayMs = DEFAULT_LOADING_DISPLAY_MS,
+                isReady = isRuntimeReady,
+                onFinished = {
+                    if (navController.currentDestination?.route == LayoverRoute.Splash.route) {
+                        navController.navigate(LayoverRoute.PeopleAround.route) {
+                            popUpTo(LayoverRoute.Splash.route) { inclusive = true }
+                            launchSingleTop = true
+                        }
                     }
                 }
             )

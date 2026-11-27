@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -98,6 +99,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = installSplashScreen()
+        splashScreen.setOnExitAnimationListener { splashView ->
+            splashView.remove()
+        }
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
@@ -118,6 +123,7 @@ class MainActivity : ComponentActivity() {
             val bleStatus by runtime.bleStateController.statusState.collectAsState()
             val uiState by runtime.uiState.collectAsState()
             val hasSetUsername by runtime.hasSetUsername.collectAsState()
+            val isRuntimeReady by runtime.isRuntimeReady.collectAsState()
             val incomingRequestPeer by runtime.incomingRequestPeer.collectAsState()
             val acceptedRequestPeer by runtime.acceptedRequestPeer.collectAsState()
             val deepLink by pendingDeepLink.collectAsState()
@@ -300,6 +306,10 @@ class MainActivity : ComponentActivity() {
             LayoverTheme {
                 val navController = rememberNavController()
                 val navBackStackEntry by navController.currentBackStackEntryAsState()
+                val currentRoute = navBackStackEntry?.destination?.route
+                val initialSkipSplash = remember { deepLink != null }
+                val isOnSplash = (!initialSkipSplash && currentRoute == null) ||
+                    currentRoute == LayoverRoute.Splash.route
 
                 LaunchedEffect(navBackStackEntry) {
                     val route = navBackStackEntry?.destination?.route
@@ -314,6 +324,13 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(deepLink, hasSetUsername) {
                     val link = deepLink ?: return@LaunchedEffect
                     if (!hasSetUsername) return@LaunchedEffect
+
+                    if (navController.currentDestination?.route == LayoverRoute.Splash.route) {
+                        navController.navigate(LayoverRoute.PeopleAround.route) {
+                            popUpTo(LayoverRoute.Splash.route) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
 
                     when (link) {
                         is NotificationDeepLink.OpenChat -> {
@@ -344,7 +361,8 @@ class MainActivity : ComponentActivity() {
                     pendingDeepLink.value = null
                 }
 
-                val shouldShowUsernameDialog = !hasSetUsername &&
+                val shouldShowUsernameDialog = !isOnSplash &&
+                    !hasSetUsername &&
                     (hasCompletedInitialPermissionFlow || showUsernameAfterPermissions)
 
                 if (shouldShowUsernameDialog) {
@@ -593,7 +611,9 @@ class MainActivity : ComponentActivity() {
                         runtime.updateUiState(newState)
                     },
                     modifier = Modifier.fillMaxSize(),
-                    navController = navController
+                    navController = navController,
+                    skipSplash = initialSkipSplash,
+                    isRuntimeReady = isRuntimeReady
                 )
             }
         }

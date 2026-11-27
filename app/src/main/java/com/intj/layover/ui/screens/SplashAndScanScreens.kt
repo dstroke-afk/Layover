@@ -46,7 +46,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -70,82 +69,15 @@ import com.intj.layover.ui.theme.LayoverTheme
 
 @Composable
 fun SplashScreen(
+    isReady: Boolean = true,
+    minDisplayDurationMs: Long = DEFAULT_LOADING_DISPLAY_MS,
     onNavigateToScan: () -> Unit
 ) {
-    val colors = LayoverTheme.colors
-    var hasNavigated by remember { mutableStateOf(false) }
-
-    val navigateNext = {
-        if (!hasNavigated) {
-            hasNavigated = true
-            onNavigateToScan()
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay(1200)
-        navigateNext()
-    }
-
-    LayoverBackground(
-        modifier = Modifier
-            .fillMaxSize()
-            .clickable { navigateNext() }
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(90.dp)
-                    .clip(CircleShape)
-                    .background(colors.cardSurface)
-                    .border(2.dp, colors.cyanPrimary, CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Radar,
-                    contentDescription = null,
-                    tint = colors.cyanPrimary,
-                    modifier = Modifier.size(48.dp)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(28.dp))
-
-            Text(
-                text = "Layover",
-                fontSize = 42.sp,
-                fontWeight = FontWeight.Bold,
-                fontStyle = FontStyle.Italic,
-                fontFamily = FontFamily.Serif,
-                color = colors.lightText,
-                letterSpacing = 2.sp
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = "Offline Nearby Social Mesh",
-                fontSize = 14.sp,
-                color = colors.mutedText,
-                letterSpacing = 1.sp,
-                textAlign = TextAlign.Center
-            )
-
-            Spacer(modifier = Modifier.height(64.dp))
-
-            Text(
-                text = "Tap anywhere to skip",
-                fontSize = 12.sp,
-                color = colors.mutedText.copy(alpha = 0.6f)
-            )
-        }
-    }
+    LayoverLoadingScreen(
+        autoFinishDelayMs = minDisplayDurationMs,
+        isReady = isReady,
+        onFinished = onNavigateToScan
+    )
 }
 
 @Composable
