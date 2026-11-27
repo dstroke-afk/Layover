@@ -1,17 +1,36 @@
 package com.intj.layover
 
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -20,8 +39,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -33,11 +63,13 @@ import com.intj.layover.ble.BleProximityService
 import com.intj.layover.ble.LayoverAppRuntime
 import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.diagnostics.LayoverFileLogger
+import com.intj.layover.model.formatPeerNameWithBadge
 import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.notifications.LayoverNotificationManager
 import com.intj.layover.notifications.NotificationDeepLink
 import com.intj.layover.ui.screens.OneTimeUsernameDialog
+import com.intj.layover.ui.screens.initialsForName
 import com.intj.layover.ui.theme.LayoverTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -328,29 +360,201 @@ class MainActivity : ComponentActivity() {
                 }
 
                 incomingRequestPeer?.let { (peerId, displayName) ->
+                    val colors = LayoverTheme.colors
+                    val aliases = PeerAliasRegistry.resolveAliases(peerId) +
+                        PeerAliasRegistry.resolveAliases(displayName) +
+                        listOfNotNull(peerId.takeIf { it.isNotBlank() }, displayName.takeIf { it.isNotBlank() })
+                    val matchingPeers = uiState.nearbyPeers.filter { p ->
+                        aliases.any { a ->
+                            p.id.equals(a, ignoreCase = true) ||
+                                p.handle.equals(a, ignoreCase = true) ||
+                                (p.displayName.isNotBlank() && p.displayName.equals(a, ignoreCase = true))
+                        }
+                    }
+                    val matchedPeer = matchingPeers.firstOrNull { it.avatar.avatarBase64OrBytes?.isNotEmpty() == true }
+                        ?: matchingPeers.firstOrNull()
+                    val resolvedName = matchedPeer?.displayName?.takeIf { it.isNotBlank() }
+                        ?: displayName.ifBlank { "Layover Peer" }
+                    val resolvedAge = matchedPeer?.age ?: matchingPeers.firstNotNullOfOrNull { it.age }
+                    val resolvedGender = matchedPeer?.gender ?: matchingPeers.firstNotNullOfOrNull { it.gender }
+                    val formattedRequesterName = formatPeerNameWithBadge(
+                        displayName = resolvedName,
+                        age = resolvedAge,
+                        gender = resolvedGender
+                    )
+                    val avatarBytes = matchingPeers
+                        .firstNotNullOfOrNull { it.avatar.avatarBase64OrBytes?.takeIf { b -> b.isNotEmpty() } }
+                    val avatarBitmap = remember(avatarBytes) {
+                        avatarBytes?.let { bytes ->
+                            runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
+                        }
+                    }
+                    val initials = remember(resolvedName) { initialsForName(resolvedName) }
+                    var showFullScreenRequesterPhoto by remember(peerId) { mutableStateOf(false) }
+
                     AlertDialog(
                         onDismissRequest = {
                             LayoverFileLogger.log("Incoming connection request dismissed for peerId=$peerId")
+                            showFullScreenRequesterPhoto = false
                             runtime.dismissIncomingRequest()
                         },
-                        title = { Text("Connection Request") },
-                        text = { Text("$displayName would like to connect with you.") },
+                        containerColor = colors.cardSurface,
+                        title = {
+                            Text(
+                                text = "Connection Request",
+                                color = colors.lightText,
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        text = {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(88.dp)
+                                        .clip(CircleShape)
+                                        .background(colors.incomingBubble)
+                                        .border(2.dp, colors.cyanPrimary, CircleShape)
+                                        .then(
+                                            if (avatarBitmap != null) {
+                                                Modifier.clickable { showFullScreenRequesterPhoto = true }
+                                            } else {
+                                                Modifier
+                                            }
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (avatarBitmap != null) {
+                                        Image(
+                                            bitmap = avatarBitmap,
+                                            contentDescription = "$formattedRequesterName profile photo",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .clip(CircleShape)
+                                        )
+                                    } else {
+                                        Text(
+                                            text = initials,
+                                            fontWeight = FontWeight.Bold,
+                                            color = colors.cyanPrimary,
+                                            fontSize = 28.sp
+                                        )
+                                    }
+                                }
+
+                                if (avatarBitmap != null) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = "Tap photo to enlarge",
+                                        color = colors.mutedText,
+                                        fontSize = 11.sp
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                Text(
+                                    text = formattedRequesterName,
+                                    color = colors.lightText,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp,
+                                    textAlign = TextAlign.Center
+                                )
+
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Text(
+                                    text = "would like to connect with you.",
+                                    color = colors.mutedText,
+                                    fontSize = 14.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        },
                         confirmButton = {
                             Button(onClick = {
-                                runtime.acceptIncomingRequest(peerId, displayName)
-                                navController.navigate(LayoverRoute.Chat.createRoute(peerId))
+                                showFullScreenRequesterPhoto = false
+                                PeerAliasRegistry.linkAliases(
+                                    listOfNotNull(
+                                        peerId,
+                                        matchedPeer?.id,
+                                        matchedPeer?.handle?.ifEmpty { null },
+                                        resolvedName
+                                    )
+                                )
+                                runtime.acceptIncomingRequest(peerId, resolvedName)
+                                val routePeerId = listOfNotNull(
+                                    peerId.takeIf { it.startsWith("dev_", ignoreCase = true) },
+                                    matchedPeer?.id?.takeIf { it.startsWith("dev_", ignoreCase = true) },
+                                    matchedPeer?.id?.takeIf { it.isNotBlank() },
+                                    peerId
+                                ).first()
+                                navController.navigate(LayoverRoute.Chat.createRoute(routePeerId))
                             }) {
                                 Text("Accept")
                             }
                         },
                         dismissButton = {
                             Button(onClick = {
+                                showFullScreenRequesterPhoto = false
                                 runtime.declineIncomingRequest(peerId)
                             }) {
                                 Text("Decline")
                             }
                         }
                     )
+
+                    if (showFullScreenRequesterPhoto && avatarBitmap != null) {
+                        Dialog(
+                            onDismissRequest = { showFullScreenRequesterPhoto = false },
+                            properties = DialogProperties(usePlatformDefaultWidth = false)
+                        ) {
+                            BackHandler { showFullScreenRequesterPhoto = false }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.94f))
+                                    .clickable { showFullScreenRequesterPhoto = false }
+                            ) {
+                                Image(
+                                    bitmap = avatarBitmap,
+                                    contentDescription = "$formattedRequesterName full-screen photo",
+                                    contentScale = ContentScale.Fit,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp)
+                                )
+
+                                Text(
+                                    text = formattedRequesterName,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 18.sp,
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .statusBarsPadding()
+                                        .padding(horizontal = 20.dp, vertical = 16.dp)
+                                )
+
+                                IconButton(
+                                    onClick = { showFullScreenRequesterPhoto = false },
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .statusBarsPadding()
+                                        .padding(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Close photo",
+                                        tint = Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
                 acceptedRequestPeer?.let { peerId ->

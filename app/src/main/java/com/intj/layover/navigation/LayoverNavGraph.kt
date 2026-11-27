@@ -37,6 +37,7 @@ import com.intj.layover.ui.screens.PeopleAroundScreen
 import com.intj.layover.ui.screens.ProfileScreen
 import com.intj.layover.ui.screens.ScanScreen
 import com.intj.layover.ui.screens.SplashScreen
+import com.intj.layover.ui.screens.canonicalDeduplicatePeers
 import com.intj.layover.ui.theme.LayoverTheme
 
 sealed class LayoverRoute(val route: String) {
@@ -158,17 +159,58 @@ fun LayoverNavGraph(
         }
     }
 
-    val toggleMutePeer = { peerId: String ->
-        val updatedMuted = uiState.mutedPeerIds.toMutableSet()
-        val peer = uiState.nearbyPeers.find { it.id == peerId || it.handle == peerId }
-        val targetId = peer?.id ?: peerId
-
-        if (updatedMuted.contains(targetId)) {
-            updatedMuted.remove(targetId)
-        } else {
-            updatedMuted.add(targetId)
+    val toggleMutePeer = { rawPeerId: String ->
+        val queryAliases = PeerAliasRegistry.resolveAliases(rawPeerId) + rawPeerId
+        val targetPeer = uiState.nearbyPeers.find { peer ->
+            queryAliases.any { q ->
+                peer.id.equals(q, ignoreCase = true) ||
+                        peer.handle.equals(q, ignoreCase = true) ||
+                        peer.displayName.equals(q, ignoreCase = true)
+            }
         }
-        onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
+
+        val resolvedPeerId = targetPeer?.id?.takeIf { it.isNotBlank() }
+            ?: targetPeer?.handle?.takeIf { it.isNotBlank() }
+            ?: rawPeerId.trim()
+
+        if (resolvedPeerId.isNotBlank() && resolvedPeerId != "00000000" && resolvedPeerId != "user") {
+            PeerAliasRegistry.linkAliases(
+                listOfNotNull(
+                    rawPeerId,
+                    resolvedPeerId,
+                    targetPeer?.id,
+                    targetPeer?.handle?.ifEmpty { null },
+                    targetPeer?.displayName?.ifEmpty { null }
+                )
+            )
+
+            val aliases = (
+                    PeerAliasRegistry.resolveAliases(resolvedPeerId) +
+                            PeerAliasRegistry.resolveAliases(rawPeerId) +
+                            listOfNotNull(
+                                resolvedPeerId,
+                                targetPeer?.id,
+                                targetPeer?.handle?.ifEmpty { null },
+                                targetPeer?.displayName?.ifEmpty { null }
+                            )
+                    ).filter { it.isNotBlank() && it != "00000000" && it != "user" }.toSet()
+
+            val updatedMuted = uiState.mutedPeerIds.toMutableSet()
+            val isCurrentlyMuted = aliases.any { candidate ->
+                updatedMuted.any { existing -> existing.equals(candidate, ignoreCase = true) }
+            }
+
+            if (isCurrentlyMuted) {
+                updatedMuted.removeAll { existing ->
+                    aliases.any { candidate -> existing.equals(candidate, ignoreCase = true) }
+                }
+                LayoverFileLogger.log("MUTE ACTION: Unmuted peerId=$resolvedPeerId. Removed aliases=$aliases.")
+            } else {
+                updatedMuted.addAll(aliases)
+                LayoverFileLogger.log("MUTE ACTION: Muted peerId=$resolvedPeerId. Added aliases=$aliases.")
+            }
+            onUpdateUiState(uiState.copy(mutedPeerIds = updatedMuted))
+        }
     }
 
     NavHost(
@@ -207,10 +249,39 @@ fun LayoverNavGraph(
                 uiState = uiState,
                 initialSearchActive = uiState.isSearchActive,
                 onConnectPeer = { peerId ->
-                    uiState.transport.sendConnectionRequest(peerId)
-                    val updatedPeers = uiState.nearbyPeers.map { peer ->
-                        if (peer.id == peerId || peer.handle == peerId) peer.copy(status = ConnectionStatus.REQUESTED) else peer
+                    val queryAliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    val matchingPeers = uiState.nearbyPeers.filter { peer ->
+                        queryAliases.any { q ->
+                            peer.id.equals(q, ignoreCase = true) ||
+                                peer.handle.equals(q, ignoreCase = true)
+                        }
                     }
+                    val targetPeer = matchingPeers.firstOrNull()
+                    if (targetPeer?.status == ConnectionStatus.REQUESTED ||
+                        targetPeer?.status == ConnectionStatus.ACCEPTED
+                    ) {
+                        return@PeopleAroundScreen
+                    }
+                    PeerAliasRegistry.linkAliases(
+                        listOfNotNull(
+                            peerId,
+                            targetPeer?.id,
+                            targetPeer?.handle?.ifEmpty { null },
+                            targetPeer?.displayName?.ifEmpty { null }
+                        )
+                    )
+                    val expandedAliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+                    val targetId = targetPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                    uiState.transport.sendConnectionRequest(targetId)
+                    val updatedPeers = canonicalDeduplicatePeers(
+                        uiState.nearbyPeers.map { peer ->
+                            val matches = expandedAliases.any { alias ->
+                                peer.id.equals(alias, ignoreCase = true) ||
+                                    peer.handle.equals(alias, ignoreCase = true)
+                            }
+                            if (matches) peer.copy(status = ConnectionStatus.REQUESTED) else peer
+                        }
+                    )
                     onUpdateUiState(uiState.copy(nearbyPeers = updatedPeers))
                 },
                 onOpenChat = { peerId ->
@@ -273,7 +344,10 @@ fun LayoverNavGraph(
                 expanded.any { exp -> uiState.blockedByPeerIds.any { it.equals(exp, ignoreCase = true) } }
             }
 
-            val isMuted = uiState.mutedPeerIds.contains(peerId) || (peer != null && uiState.mutedPeerIds.contains(peer.id))
+            val isMuted = listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
+                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+                expanded.any { exp -> uiState.mutedPeerIds.any { it.equals(exp, ignoreCase = true) } }
+            }
 
             ChatScreen(
                 peer = peer,
@@ -332,19 +406,14 @@ fun LayoverNavGraph(
                 ?: matchingTargetPeers.firstOrNull()
             val targetAvatarBytes = matchingTargetPeers
                 .firstNotNullOfOrNull { it.avatar.avatarBase64OrBytes?.takeIf { b -> b.isNotEmpty() } }
-            val resolvedPeerAge: Int? = matchingTargetPeers.firstNotNullOfOrNull { p ->
-                runCatching {
-                    val v = p::class.members.firstOrNull { it.name == "age" }?.call(p)
-                        ?: p.avatar::class.members.firstOrNull { it.name == "age" }?.call(p.avatar)
-                    when (v) {
-                        is Int -> v.takeIf { it > 0 }
-                        is Long -> v.toInt().takeIf { it > 0 }
-                        is Number -> v.toInt().takeIf { it > 0 }
-                        is String -> v.trim().toIntOrNull()?.takeIf { it > 0 }
-                        else -> null
-                    }
-                }.getOrNull()
-            }
+            val resolvedPeerAge: Int? = matchingTargetPeers
+                .firstNotNullOfOrNull { it.age?.takeIf { ageVal -> ageVal > 0 } }
+            val resolvedPeerGender = matchingTargetPeers
+                .firstNotNullOfOrNull { it.gender }
+            val enrichedTargetPeer = targetPeer?.copy(
+                age = targetPeer.age ?: resolvedPeerAge,
+                gender = targetPeer.gender ?: resolvedPeerGender
+            )
 
             val peerBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
                 ?.isPeerIdentifierBlocked(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName)
@@ -359,7 +428,7 @@ fun LayoverNavGraph(
             }
 
             com.intj.layover.ui.screens.PeerProfileScreen(
-                peer = targetPeer,
+                peer = enrichedTargetPeer,
                 peerIdFallback = targetPeerId,
                 age = resolvedPeerAge,
                 fallbackAvatarBytes = targetAvatarBytes,

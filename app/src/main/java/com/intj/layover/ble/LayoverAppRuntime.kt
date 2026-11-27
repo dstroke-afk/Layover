@@ -14,9 +14,12 @@ import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.PeerAvatar
 import com.intj.layover.model.UserProfile
 import com.intj.layover.notifications.LayoverNotificationManager
 import com.intj.layover.notifications.NotificationEligibilityEvaluator
+import com.intj.layover.notifications.UnreadMessageTracker
+import com.intj.layover.ui.screens.canonicalDeduplicatePeers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,6 +29,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Application-scoped BLE, chat state, and notification runtime shared between
@@ -63,6 +67,16 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     val bleDiscoveryManager: BleDiscoveryManager
     val bleTransport: BleProximityTransport
     val notificationEvaluator = NotificationEligibilityEvaluator()
+    val unreadTracker = UnreadMessageTracker()
+
+    private class CachedPeerProfileMeta(
+        val displayName: String? = null,
+        val gender: GenderOption? = null,
+        val age: Int? = null,
+        val avatarBytes: ByteArray? = null
+    )
+
+    private val cachedPeerMetaByAlias = ConcurrentHashMap<String, CachedPeerProfileMeta>()
 
     private val _hasSetUsername: MutableStateFlow<Boolean>
     val hasSetUsername: StateFlow<Boolean>
@@ -122,7 +136,11 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             newId
         }
         val usernameAlreadySet = prefs.getBoolean("username_set", false)
-        val savedName = if (usernameAlreadySet) (prefs.getString("display_name", "") ?: "") else ""
+        val rawSavedName = if (usernameAlreadySet) (prefs.getString("display_name", "") ?: "") else ""
+        val savedName = rawSavedName.trim().take(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
+        if (usernameAlreadySet && savedName != rawSavedName) {
+            prefs.edit().putString("display_name", savedName).apply()
+        }
         val savedHandle = prefs.getString("handle", savedDeviceId) ?: savedDeviceId
         val savedGender = GenderOption.fromLabelOrName(prefs.getString("gender", GenderOption.MALE.name))
         val savedAge = if (prefs.contains("age")) prefs.getInt("age", -1).takeIf { it > 0 } else null
@@ -243,6 +261,11 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         _activeChatPeerId.value = clean
         if (clean != null) {
             LayoverNotificationManager.cancelMessageNotification(appContext, clean)
+            val matchedPeer = findMatchingPeer(_uiState.value.nearbyPeers, clean)
+            val updatedUnread = unreadTracker.markChatRead(
+                listOfNotNull(clean, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)
+            )
+            _uiState.update { it.copy(unreadCountsByPeerId = updatedUnread) }
         }
     }
 
@@ -259,7 +282,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     }
 
     fun confirmInitialProfile(chosenName: String, chosenGender: GenderOption, chosenAge: Int) {
-        val cleanedName = chosenName.trim()
+        val cleanedName = chosenName.trim().take(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
         val visiblePref = prefs.getBoolean("is_visible", true)
         val updatedProfile = _uiState.value.userProfile.copy(
             displayName = cleanedName,
@@ -294,75 +317,79 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     fun updateUiState(newState: LayoverUiState) {
         val oldState = _uiState.value
         val oldProfile = oldState.userProfile
-        bleTransport.updateProfile(newState.userProfile)
+        val sanitizedProfile = newState.userProfile.copy(
+            displayName = newState.userProfile.displayName.trim().take(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
+        )
+        val sanitizedState = newState.copy(userProfile = sanitizedProfile)
+        bleTransport.updateProfile(sanitizedProfile)
         bleTransport.updateSafetySettings(
-            blocked = newState.blockedPeerIds,
-            muted = newState.mutedPeerIds
+            blocked = sanitizedState.blockedPeerIds,
+            muted = sanitizedState.mutedPeerIds
         )
 
-        if (newState.blockedPeerIds != oldState.blockedPeerIds) {
-            prefs.edit().putStringSet(KEY_BLOCKED_PEER_IDS, newState.blockedPeerIds.toSet()).apply()
-            newState.blockedPeerIds.forEach { blockedId ->
+        if (sanitizedState.blockedPeerIds != oldState.blockedPeerIds) {
+            prefs.edit().putStringSet(KEY_BLOCKED_PEER_IDS, sanitizedState.blockedPeerIds.toSet()).apply()
+            sanitizedState.blockedPeerIds.forEach { blockedId ->
                 LayoverNotificationManager.cancelMessageNotification(appContext, blockedId)
                 LayoverNotificationManager.cancelConnectionRequestNotification(appContext, blockedId)
             }
         }
-        if (newState.mutedPeerIds != oldState.mutedPeerIds) {
-            prefs.edit().putStringSet(KEY_MUTED_PEER_IDS, newState.mutedPeerIds.toSet()).apply()
-            val newlyMuted = newState.mutedPeerIds - oldState.mutedPeerIds
+        if (sanitizedState.mutedPeerIds != oldState.mutedPeerIds) {
+            prefs.edit().putStringSet(KEY_MUTED_PEER_IDS, sanitizedState.mutedPeerIds.toSet()).apply()
+            val newlyMuted = sanitizedState.mutedPeerIds - oldState.mutedPeerIds
             newlyMuted.forEach { mutedId ->
                 LayoverNotificationManager.cancelMessageNotification(appContext, mutedId)
                 LayoverNotificationManager.cancelConnectionRequestNotification(appContext, mutedId)
             }
         }
-        if (newState.blockedByPeerIds != oldState.blockedByPeerIds) {
-            prefs.edit().putStringSet(KEY_BLOCKED_BY_PEER_IDS, newState.blockedByPeerIds.toSet()).apply()
+        if (sanitizedState.blockedByPeerIds != oldState.blockedByPeerIds) {
+            prefs.edit().putStringSet(KEY_BLOCKED_BY_PEER_IDS, sanitizedState.blockedByPeerIds.toSet()).apply()
         }
 
-        if (newState.userProfile != oldProfile) {
+        if (sanitizedProfile != oldProfile) {
             LayoverFileLogger.log(
-                "UserProfile updated: name=${newState.userProfile.displayName}, " +
-                    "gender=${newState.userProfile.gender.name}, visible=${newState.userProfile.isVisibleToNearby}"
+                "UserProfile updated: name=${sanitizedProfile.displayName}, " +
+                    "gender=${sanitizedProfile.gender.name}, visible=${sanitizedProfile.isVisibleToNearby}"
             )
             val editor = prefs.edit()
-                .putString("display_name", newState.userProfile.displayName)
-                .putString("handle", newState.userProfile.handle)
-                .putString("gender", newState.userProfile.gender.name)
-                .putBoolean("is_visible", newState.userProfile.isVisibleToNearby)
-            val ageValue = newState.userProfile.age
+                .putString("display_name", sanitizedProfile.displayName)
+                .putString("handle", sanitizedProfile.handle)
+                .putString("gender", sanitizedProfile.gender.name)
+                .putBoolean("is_visible", sanitizedProfile.isVisibleToNearby)
+            val ageValue = sanitizedProfile.age
             if (ageValue != null) {
                 editor.putInt("age", ageValue)
             } else {
                 editor.remove("age")
             }
-            newState.userProfile.avatarBytes?.let {
+            sanitizedProfile.avatarBytes?.let {
                 editor.putString("avatar_b64", Base64.encodeToString(it, Base64.NO_WRAP))
             }
-            newState.userProfile.compactTransferAvatarBytes?.let {
+            sanitizedProfile.compactTransferAvatarBytes?.let {
                 editor.putString("compact_avatar_b64", Base64.encodeToString(it, Base64.NO_WRAP))
             }
-            newState.userProfile.croppedResolutionLabel?.let {
+            sanitizedProfile.croppedResolutionLabel?.let {
                 editor.putString("cropped_resolution", it)
             }
-            val avatarChanged = !oldProfile.compactTransferAvatarBytes.contentEquals(newState.userProfile.compactTransferAvatarBytes) ||
-                !oldProfile.avatarBytes.contentEquals(newState.userProfile.avatarBytes)
+            val avatarChanged = !oldProfile.compactTransferAvatarBytes.contentEquals(sanitizedProfile.compactTransferAvatarBytes) ||
+                !oldProfile.avatarBytes.contentEquals(sanitizedProfile.avatarBytes)
             if (avatarChanged) {
                 LayoverFileLogger.log("Avatar bytes changed; updating avatar_updated_at timestamp.")
                 editor.putLong("avatar_updated_at", System.currentTimeMillis())
             }
             editor.apply()
 
-            if (newState.userProfile.isVisibleToNearby && _hasSetUsername.value && isBluetoothEnabled()) {
-                bleDiscoveryManager.startAdvertising(newState.userProfile)
+            if (sanitizedProfile.isVisibleToNearby && _hasSetUsername.value && isBluetoothEnabled()) {
+                bleDiscoveryManager.startAdvertising(sanitizedProfile)
             } else {
                 bleDiscoveryManager.stopAdvertising()
             }
         }
 
-        val compactBytes = newState.userProfile.effectiveCompactAvatarBytes()
-        val updatedNearbyPeers = newState.nearbyPeers.map { peer ->
-            val isSelf = peer.id.equals(newState.userProfile.handle, ignoreCase = true) ||
-                (peer.displayName.isNotEmpty() && peer.displayName.equals(newState.userProfile.displayName, ignoreCase = true))
+        val compactBytes = sanitizedProfile.effectiveCompactAvatarBytes()
+        val updatedNearbyPeers = sanitizedState.nearbyPeers.map { peer ->
+            val isSelf = peer.id.equals(sanitizedProfile.handle, ignoreCase = true) ||
+                (peer.displayName.isNotEmpty() && peer.displayName.equals(sanitizedProfile.displayName, ignoreCase = true))
             if (isSelf && compactBytes != null) {
                 peer.copy(avatar = peer.avatar.copy(avatarBase64OrBytes = compactBytes))
             } else {
@@ -370,8 +397,9 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             }
         }
 
-        _uiState.value = newState.copy(
-            nearbyPeers = updatedNearbyPeers,
+        _uiState.value = sanitizedState.copy(
+            nearbyPeers = canonicalDeduplicatePeers(updatedNearbyPeers),
+            unreadCountsByPeerId = unreadTracker.snapshot(),
             transport = bleTransport,
             diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
         )
@@ -398,28 +426,48 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         bleTransport.acceptConnectionRequest(peerId)
         bleDiscoveryManager.updatePeerStatus(peerId, ConnectionStatus.ACCEPTED)
 
+        val cachedMeta = lookupCachedPeerMeta(peerId, displayName)
         _uiState.update { state ->
-            val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId, displayName))
-            val existing = state.nearbyPeers.find { p ->
-                aliases.any { a ->
-                    p.id.equals(a, ignoreCase = true) ||
-                        p.handle.equals(a, ignoreCase = true) ||
-                        (displayName.isNotBlank() && p.displayName.equals(displayName, ignoreCase = true))
-                }
-            }
-            val updatedPeers = if (existing == null) {
+            val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId, displayName)
+            PeerAliasRegistry.linkAliases(
+                listOfNotNull(peerId, displayName.ifBlank { null }) +
+                    matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+            )
+            val updatedPeers = if (matchedPeers.isEmpty()) {
+                val resolvedName = displayName.ifBlank { cachedMeta?.displayName ?: "Layover Peer" }
                 state.nearbyPeers + NearbyPeer(
                     id = peerId,
-                    displayName = displayName.ifBlank { "Layover Peer" },
+                    displayName = resolvedName,
                     handle = peerId,
-                    status = ConnectionStatus.ACCEPTED
+                    gender = cachedMeta?.gender,
+                    age = cachedMeta?.age,
+                    status = ConnectionStatus.ACCEPTED,
+                    avatar = PeerAvatar(
+                        peerId = peerId,
+                        initials = resolvedName.split(" ").mapNotNull { it.firstOrNull()?.toString() }.take(2).joinToString("").ifEmpty { "?" },
+                        avatarBase64OrBytes = cachedMeta?.avatarBytes
+                    )
                 )
             } else {
+                val matchedIds = matchedPeers.map { it.id }.toSet()
                 state.nearbyPeers.map { p ->
-                    if (p.id == existing.id) p.copy(status = ConnectionStatus.ACCEPTED) else p
+                    if (p.id in matchedIds) {
+                        p.copy(
+                            gender = p.gender ?: cachedMeta?.gender,
+                            age = p.age ?: cachedMeta?.age,
+                            status = ConnectionStatus.ACCEPTED,
+                            avatar = if (p.avatar.avatarBase64OrBytes == null && cachedMeta?.avatarBytes != null) {
+                                p.avatar.copy(avatarBase64OrBytes = cachedMeta.avatarBytes)
+                            } else {
+                                p.avatar
+                            }
+                        )
+                    } else {
+                        p
+                    }
                 }
             }
-            state.copy(nearbyPeers = updatedPeers)
+            state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
         }
     }
 
@@ -433,15 +481,15 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         bleDiscoveryManager.updatePeerStatus(peerId, ConnectionStatus.DECLINED)
 
         _uiState.update { state ->
-            val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId))
+            val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId)
+            PeerAliasRegistry.linkAliases(
+                listOf(peerId) + matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+            )
+            val matchedIds = matchedPeers.map { it.id }.toSet()
             val updatedPeers = state.nearbyPeers.map { p ->
-                if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
-                    p.copy(status = ConnectionStatus.DECLINED)
-                } else {
-                    p
-                }
+                if (p.id in matchedIds) p.copy(status = ConnectionStatus.DECLINED) else p
             }
-            state.copy(nearbyPeers = updatedPeers)
+            state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
         }
     }
 
@@ -458,15 +506,15 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         _acceptedRequestPeer.value = null
         recordAcceptedPeer(peerId)
         _uiState.update { state ->
-            val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId))
+            val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId)
+            PeerAliasRegistry.linkAliases(
+                listOf(peerId) + matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+            )
+            val matchedIds = matchedPeers.map { it.id }.toSet()
             val updatedPeers = state.nearbyPeers.map { p ->
-                if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
-                    p.copy(status = ConnectionStatus.ACCEPTED)
-                } else {
-                    p
-                }
+                if (p.id in matchedIds) p.copy(status = ConnectionStatus.ACCEPTED) else p
             }
-            state.copy(nearbyPeers = updatedPeers)
+            state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
         }
     }
 
@@ -507,19 +555,32 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         prefs.edit().putStringSet(KEY_ACCEPTED_PEER_IDS, updated).apply()
     }
 
+    private fun findAllMatchingPeers(
+        peers: List<NearbyPeer>,
+        peerId: String,
+        displayName: String = ""
+    ): List<NearbyPeer> {
+        val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId, displayName))
+        val cleanName = displayName.trim().takeUnless { it.isEmpty() || it.startsWith("Layover Peer (", ignoreCase = true) }
+        return peers.filter { p ->
+            val peerAliases = notificationEvaluator.expandIdentifiers(listOf(p.id, p.handle))
+            val aliasOverlap = aliases.any { a ->
+                peerAliases.any { pa -> pa.equals(a, ignoreCase = true) }
+            }
+            val nameMatch = cleanName != null &&
+                p.displayName.isNotBlank() &&
+                !p.displayName.startsWith("Layover Peer (", ignoreCase = true) &&
+                p.displayName.equals(cleanName, ignoreCase = true)
+            aliasOverlap || nameMatch
+        }
+    }
+
     private fun findMatchingPeer(
         peers: List<NearbyPeer>,
         peerId: String,
         displayName: String = ""
     ): NearbyPeer? {
-        val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId, displayName))
-        return peers.find { p ->
-            aliases.any { a ->
-                p.id.equals(a, ignoreCase = true) ||
-                    p.handle.equals(a, ignoreCase = true) ||
-                    (p.displayName.isNotBlank() && p.displayName.equals(a, ignoreCase = true))
-            }
-        }
+        return findAllMatchingPeers(peers, peerId, displayName).firstOrNull()
     }
 
     private fun isPeerInAcceptedSet(vararg candidates: String?): Boolean {
@@ -529,18 +590,54 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         return expanded.any { cand -> expandedAccepted.any { acc -> cand.equals(acc, ignoreCase = true) } }
     }
 
+    private fun lookupCachedPeerMeta(vararg identifiers: String?): CachedPeerProfileMeta? {
+        val aliases = notificationEvaluator.expandIdentifiers(identifiers.toList())
+        return aliases.firstNotNullOfOrNull { cachedPeerMetaByAlias[it.lowercase()] }
+    }
+
+    private fun storeCachedPeerMeta(
+        identifiers: Collection<String?>,
+        displayName: String?,
+        gender: GenderOption?,
+        age: Int?,
+        avatarBytes: ByteArray?
+    ) {
+        val aliases = notificationEvaluator.expandIdentifiers(identifiers)
+        if (aliases.isEmpty()) return
+        val existing = aliases.firstNotNullOfOrNull { cachedPeerMetaByAlias[it.lowercase()] }
+        val merged = CachedPeerProfileMeta(
+            displayName = displayName?.takeIf { it.isNotBlank() } ?: existing?.displayName,
+            gender = gender ?: existing?.gender,
+            age = age?.takeIf { it > 0 } ?: existing?.age,
+            avatarBytes = avatarBytes?.takeIf { it.isNotEmpty() } ?: existing?.avatarBytes
+        )
+        aliases.forEach { alias ->
+            cachedPeerMetaByAlias[alias.lowercase()] = merged
+        }
+    }
+
     private fun wireTransportCollectors() {
         bleTransport.onPeerProfileUpdated = { peerId, displayName, gender, age, avatarBytes ->
+            PeerAliasRegistry.linkAliases(listOfNotNull(peerId, displayName?.ifBlank { null }))
+            storeCachedPeerMeta(
+                identifiers = listOf(peerId, displayName),
+                displayName = displayName,
+                gender = gender,
+                age = age,
+                avatarBytes = avatarBytes
+            )
             _uiState.update { state ->
-                val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId, displayName))
+                val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId, displayName ?: "")
+                PeerAliasRegistry.linkAliases(
+                    listOfNotNull(peerId, displayName?.ifBlank { null }) +
+                        matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+                )
+                val matchedIds = matchedPeers.map { it.id }.toSet()
                 val updatedPeers = state.nearbyPeers.map { p ->
-                    val matches = aliases.any { a ->
-                        p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true)
-                    }
-                    if (matches) {
+                    if (p.id in matchedIds) {
                         p.copy(
                             displayName = displayName?.takeIf { it.isNotBlank() } ?: p.displayName,
-                            gender = gender,
+                            gender = gender ?: p.gender,
                             age = age ?: p.age,
                             avatar = if (avatarBytes != null && avatarBytes.isNotEmpty()) {
                                 p.avatar.copy(avatarBase64OrBytes = avatarBytes)
@@ -552,7 +649,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                         p
                     }
                 }
-                state.copy(nearbyPeers = updatedPeers)
+                state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
             }
         }
 
@@ -566,54 +663,82 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             bleDiscoveryManager.discoveredPeers.collect { liveDiscoveredPeers ->
                 _uiState.update { current ->
                     val existingList = current.nearbyPeers
-                    val merged = liveDiscoveredPeers
-                        .groupBy { peer ->
-                            val aliases = PeerAliasRegistry.resolveAliases(peer.id) +
-                                PeerAliasRegistry.resolveAliases(peer.handle) +
-                                listOfNotNull(peer.id.takeIf { it.isNotBlank() }, peer.handle.takeIf { it.isNotBlank() })
-                            aliases.firstOrNull { it.startsWith("dev_", ignoreCase = true) }
-                                ?: aliases.firstOrNull()
-                                ?: peer.displayName.ifBlank { peer.id }
-                        }
-                        .map { (_, group) ->
-                            val discovered = group.first()
-                            val discoveredAliases = PeerAliasRegistry.resolveAliases(discovered.id) +
-                                PeerAliasRegistry.resolveAliases(discovered.handle) +
-                                listOfNotNull(discovered.id.takeIf { it.isNotBlank() }, discovered.handle.takeIf { it.isNotBlank() })
-
-                            val existing = existingList.find { p ->
-                                val existingAliases = PeerAliasRegistry.resolveAliases(p.id) +
-                                    PeerAliasRegistry.resolveAliases(p.handle) +
-                                    listOfNotNull(p.id.takeIf { it.isNotBlank() }, p.handle.takeIf { it.isNotBlank() })
-                                discoveredAliases.any { dAlias -> existingAliases.any { eAlias -> dAlias.equals(eAlias, ignoreCase = true) } } ||
-                                    (p.displayName.isNotEmpty() && p.displayName.equals(discovered.displayName, ignoreCase = true))
-                            }
-                            val resolvedAvatar = when {
-                                discovered.avatar.avatarBase64OrBytes != null -> discovered.avatar
-                                existing != null && existing.avatar.avatarBase64OrBytes != null -> existing.avatar
-                                else -> discovered.avatar
-                            }
-                            val resolvedAge = discovered.age ?: existing?.age
-                            val resolvedStatus = when {
-                                existing != null && existing.status != ConnectionStatus.NONE -> existing.status
-                                discovered.status != ConnectionStatus.NONE -> discovered.status
-                                isPeerInAcceptedSet(discovered.id, discovered.handle, discovered.displayName) -> ConnectionStatus.ACCEPTED
-                                else -> ConnectionStatus.NONE
-                            }
-                            if (existing != null && resolvedStatus != ConnectionStatus.NONE) {
-                                discovered.copy(
-                                    id = existing.id,
-                                    handle = existing.handle.ifEmpty { discovered.handle },
-                                    displayName = discovered.displayName.ifBlank { existing.displayName },
-                                    age = resolvedAge,
-                                    status = resolvedStatus,
-                                    avatar = resolvedAvatar
+                    val mergedLive = canonicalDeduplicatePeers(liveDiscoveredPeers).map { discovered ->
+                        val existing = findMatchingPeer(existingList, discovered.id, discovered.displayName)
+                            ?: findMatchingPeer(existingList, discovered.handle, discovered.displayName)
+                        if (existing != null) {
+                            PeerAliasRegistry.linkAliases(
+                                listOfNotNull(
+                                    discovered.id,
+                                    discovered.handle.ifEmpty { null },
+                                    discovered.displayName.ifEmpty { null },
+                                    existing.id,
+                                    existing.handle.ifEmpty { null },
+                                    existing.displayName.ifEmpty { null }
                                 )
-                            } else {
-                                discovered.copy(age = resolvedAge, status = resolvedStatus, avatar = resolvedAvatar)
-                            }
+                            )
                         }
+                        val cachedMeta = lookupCachedPeerMeta(
+                            discovered.id,
+                            discovered.handle,
+                            discovered.displayName,
+                            existing?.id,
+                            existing?.handle
+                        )
+                        val resolvedAvatar = when {
+                            discovered.avatar.avatarBase64OrBytes != null -> discovered.avatar
+                            existing != null && existing.avatar.avatarBase64OrBytes != null -> existing.avatar
+                            cachedMeta?.avatarBytes != null -> discovered.avatar.copy(avatarBase64OrBytes = cachedMeta.avatarBytes)
+                            else -> discovered.avatar
+                        }
+                        val resolvedAge = discovered.age ?: existing?.age ?: cachedMeta?.age
+                        val resolvedGender = discovered.gender ?: existing?.gender ?: cachedMeta?.gender
+                        val existingName = existing?.displayName?.takeIf { it.isNotBlank() }
+                        val cachedName = cachedMeta?.displayName?.takeIf { it.isNotBlank() }
+                        val discoveredName = discovered.displayName.takeIf { it.isNotBlank() }
+                        val resolvedDisplayName = when {
+                            cachedName != null && discoveredName != null &&
+                                cachedName.length > discoveredName.length &&
+                                cachedName.startsWith(discoveredName, ignoreCase = true) -> cachedName
+                            existingName != null && discoveredName != null &&
+                                existingName.length > discoveredName.length &&
+                                existingName.startsWith(discoveredName, ignoreCase = true) -> existingName
+                            discoveredName != null && !discoveredName.startsWith("Layover Peer (", ignoreCase = true) -> discoveredName
+                            existingName != null -> existingName
+                            cachedName != null -> cachedName
+                            else -> discovered.displayName
+                        }
+                        val resolvedStatus = when {
+                            existing != null && existing.status != ConnectionStatus.NONE -> existing.status
+                            discovered.status != ConnectionStatus.NONE -> discovered.status
+                            isPeerInAcceptedSet(discovered.id, discovered.handle, resolvedDisplayName) -> ConnectionStatus.ACCEPTED
+                            else -> ConnectionStatus.NONE
+                        }
+                        if (existing != null && resolvedStatus != ConnectionStatus.NONE) {
+                            discovered.copy(
+                                id = existing.id,
+                                handle = existing.handle.ifEmpty { discovered.handle },
+                                displayName = resolvedDisplayName,
+                                gender = resolvedGender,
+                                age = resolvedAge,
+                                status = resolvedStatus,
+                                avatar = resolvedAvatar
+                            )
+                        } else {
+                            discovered.copy(
+                                displayName = resolvedDisplayName,
+                                gender = resolvedGender,
+                                age = resolvedAge,
+                                status = resolvedStatus,
+                                avatar = resolvedAvatar
+                            )
+                        }
+                    }
 
+                    val retainedActivePeers = existingList.filter { existing ->
+                        existing.status == ConnectionStatus.ACCEPTED || existing.status == ConnectionStatus.REQUESTED
+                    }
+                    val merged = canonicalDeduplicatePeers(mergedLive + retainedActivePeers)
                     bleTransport.diagnosticsTracker.updateDiscoveredPeersCount(merged.size)
                     current.copy(nearbyPeers = merged)
                 }
@@ -645,7 +770,28 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                         if (p.handle.isNotEmpty()) addMsgToKey(p.handle)
                         if (p.displayName.isNotEmpty()) addMsgToKey(p.displayName)
                     }
-                    state.copy(chatMessages = updatedMap)
+
+                    val unreadCandidates = listOfNotNull(
+                        peerId,
+                        message.senderId,
+                        peer?.id,
+                        peer?.handle,
+                        peer?.displayName
+                    )
+                    val updatedUnread = if (!message.isOutgoing) {
+                        unreadTracker.recordIncomingMessage(
+                            senderCandidates = unreadCandidates,
+                            messageId = message.id,
+                            isAppInForeground = _isAppInForeground.value,
+                            activeChatPeerId = _activeChatPeerId.value
+                        )
+                    } else {
+                        state.unreadCountsByPeerId
+                    }
+                    state.copy(
+                        chatMessages = updatedMap,
+                        unreadCountsByPeerId = updatedUnread
+                    )
                 }
 
                 val currentState = _uiState.value
@@ -703,32 +849,57 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
 
                 var resolvedPeerId = peerId
                 var resolvedName = displayName.ifBlank { "Layover Peer" }
+                val cachedMeta = lookupCachedPeerMeta(peerId, displayName)
 
                 _uiState.update { state ->
-                    val existingPeer = findMatchingPeer(state.nearbyPeers, peerId, displayName)
-                    val updatedPeers = if (existingPeer == null) {
+                    val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId, displayName)
+                    PeerAliasRegistry.linkAliases(
+                        listOfNotNull(peerId, displayName.ifBlank { null }) +
+                            matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+                    )
+                    val updatedPeers = if (matchedPeers.isEmpty()) {
                         state.nearbyPeers + NearbyPeer(
                             id = peerId,
                             displayName = resolvedName,
                             handle = peerId,
-                            status = ConnectionStatus.REQUESTED
+                            gender = cachedMeta?.gender,
+                            age = cachedMeta?.age,
+                            status = ConnectionStatus.REQUESTED,
+                            avatar = PeerAvatar(
+                                peerId = peerId,
+                                initials = resolvedName.split(" ").mapNotNull { it.firstOrNull()?.toString() }.take(2).joinToString("").ifEmpty { "?" },
+                                avatarBase64OrBytes = cachedMeta?.avatarBytes
+                            )
                         )
                     } else {
-                        resolvedPeerId = existingPeer.id.ifBlank { peerId }
-                        resolvedName = displayName.ifBlank { existingPeer.displayName.ifBlank { "Layover Peer" } }
+                        val primaryMatch = matchedPeers.first()
+                        resolvedPeerId = if (peerId.startsWith("dev_", ignoreCase = true)) {
+                            peerId
+                        } else {
+                            primaryMatch.id.ifBlank { peerId }
+                        }
+                        resolvedName = displayName.ifBlank { primaryMatch.displayName.ifBlank { "Layover Peer" } }
+                        val matchedIds = matchedPeers.map { it.id }.toSet()
                         state.nearbyPeers.map { p ->
-                            if (p.id == existingPeer.id) {
+                            if (p.id in matchedIds) {
                                 p.copy(
                                     handle = peerId.ifEmpty { p.handle },
                                     displayName = resolvedName,
-                                    status = if (p.status == ConnectionStatus.ACCEPTED) ConnectionStatus.ACCEPTED else ConnectionStatus.REQUESTED
+                                    gender = cachedMeta?.gender ?: p.gender,
+                                    age = cachedMeta?.age ?: p.age,
+                                    status = if (p.status == ConnectionStatus.ACCEPTED) ConnectionStatus.ACCEPTED else ConnectionStatus.REQUESTED,
+                                    avatar = if (p.avatar.avatarBase64OrBytes == null && cachedMeta?.avatarBytes != null) {
+                                        p.avatar.copy(avatarBase64OrBytes = cachedMeta.avatarBytes)
+                                    } else {
+                                        p.avatar
+                                    }
                                 )
                             } else {
                                 p
                             }
                         }
                     }
-                    state.copy(nearbyPeers = updatedPeers)
+                    state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
                 }
 
                 _incomingRequestPeer.value = Pair(resolvedPeerId, resolvedName)
@@ -765,7 +936,11 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         scope.launch {
             bleTransport.incomingConnectionAcceptFlow.collect { peerId ->
                 LayoverFileLogger.log("Incoming CONNECTION_ACCEPT in runtime: peerId=$peerId")
-                val existingPeer = findMatchingPeer(_uiState.value.nearbyPeers, peerId)
+                val existingPeers = findAllMatchingPeers(_uiState.value.nearbyPeers, peerId)
+                PeerAliasRegistry.linkAliases(
+                    listOf(peerId) + existingPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+                )
+                val existingPeer = existingPeers.firstOrNull()
                 recordAcceptedPeer(peerId, existingPeer?.id, existingPeer?.handle, existingPeer?.displayName)
                 notificationEvaluator.clearRequestDedupe(peerId, existingPeer?.id, existingPeer?.displayName)
                 LayoverNotificationManager.cancelConnectionRequestNotification(appContext, peerId)
@@ -773,15 +948,11 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 _acceptedRequestPeer.value = peerId
 
                 _uiState.update { state ->
-                    val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId))
+                    val matchedIds = findAllMatchingPeers(state.nearbyPeers, peerId).map { it.id }.toSet()
                     val updatedPeers = state.nearbyPeers.map { p ->
-                        if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
-                            p.copy(status = ConnectionStatus.ACCEPTED)
-                        } else {
-                            p
-                        }
+                        if (p.id in matchedIds) p.copy(status = ConnectionStatus.ACCEPTED) else p
                     }
-                    state.copy(nearbyPeers = updatedPeers)
+                    state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
                 }
             }
         }
@@ -789,21 +960,21 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         scope.launch {
             bleTransport.incomingConnectionDeclineFlow.collect { peerId ->
                 LayoverFileLogger.log("Incoming CONNECTION_DECLINE in runtime: peerId=$peerId")
+                val existingPeers = findAllMatchingPeers(_uiState.value.nearbyPeers, peerId)
+                PeerAliasRegistry.linkAliases(
+                    listOf(peerId) + existingPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }, it.displayName.ifEmpty { null }) }
+                )
                 removeAcceptedPeer(peerId)
                 notificationEvaluator.clearRequestDedupe(peerId)
                 LayoverNotificationManager.cancelConnectionRequestNotification(appContext, peerId)
                 bleDiscoveryManager.updatePeerStatus(peerId, ConnectionStatus.DECLINED)
 
                 _uiState.update { state ->
-                    val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId))
+                    val matchedIds = findAllMatchingPeers(state.nearbyPeers, peerId).map { it.id }.toSet()
                     val updatedPeers = state.nearbyPeers.map { p ->
-                        if (aliases.any { a -> p.id.equals(a, ignoreCase = true) || p.handle.equals(a, ignoreCase = true) }) {
-                            p.copy(status = ConnectionStatus.DECLINED)
-                        } else {
-                            p
-                        }
+                        if (p.id in matchedIds) p.copy(status = ConnectionStatus.DECLINED) else p
                     }
-                    state.copy(nearbyPeers = updatedPeers)
+                    state.copy(nearbyPeers = canonicalDeduplicatePeers(updatedPeers))
                 }
             }
         }

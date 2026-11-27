@@ -38,6 +38,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.formatPeerNameWithBadge
 import com.intj.layover.navigation.LayoverBackground
 import com.intj.layover.ui.theme.LayoverTheme
 
@@ -66,8 +67,10 @@ fun PeerProfileScreen(
         }
     }
 
-    val resolvedAge = age ?: peer?.age
-    val ageDisplayText = resolvedAge?.takeIf { it in 13..120 }?.toString() ?: "Not shared"
+    val resolvedAge = (age ?: peer?.age)?.takeIf { it in 1..255 }
+    val resolvedGender = peer?.gender
+    val formattedName = formatPeerNameWithBadge(resolvedName, resolvedAge, resolvedGender)
+    val ageDisplayText = resolvedAge?.toString() ?: "Not shared"
 
     LayoverBackground {
         Column(
@@ -154,7 +157,7 @@ fun PeerProfileScreen(
                     Spacer(modifier = Modifier.height(4.dp))
 
                     Text(
-                        text = resolvedName,
+                        text = formattedName,
                         fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
                         color = colors.lightText,
@@ -196,10 +199,10 @@ fun PeerProfileScreen(
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = peer?.gender?.label ?: "Not shared",
+                                text = resolvedGender?.label ?: "Not shared",
                                 fontSize = 16.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = colors.lightText
+                                color = if (resolvedGender != null) colors.lightText else colors.mutedText
                             )
                         }
 

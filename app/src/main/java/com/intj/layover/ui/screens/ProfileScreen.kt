@@ -643,6 +643,7 @@ fun ProfileScreen(
                             val effectiveCompact = compactAvatarBytes ?: avatarBytes
                             LayoverFileLogger.log("ProfileScreen saving profile: compactBytes=${effectiveCompact?.size ?: 0}")
                             val updatedProfile = profile.copy(
+                                displayName = profile.displayName.trim().take(7),
                                 age = selectedAge,
                                 avatarBytes = avatarBytes,
                                 compactTransferAvatarBytes = effectiveCompact,
@@ -702,6 +703,7 @@ fun ProfileScreen(
                                     uiState.transport.stopDiscovery()
                                 }
                                 val updatedProfile = profile.copy(
+                                    displayName = profile.displayName.trim().take(7),
                                     age = selectedAge,
                                     avatarBytes = avatarBytes,
                                     compactTransferAvatarBytes = compactAvatarBytes ?: avatarBytes,

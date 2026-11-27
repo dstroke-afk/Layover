@@ -15,7 +15,7 @@ sealed class WireFrame {
     data class ConnectionRequest(
         val senderId: String,
         val displayName: String,
-        val gender: GenderOption = GenderOption.MALE,
+        val gender: GenderOption? = null,
         val age: Int? = null
     ) : WireFrame()
 
@@ -64,12 +64,13 @@ object WireFrameCodec {
     fun encodeConnectionRequest(
         senderId: String,
         displayName: String,
-        gender: GenderOption = GenderOption.MALE,
+        gender: GenderOption? = null,
         age: Int? = null
     ): String {
         val safeName = displayName.replace("|", " ")
+        val genderPart = gender?.name ?: ""
         val agePart = age?.toString() ?: ""
-        return "CONNECTION_REQUEST|$senderId|$safeName|${gender.name}|$agePart"
+        return "CONNECTION_REQUEST|$senderId|$safeName|$genderPart|$agePart"
     }
 
     fun encodeConnectionAccept(senderId: String): String {
@@ -132,7 +133,9 @@ object WireFrameCodec {
 
             "CONNECTION_REQUEST" -> {
                 if (parts.size >= 3) {
-                    val gender = GenderOption.fromLabelOrName(parts.getOrNull(3))
+                    val gender = parts.getOrNull(3)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { GenderOption.fromLabelOrName(it) }
                     val age = parts.getOrNull(4)?.takeIf { it.isNotBlank() }?.toIntOrNull()
                     WireFrame.ConnectionRequest(
                         senderId = parts[1],

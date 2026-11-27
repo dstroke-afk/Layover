@@ -39,11 +39,27 @@ object PeerAliasRegistry {
                 !trimmed.equals("user", ignoreCase = true) &&
                 !trimmed.equals("local", ignoreCase = true) &&
                 !trimmed.equals("remote_peer", ignoreCase = true) &&
-                !trimmed.equals("unknown_mac", ignoreCase = true)
+                !trimmed.equals("unknown_mac", ignoreCase = true) &&
+                !trimmed.startsWith("Layover Peer (", ignoreCase = true)
+    }
+
+    private fun expandSeedWithDerivedInstanceId(raw: String): Set<String> {
+        val out = linkedSetOf(raw)
+        if (raw.startsWith("dev_", ignoreCase = true)) {
+            val derivedInstanceHex = LayoverBlePayloadEncoder.getInstanceIdHex(raw)
+            if (isValidAlias(derivedInstanceHex)) {
+                out.add(derivedInstanceHex)
+            }
+        }
+        return out
     }
 
     fun linkAliases(rawAliases: Collection<String?>) {
-        val clean = rawAliases.filter(::isValidAlias).map { it!!.trim() }.toSet()
+        val clean = linkedSetOf<String>()
+        for (raw in rawAliases) {
+            if (!isValidAlias(raw)) continue
+            clean.addAll(expandSeedWithDerivedInstanceId(raw!!.trim()))
+        }
         if (clean.isEmpty()) return
 
         val overlapping = aliasGroups.filter { group ->
@@ -61,11 +77,11 @@ object PeerAliasRegistry {
 
     fun resolveAliases(identifier: String?): Set<String> {
         if (!isValidAlias(identifier)) return emptySet()
-        val target = identifier!!.trim()
-        val result = linkedSetOf<String>(target)
+        val seeds = expandSeedWithDerivedInstanceId(identifier!!.trim())
+        val result = linkedSetOf<String>().apply { addAll(seeds) }
 
         aliasGroups.filter { group ->
-            group.any { it.equals(target, ignoreCase = true) }
+            group.any { existing -> seeds.any { seed -> existing.equals(seed, ignoreCase = true) } }
         }.forEach { group ->
             result.addAll(group)
         }
@@ -119,20 +135,21 @@ class BleProximityTransport(
     var onPeerProfileUpdated: ((
         peerId: String,
         displayName: String?,
-        gender: GenderOption,
+        gender: GenderOption?,
         age: Int?,
         avatarBytes: ByteArray?
     ) -> Unit)? = null
 
     fun sendProfileSync(targetPeerId: String? = null) {
         val localId = currentUserProfile.handle.ifEmpty { "user" }
-        val compactBytes = currentUserProfile.compactTransferAvatarBytes ?: currentUserProfile.avatarBytes
+        // Avatar bytes are already fetched via dedicated chunked LAYOVER_AVATAR_CHAR_UUID reads;
+        // omit multi-KB avatar blobs here so PROFILE_SYNC stays compact on the control channel.
         val frame = WireFrameCodec.encodeProfileSync(
             senderId = localId,
             displayName = currentUserProfile.displayName,
             gender = currentUserProfile.gender,
             age = currentUserProfile.age,
-            compactAvatarBytes = compactBytes
+            compactAvatarBytes = null
         )
         if (targetPeerId != null && targetPeerId.isNotBlank()) {
             activePeerId = targetPeerId
@@ -152,6 +169,9 @@ class BleProximityTransport(
 
     private var hasSentKeyExchange = false
     private var hasReceivedKeyExchange = false
+    private var lastEstablishedRemotePublicKey: String? = null
+    private var lastRespondedRemotePublicKey: String? = null
+    private var lastKeyExchangeSentMs: Long = 0L
     private val pendingEncryptedRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
 
     val isE2eeEstablished: Boolean
@@ -206,6 +226,9 @@ class BleProximityTransport(
                     sessionCryptoManager.clearSession()
                     hasSentKeyExchange = false
                     hasReceivedKeyExchange = false
+                    lastEstablishedRemotePublicKey = null
+                    lastRespondedRemotePublicKey = null
+                    lastKeyExchangeSentMs = 0L
                     diagnosticsTracker.updateKeyHandshakeComplete(false)
                     diagnosticsTracker.updateSessionFingerprint(null)
                     if (state == RfcommConnectionState.FAILED) {
@@ -226,7 +249,9 @@ class BleProximityTransport(
                 val currentPeer = activePeerId ?: rawSenderMac
                 val rawType = rawFrame.text.substringBefore("|")
 
-                LayoverFileLogger.log("FRAME INGESTION [1/3]: rawType=$rawType, rawSender=$rawSenderMac, activePeer=$activePeerId, len=${rawFrame.text.length}")
+                if (rawType != "KEY_EXCHANGE") {
+                    LayoverFileLogger.log("FRAME INGESTION [1/3]: rawType=$rawType, rawSender=$rawSenderMac, activePeer=$activePeerId, len=${rawFrame.text.length}")
+                }
 
                 val frame = WireFrameCodec.decodeFrame(rawFrame.text)
                 if (frame == null) {
@@ -245,7 +270,16 @@ class BleProximityTransport(
                     is WireFrame.ChatEncrypted -> frame.senderId
                 }
 
-                val frameDisplayName = if (frame is WireFrame.ConnectionRequest) frame.displayName else ""
+                val frameDisplayName = when (frame) {
+                    is WireFrame.ConnectionRequest -> frame.displayName
+                    is WireFrame.ProfileSync -> frame.displayName
+                    else -> ""
+                }
+
+                val matchedDiscovered = discoveryManager.findDiscoveredPeer(frameSenderId)
+                    ?: activePeerId?.let { discoveryManager.findDiscoveredPeer(it) }
+                    ?: discoveryManager.findDiscoveredPeer(rawSenderMac)
+                    ?: frameDisplayName.takeIf { it.isNotBlank() }?.let { discoveryManager.findDiscoveredPeer(it) }
 
                 PeerAliasRegistry.linkAliases(
                     listOfNotNull(
@@ -253,7 +287,10 @@ class BleProximityTransport(
                         rawSenderMac,
                         lastGattMac,
                         frameSenderId,
-                        frameDisplayName.ifEmpty { null }
+                        frameDisplayName.ifEmpty { null },
+                        matchedDiscovered?.id,
+                        matchedDiscovered?.handle?.ifEmpty { null },
+                        matchedDiscovered?.displayName?.ifEmpty { null }
                     )
                 )
 
@@ -287,14 +324,47 @@ class BleProximityTransport(
                 }
 
                 diagnosticsTracker.incrementMessagesReceived()
-                LayoverFileLogger.log("FRAME INGESTION [3/3]: PASSED frame from sender=$frameSenderId. Messages Received=${diagnosticsTracker.diagnosticsState.value.messagesReceived}")
+                if (frame !is WireFrame.KeyExchange) {
+                    LayoverFileLogger.log("FRAME INGESTION [3/3]: PASSED frame from sender=$frameSenderId. Messages Received=${diagnosticsTracker.diagnosticsState.value.messagesReceived}")
+                }
 
                 when (frame) {
                     is WireFrame.KeyExchange -> {
                         if (frame.senderId.isNotEmpty() && frame.senderId != "local" && frame.senderId != "user") {
                             activePeerId = frame.senderId
                         }
-                        LayoverFileLogger.log("KeyExchange applied for peer=${frame.senderId}. Algorithm=${frame.algorithm}")
+
+                        val alreadyEstablishedSameKey = sessionCryptoManager.isSessionKeyEstablished &&
+                            lastEstablishedRemotePublicKey == frame.publicKeyBase64
+
+                        if (alreadyEstablishedSameKey) {
+                            if (!frame.isResponse && lastRespondedRemotePublicKey != frame.publicKeyBase64) {
+                                val localPub = sessionCryptoManager.getLocalPublicKeyBase64()
+                                if (localPub != null) {
+                                    val localId = currentUserProfile.handle.ifEmpty { "local" }
+                                    val responsePayload = WireFrameCodec.encodeKeyExchange(
+                                        senderId = localId,
+                                        publicKeyBase64 = localPub,
+                                        algorithm = sessionCryptoManager.getAlgorithmName(),
+                                        isResponse = true
+                                    )
+                                    hasSentKeyExchange = true
+                                    lastRespondedRemotePublicKey = frame.publicKeyBase64
+                                    lastKeyExchangeSentMs = System.currentTimeMillis()
+                                    LayoverFileLogger.log("Sending single KeyExchange response to established peer=${frame.senderId}")
+                                    gattSessionManager.sendFrame(responsePayload)
+                                    gattSessionManager.flushQueue()
+                                }
+                            } else {
+                                LayoverFileLogger.logThrottled(
+                                    "key_exchange_dup_${frame.senderId}",
+                                    "Ignoring duplicate KeyExchange from ${frame.senderId} (isResponse=${frame.isResponse}); E2EE session already established."
+                                )
+                            }
+                            return@collect
+                        }
+
+                        LayoverFileLogger.log("KeyExchange applied for peer=${frame.senderId}. Algorithm=${frame.algorithm}, isResponse=${frame.isResponse}")
                         hasReceivedKeyExchange = true
                         if (sessionCryptoManager.getLocalPublicKeyBase64() == null) {
                             sessionCryptoManager.generateKeyPair()
@@ -305,7 +375,15 @@ class BleProximityTransport(
                         )
                         LayoverFileLogger.log("KeyExchange establishRemoteKey success=$success for peer=${frame.senderId}")
 
-                        if (sessionCryptoManager.getLocalPublicKeyBase64() != null && success && !frame.isResponse) {
+                        if (success && sessionCryptoManager.isSessionKeyEstablished) {
+                            lastEstablishedRemotePublicKey = frame.publicKeyBase64
+                        }
+
+                        if (sessionCryptoManager.getLocalPublicKeyBase64() != null &&
+                            success &&
+                            !frame.isResponse &&
+                            lastRespondedRemotePublicKey != frame.publicKeyBase64
+                        ) {
                             val localPub = sessionCryptoManager.getLocalPublicKeyBase64()!!
                             val localId = currentUserProfile.handle.ifEmpty { "local" }
                             val responsePayload = WireFrameCodec.encodeKeyExchange(
@@ -315,6 +393,8 @@ class BleProximityTransport(
                                 isResponse = true
                             )
                             hasSentKeyExchange = true
+                            lastRespondedRemotePublicKey = frame.publicKeyBase64
+                            lastKeyExchangeSentMs = System.currentTimeMillis()
                             LayoverFileLogger.log("Sending bidirectional KeyExchange response payload to peer=${frame.senderId} (algo=${sessionCryptoManager.getAlgorithmName()})...")
                             gattSessionManager.sendFrame(responsePayload)
                             gattSessionManager.flushQueue()
@@ -467,11 +547,17 @@ class BleProximityTransport(
     }
 
     private fun initiateE2eeHandshake() {
+        val now = System.currentTimeMillis()
         if (hasSentKeyExchange && sessionCryptoManager.isSessionKeyEstablished) {
-            LayoverFileLogger.log("KeyExchange already completed. Skipping duplicate send.")
+            LayoverFileLogger.logThrottled("key_exchange_skip_established", "KeyExchange already completed. Skipping duplicate send.")
+            return
+        }
+        if (hasSentKeyExchange && (now - lastKeyExchangeSentMs) < 3_000L) {
+            LayoverFileLogger.logThrottled("key_exchange_skip_debounce", "KeyExchange recently sent; debouncing duplicate initiateE2eeHandshake.")
             return
         }
         hasSentKeyExchange = true
+        lastKeyExchangeSentMs = now
         LayoverFileLogger.log("Initiating E2EE key exchange handshake over GATT...")
         val pubKeyB64 = sessionCryptoManager.getLocalPublicKeyBase64() ?: sessionCryptoManager.generateKeyPair()
         val algo = sessionCryptoManager.getAlgorithmName()
@@ -488,6 +574,7 @@ class BleProximityTransport(
             diagnosticsTracker.updateLastErrorMessage(null)
         } else {
             hasSentKeyExchange = false
+            lastKeyExchangeSentMs = 0L
             diagnosticsTracker.updateLastErrorMessage("Failed to send key exchange frame")
         }
     }
@@ -541,14 +628,37 @@ class BleProximityTransport(
         discoveryManager.stopAdvertising()
     }
 
+    private fun linkOutboundPeerAliases(peerId: String) {
+        val discovered = discoveryManager.findDiscoveredPeer(peerId)
+        val deviceMac = discoveryManager.getDiscoveredDevice(peerId)?.address
+        PeerAliasRegistry.linkAliases(
+            listOfNotNull(
+                peerId,
+                activePeerId,
+                lastGattMac,
+                deviceMac,
+                discovered?.id,
+                discovered?.handle?.ifEmpty { null },
+                discovered?.displayName?.ifEmpty { null }
+            )
+        )
+    }
+
     override fun sendConnectionRequest(peerId: String) {
-        val lastTime = lastRequestTimeMap[peerId] ?: 0L
+        linkOutboundPeerAliases(peerId)
         val now = System.currentTimeMillis()
-        if (now - lastTime < 800L) {
+        val peerAliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+        val recentRequestExists = peerAliases.any { alias ->
+            val lastTime = lastRequestTimeMap[alias.lowercase()] ?: 0L
+            (now - lastTime) < 800L
+        }
+        if (recentRequestExists) {
             LayoverFileLogger.log("Debouncing duplicate sendConnectionRequest for peerId=$peerId within 800ms.")
             return
         }
-        lastRequestTimeMap[peerId] = now
+        peerAliases.forEach { alias ->
+            lastRequestTimeMap[alias.lowercase()] = now
+        }
 
         LayoverFileLogger.log("sendConnectionRequest to peerId=$peerId")
         if (isPeerIdentifierBlocked(peerId)) {
@@ -570,6 +680,7 @@ class BleProximityTransport(
     }
 
     override fun acceptConnectionRequest(peerId: String) {
+        linkOutboundPeerAliases(peerId)
         LayoverFileLogger.log("acceptConnectionRequest for peerId=$peerId")
         if (isPeerIdentifierBlocked(peerId)) {
             diagnosticsTracker.incrementBlockedDrops()
@@ -586,6 +697,7 @@ class BleProximityTransport(
     }
 
     override fun declineConnectionRequest(peerId: String) {
+        linkOutboundPeerAliases(peerId)
         LayoverFileLogger.log("declineConnectionRequest for peerId=$peerId")
         val declineFrame = WireFrameCodec.encodeConnectionDecline(
             senderId = currentUserProfile.handle.ifEmpty { "user" }
@@ -689,6 +801,9 @@ class BleProximityTransport(
         sessionCryptoManager.clearSession()
         hasSentKeyExchange = false
         hasReceivedKeyExchange = false
+        lastEstablishedRemotePublicKey = null
+        lastRespondedRemotePublicKey = null
+        lastKeyExchangeSentMs = 0L
         gattSessionManager.cleanup()
     }
 }

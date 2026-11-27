@@ -137,6 +137,18 @@ class BleDiscoveryManager(
         return record?.device
     }
 
+    fun findDiscoveredPeer(peerId: String): NearbyPeer? {
+        val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
+        return aliases.firstNotNullOfOrNull { key ->
+            peerMap[key]?.peer ?: peerMap.values.find {
+                it.peer.id.equals(key, ignoreCase = true) ||
+                        it.peer.handle.equals(key, ignoreCase = true) ||
+                        it.device.address.equals(key, ignoreCase = true) ||
+                        (it.peer.displayName.isNotBlank() && it.peer.displayName.equals(key, ignoreCase = true))
+            }?.peer
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun startAdvertising(userProfile: UserProfile) {
         if (!userProfile.isVisibleToNearby) {
@@ -166,6 +178,15 @@ class BleDiscoveryManager(
         }
 
         stopAdvertising()
+        startAdvertisingInternal(advertiser, userProfile, tier = 0)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startAdvertisingInternal(
+        advertiser: BluetoothLeAdvertiser,
+        userProfile: UserProfile,
+        tier: Int
+    ) {
         currentAdvertiser = advertiser
 
         val settings = AdvertiseSettings.Builder()
@@ -175,29 +196,52 @@ class BleDiscoveryManager(
             .setTimeout(0)
             .build()
 
-        val payload = LayoverBlePayloadEncoder.encodePayload(
-            displayName = userProfile.displayName,
-            isVisible = userProfile.isVisibleToNearby,
-            handleOrDeviceId = userProfile.handle,
-            age = userProfile.age
-        )
-
         val advertiseData = AdvertiseData.Builder()
             .addServiceUuid(LayoverBleConstants.LAYOVER_SERVICE_UUID)
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .build()
 
-        val scanResponseData = AdvertiseData.Builder()
-            .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, payload)
-            .setIncludeDeviceName(false)
-            .setIncludeTxPowerLevel(false)
-            .build()
+        val payload: ByteArray? = when (tier) {
+            0 -> LayoverBlePayloadEncoder.encodePayload(
+                displayName = userProfile.displayName,
+                isVisible = userProfile.isVisibleToNearby,
+                handleOrDeviceId = userProfile.handle,
+                age = userProfile.age,
+                gender = userProfile.gender,
+                maxPayloadBytes = LayoverBleConstants.MAX_SERVICE_DATA_PAYLOAD_BYTES
+            )
+            1 -> LayoverBlePayloadEncoder.encodePayload(
+                displayName = userProfile.displayName,
+                isVisible = userProfile.isVisibleToNearby,
+                handleOrDeviceId = userProfile.handle,
+                age = userProfile.age,
+                gender = userProfile.gender,
+                maxPayloadBytes = LayoverBleConstants.COMPACT_SERVICE_DATA_PAYLOAD_BYTES
+            )
+            else -> null
+        }
+
+        val scanResponseData = payload?.let {
+            AdvertiseData.Builder()
+                .addServiceData(LayoverBleConstants.LAYOVER_SERVICE_UUID, it)
+                .setIncludeDeviceName(false)
+                .setIncludeTxPowerLevel(false)
+                .build()
+        }
+
+        val primaryBytes = LayoverBlePayloadEncoder.calculatePrimaryAdvertiseBytes(includeFlags = true)
+        val serviceDataPayloadBytes = payload?.size ?: 0
+        val scanResponseBytes = LayoverBlePayloadEncoder.calculateScanResponseBytes(serviceDataPayloadBytes)
 
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                 val instId = LayoverBlePayloadEncoder.getInstanceIdHex(userProfile.handle)
-                LayoverFileLogger.log("SUCCESS: BLE Advertising started (LOW_LATENCY, HIGH_POWER, CONNECTABLE). InstanceId=$instId")
+                LayoverFileLogger.log(
+                    "SUCCESS: BLE Advertising started (tier=$tier, LOW_LATENCY, HIGH_POWER, CONNECTABLE). " +
+                        "InstanceId=$instId, Primary=${primaryBytes}B, ScanResponse=${scanResponseBytes}B, " +
+                        "ServiceDataPayload=${serviceDataPayloadBytes}B"
+                )
                 bleStateController.startAdvertising()
             }
 
@@ -210,18 +254,43 @@ class BleDiscoveryManager(
                     ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "ADVERTISE_FAILED_FEATURE_UNSUPPORTED (5)"
                     else -> "ErrorCode $errorCode"
                 }
-                LayoverFileLogger.logError("BLE Advertising failed with $errReason. Primary bytes: 18, ScanResponse bytes: 25.")
-                bleStateController.stopAdvertising()
+                LayoverFileLogger.logError(
+                    "BLE Advertising failed (tier=$tier) with $errReason. " +
+                        "Primary=${primaryBytes}B, ScanResponse=${scanResponseBytes}B, " +
+                        "ServiceDataPayload=${serviceDataPayloadBytes}B."
+                )
+
+                val shouldFallback = when {
+                    tier == 0 && errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE -> true
+                    tier < 2 && (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE || errorCode == ADVERTISE_FAILED_FEATURE_UNSUPPORTED) -> true
+                    else -> false
+                }
+                if (shouldFallback) {
+                    val nextTier = if (errorCode == ADVERTISE_FAILED_FEATURE_UNSUPPORTED) 2 else tier + 1
+                    LayoverFileLogger.log("Retrying BLE advertising with fallback tier=$nextTier...")
+                    advertiseCallback = null
+                    startAdvertisingInternal(advertiser, userProfile, tier = nextTier)
+                } else {
+                    bleStateController.stopAdvertising()
+                }
             }
         }
 
         advertiseCallback = callback
 
         try {
-            LayoverFileLogger.log("Requesting BluetoothLeAdvertiser.startAdvertising(...) [Primary: 18B, ScanResponse: 25B]")
-            advertiser.startAdvertising(settings, advertiseData, scanResponseData, callback)
+            LayoverFileLogger.log(
+                "Requesting BluetoothLeAdvertiser.startAdvertising(...) " +
+                    "[tier=$tier, Primary=${primaryBytes}B, ScanResponse=${scanResponseBytes}B, " +
+                    "ServiceDataPayload=${serviceDataPayloadBytes}B]"
+            )
+            if (scanResponseData != null) {
+                advertiser.startAdvertising(settings, advertiseData, scanResponseData, callback)
+            } else {
+                advertiser.startAdvertising(settings, advertiseData, callback)
+            }
         } catch (e: Exception) {
-            LayoverFileLogger.logError("Exception starting BLE advertising", e)
+            LayoverFileLogger.logError("Exception starting BLE advertising (tier=$tier)", e)
             bleStateController.stopAdvertising()
         }
     }
@@ -335,18 +404,46 @@ class BleDiscoveryManager(
             return
         }
 
-        val fallbackName = payload?.displayName?.ifEmpty { null }
-            ?: "Layover Peer (${macAddress.takeLast(4)})"
+        val payloadInstanceKey = payload?.instanceIdHex?.takeIf { it.isNotBlank() }
+        val macAliases = PeerAliasRegistry.resolveAliases(macAddress) + macAddress
 
-        val mapKey = payload?.instanceIdHex?.ifBlank { macAddress } ?: macAddress
+        val existingEntry = (payloadInstanceKey?.let { key -> peerMap.entries.find { it.key.equals(key, ignoreCase = true) } })
+            ?: peerMap.entries.find { entry ->
+                entry.value.device.address.equals(macAddress, ignoreCase = true) ||
+                    entry.value.peer.id.equals(macAddress, ignoreCase = true) ||
+                    (payloadInstanceKey != null && entry.value.peer.handle.equals(payloadInstanceKey, ignoreCase = true)) ||
+                    macAliases.any { alias ->
+                        entry.key.equals(alias, ignoreCase = true) ||
+                            entry.value.peer.id.equals(alias, ignoreCase = true)
+                    }
+            }
+        val existingRecord = existingEntry?.value
+
+        val mapKey = payloadInstanceKey ?: existingEntry?.key ?: macAddress
+        if (existingEntry != null && !existingEntry.key.equals(mapKey, ignoreCase = true)) {
+            peerMap.remove(existingEntry.key)
+        }
+
+        val existingName = existingRecord?.peer?.displayName?.takeIf { it.isNotBlank() }
+        val incomingName = payload?.displayName?.takeIf { it.isNotBlank() }
+        val existingNameIsReal = existingName != null && !existingName.startsWith("Layover Peer (", ignoreCase = true)
+        val incomingNameIsReal = incomingName != null && !incomingName.startsWith("Layover Peer (", ignoreCase = true)
+
+        val resolvedName = when {
+            incomingNameIsReal && existingNameIsReal &&
+                existingName.length > incomingName.length &&
+                existingName.startsWith(incomingName, ignoreCase = true) -> existingName
+            incomingNameIsReal -> incomingName
+            existingNameIsReal -> existingName
+            incomingName != null -> incomingName
+            existingName != null -> existingName
+            else -> "Layover Peer (${macAddress.takeLast(4)})"
+        }
 
         val incomingAdTag: String? = serviceData?.takeIf { it.isNotEmpty() }?.let { bytes ->
             bytes.joinToString("") { "%02X".format(it) }
         }
 
-        val existingRecord = peerMap[mapKey] ?: peerMap.values.find {
-            it.peer.id == macAddress || it.peer.handle == mapKey || it.device.address.equals(macAddress, ignoreCase = true)
-        }
         val currentStatus = existingRecord?.peer?.status ?: ConnectionStatus.NONE
 
         val hasValidCachedAvatar = cachedAvatarsByKey.containsKey(mapKey) ||
@@ -377,16 +474,18 @@ class BleDiscoveryManager(
         }
 
         val resolvedAge = payload?.age ?: existingRecord?.peer?.age
+        val resolvedGender = payload?.gender ?: existingRecord?.peer?.gender
 
         val updatedPeer = NearbyPeer(
             id = mapKey,
-            displayName = fallbackName,
+            displayName = resolvedName,
             handle = mapKey,
+            gender = resolvedGender,
             age = resolvedAge,
             status = currentStatus,
             avatar = PeerAvatar(
                 peerId = mapKey,
-                initials = fallbackName.split(" ")
+                initials = resolvedName.split(" ")
                     .mapNotNull { it.firstOrNull()?.toString() }
                     .take(2)
                     .joinToString("")
@@ -402,7 +501,7 @@ class BleDiscoveryManager(
                 macAddress,
                 existingRecord?.peer?.id,
                 existingRecord?.peer?.handle,
-                fallbackName
+                resolvedName.takeUnless { it.startsWith("Layover Peer (", ignoreCase = true) }
             )
         )
 
@@ -413,7 +512,12 @@ class BleDiscoveryManager(
         )
 
         _discoveredPeers.value = peerMap.values.map { it.peer }
-        LayoverFileLogger.logThrottled("scan_$mapKey", "BLE scan result emitted: Key=$mapKey, MAC=$macAddress, Name=$fallbackName, DiscoveredTotal=${_discoveredPeers.value.size}")
+        LayoverFileLogger.logThrottled(
+            "scan_$mapKey",
+            "BLE scan result emitted: Key=$mapKey, MAC=$macAddress, Name=$resolvedName, " +
+                "age=$resolvedAge, gender=$resolvedGender, hasServiceData=${serviceData != null}, " +
+                "DiscoveredTotal=${_discoveredPeers.value.size}"
+        )
 
         maybeFetchAvatar(result.device, mapKey)
     }
@@ -517,14 +621,25 @@ class BleDiscoveryManager(
 
     fun updatePeerStatus(peerId: String, newStatus: ConnectionStatus) {
         val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
-        val record = aliases.firstNotNullOfOrNull { key ->
-            peerMap[key] ?: peerMap.values.find { it.peer.id.equals(key, ignoreCase = true) || it.peer.handle.equals(key, ignoreCase = true) }
+        val matchingEntries = peerMap.entries.filter { entry ->
+            aliases.any { key ->
+                entry.key.equals(key, ignoreCase = true) ||
+                    entry.value.peer.id.equals(key, ignoreCase = true) ||
+                    entry.value.peer.handle.equals(key, ignoreCase = true) ||
+                    entry.value.device.address.equals(key, ignoreCase = true) ||
+                    (entry.value.peer.displayName.isNotBlank() && entry.value.peer.displayName.equals(key, ignoreCase = true))
+            }
         }
-        if (record != null) {
-            val updated = record.peer.copy(status = newStatus)
-            val key = peerMap.entries.find { it.value.peer.id == record.peer.id }?.key ?: peerId
-            peerMap[key] = record.copy(peer = updated)
-            _discoveredPeers.value = peerMap.values.map { it.peer }
+        if (matchingEntries.isNotEmpty()) {
+            var updatedAny = false
+            matchingEntries.forEach { entry ->
+                val updated = entry.value.peer.copy(status = newStatus)
+                peerMap[entry.key] = entry.value.copy(peer = updated)
+                updatedAny = true
+            }
+            if (updatedAny) {
+                _discoveredPeers.value = peerMap.values.map { it.peer }
+            }
         }
     }
 

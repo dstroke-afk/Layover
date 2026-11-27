@@ -66,12 +66,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.intj.layover.ble.BlePermissionHelper
+import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.formatPeerNameWithBadge
 import com.intj.layover.navigation.LayoverBackground
+import com.intj.layover.notifications.UnreadMessageTracker
 import com.intj.layover.ui.theme.LayoverTheme
 
 internal fun initialsForName(name: String, fallback: String = "?"): String {
@@ -84,50 +87,133 @@ internal fun initialsForName(name: String, fallback: String = "?"): String {
     return computed.ifEmpty { fallback }
 }
 
+private fun isPlaceholderPeerName(name: String): Boolean {
+    val trimmed = name.trim()
+    return trimmed.isEmpty() || trimmed.startsWith("Layover Peer (", ignoreCase = true)
+}
+
+private fun expandedPeerIdentityAliases(peer: NearbyPeer): Set<String> {
+    val result = linkedSetOf<String>()
+    fun addId(raw: String) {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return
+        result.add(trimmed)
+        result.addAll(PeerAliasRegistry.resolveAliases(trimmed))
+    }
+    addId(peer.id)
+    addId(peer.handle)
+    return result
+}
+
+private fun peersShareIdentity(
+    a: NearbyPeer,
+    aAliases: Set<String>,
+    b: NearbyPeer,
+    bAliases: Set<String>
+): Boolean {
+    if (aAliases.any { aId -> bAliases.any { bId -> aId.equals(bId, ignoreCase = true) } }) {
+        return true
+    }
+    val aRealName = a.displayName.trim().takeUnless(::isPlaceholderPeerName)
+    val bRealName = b.displayName.trim().takeUnless(::isPlaceholderPeerName)
+    return aRealName != null && bRealName != null && aRealName.equals(bRealName, ignoreCase = true)
+}
+
+private fun mergeCanonicalPeers(existing: NearbyPeer, incoming: NearbyPeer): NearbyPeer {
+    val statusPriority = mapOf(
+        ConnectionStatus.ACCEPTED to 4,
+        ConnectionStatus.REQUESTED to 3,
+        ConnectionStatus.DECLINED to 2,
+        ConnectionStatus.NONE to 1
+    )
+    val bestStatus = if ((statusPriority[incoming.status] ?: 0) > (statusPriority[existing.status] ?: 0)) {
+        incoming.status
+    } else {
+        existing.status
+    }
+
+    val combinedAliases = expandedPeerIdentityAliases(existing) + expandedPeerIdentityAliases(incoming)
+    val preferredDevId = listOf(existing.id, incoming.id, existing.handle, incoming.handle)
+        .firstOrNull { it.startsWith("dev_", ignoreCase = true) }
+        ?: combinedAliases.firstOrNull { it.startsWith("dev_", ignoreCase = true) }
+
+    val bestId = preferredDevId
+        ?: existing.id.ifBlank { incoming.id }
+    val bestHandle = preferredDevId
+        ?: existing.handle.ifBlank { incoming.handle }.ifBlank { bestId }
+
+    val existingName = existing.displayName.trim()
+    val incomingName = incoming.displayName.trim()
+    val existingReal = !isPlaceholderPeerName(existingName)
+    val incomingReal = !isPlaceholderPeerName(incomingName)
+    val bestName = when {
+        incomingReal && existingReal -> {
+            when {
+                existingName.length > incomingName.length &&
+                    existingName.startsWith(incomingName, ignoreCase = true) -> existingName
+                incomingName.length > existingName.length &&
+                    incomingName.startsWith(existingName, ignoreCase = true) -> incomingName
+                else -> incomingName
+            }
+        }
+        incomingReal -> incomingName
+        existingReal -> existingName
+        incomingName.isNotEmpty() -> incomingName
+        else -> existingName
+    }
+
+    val bestGender = incoming.gender ?: existing.gender
+    val bestAge = incoming.age?.takeIf { it > 0 } ?: existing.age?.takeIf { it > 0 }
+    val bestAvatarBytes = incoming.avatar.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
+        ?: existing.avatar.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
+
+    return existing.copy(
+        id = bestId,
+        handle = bestHandle,
+        displayName = bestName,
+        gender = bestGender,
+        age = bestAge,
+        status = bestStatus,
+        avatar = existing.avatar.copy(
+            peerId = bestId,
+            initials = initialsForName(bestName, fallback = existing.avatar.initials.ifEmpty { "?" }),
+            avatarBase64OrBytes = bestAvatarBytes
+        )
+    )
+}
+
 fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
     val canonicalList = mutableListOf<NearbyPeer>()
+    val aliasCache = mutableListOf<MutableSet<String>>()
 
     for (p in peers) {
-        val existingIndex = canonicalList.indexOfFirst { existing ->
-            existing.id.equals(p.id, ignoreCase = true) ||
-                    (existing.handle.isNotEmpty() && p.handle.isNotEmpty() && existing.handle.equals(p.handle, ignoreCase = true)) ||
-                    (existing.displayName.isNotEmpty() && p.displayName.isNotEmpty() && existing.displayName.equals(p.displayName, ignoreCase = true))
+        val pAliases = expandedPeerIdentityAliases(p)
+        val matchingIndices = canonicalList.indices.filter { idx ->
+            peersShareIdentity(canonicalList[idx], aliasCache[idx], p, pAliases)
         }
 
-        if (existingIndex == -1) {
+        if (matchingIndices.isEmpty()) {
             canonicalList.add(p)
+            aliasCache.add(pAliases.toMutableSet())
         } else {
-            val existing = canonicalList[existingIndex]
-            val statusPriority = mapOf(
-                ConnectionStatus.ACCEPTED to 4,
-                ConnectionStatus.REQUESTED to 3,
-                ConnectionStatus.DECLINED to 2,
-                ConnectionStatus.NONE to 1
-            )
-            val bestStatus = if ((statusPriority[p.status] ?: 0) > (statusPriority[existing.status] ?: 0)) {
-                p.status
-            } else {
-                existing.status
+            val primaryIdx = matchingIndices.first()
+            var merged = mergeCanonicalPeers(canonicalList[primaryIdx], p)
+            val mergedAliases = linkedSetOf<String>().apply {
+                addAll(aliasCache[primaryIdx])
+                addAll(pAliases)
             }
 
-            val bestId = if (p.id.startsWith("dev_")) p.id else existing.id
-            val bestHandle = if (p.handle.startsWith("dev_")) p.handle else existing.handle.ifEmpty { p.handle }
-            val bestName = if (p.displayName.isNotBlank()) p.displayName else existing.displayName
-            val bestAge = p.age ?: existing.age
-            val bestAvatar = when {
-                p.avatar.avatarBase64OrBytes != null -> p.avatar
-                existing.avatar.avatarBase64OrBytes != null -> existing.avatar
-                else -> p.avatar
+            // If p bridges multiple previously separate entries, merge them all into primaryIdx
+            for (extraIdx in matchingIndices.drop(1).asReversed()) {
+                merged = mergeCanonicalPeers(merged, canonicalList[extraIdx])
+                mergedAliases.addAll(aliasCache[extraIdx])
+                canonicalList.removeAt(extraIdx)
+                aliasCache.removeAt(extraIdx)
             }
 
-            canonicalList[existingIndex] = existing.copy(
-                id = bestId,
-                handle = bestHandle,
-                displayName = bestName,
-                age = bestAge,
-                status = bestStatus,
-                avatar = bestAvatar
-            )
+            mergedAliases.addAll(expandedPeerIdentityAliases(merged))
+            canonicalList[primaryIdx] = merged
+            aliasCache[primaryIdx] = mergedAliases
         }
     }
 
@@ -361,14 +447,34 @@ fun PeopleAroundScreen(
                 }
 
                 items(filteredPeers, key = { it.id }) { peer ->
+                    val peerCandidates = listOfNotNull(
+                        peer.id.takeIf { it.isNotBlank() },
+                        peer.handle.takeIf { it.isNotBlank() },
+                        peer.displayName.takeIf { it.isNotBlank() }
+                    )
+                    val expandedPeerIds = UnreadMessageTracker.expandIdentifiers(peerCandidates)
+                    val isBlocked = expandedPeerIds.any { candidate ->
+                        uiState.blockedPeerIds.any { blocked ->
+                            blocked.equals(candidate, ignoreCase = true) ||
+                                PeerAliasRegistry.resolveAliases(blocked).any { it.equals(candidate, ignoreCase = true) }
+                        }
+                    }
+                    val isMuted = expandedPeerIds.any { candidate ->
+                        uiState.mutedPeerIds.any { muted ->
+                            muted.equals(candidate, ignoreCase = true) ||
+                                PeerAliasRegistry.resolveAliases(muted).any { it.equals(candidate, ignoreCase = true) }
+                        }
+                    }
+                    val unreadCount = UnreadMessageTracker.resolveUnreadCount(
+                        unreadCountsByPeerId = uiState.unreadCountsByPeerId,
+                        peerCandidates = peerCandidates
+                    )
                     PeerListItemCard(
                         peer = peer,
-                        isBlocked = uiState.blockedPeerIds.contains(peer.id) ||
-                                (peer.handle.isNotEmpty() && uiState.blockedPeerIds.contains(peer.handle)) ||
-                                (peer.displayName.isNotEmpty() && uiState.blockedPeerIds.contains(peer.displayName)),
-                        isMuted = uiState.mutedPeerIds.contains(peer.id),
+                        isBlocked = isBlocked,
+                        isMuted = isMuted,
+                        unreadCount = unreadCount,
                         onConnect = {
-                            uiState.transport.sendConnectionRequest(peer.id)
                             onConnectPeer(peer.id)
                         },
                         onChat = { onOpenChat(peer.id) },
@@ -438,6 +544,7 @@ fun PeerListItemCard(
     peer: NearbyPeer,
     isBlocked: Boolean,
     isMuted: Boolean,
+    unreadCount: Int = 0,
     onConnect: () -> Unit,
     onChat: () -> Unit,
     onToggleBlock: () -> Unit,
@@ -445,6 +552,9 @@ fun PeerListItemCard(
 ) {
     val colors = LayoverTheme.colors
     val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
+    val formattedPeerName = remember(peer.displayName, peer.age, peer.gender) {
+        formatPeerNameWithBadge(peer.displayName, peer.age, peer.gender)
+    }
     val displayInitials = remember(peer.displayName, peer.avatar.initials) {
         if (peer.displayName.isNotBlank()) initialsForName(peer.displayName) else peer.avatar.initials
     }
@@ -518,35 +628,61 @@ fun PeerListItemCard(
                 Spacer(modifier = Modifier.width(14.dp))
 
                 Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = peer.displayName,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (isBlocked) colors.mutedText else colors.lightText,
-                            fontSize = 16.sp
-                        )
-                        if (isMuted) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.VolumeOff,
-                                contentDescription = "Muted",
-                                tint = colors.mutedText,
-                                modifier = Modifier.size(14.dp)
+                    Text(
+                        text = formattedPeerName,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isBlocked) colors.mutedText else colors.lightText,
+                        fontSize = 16.sp
+                    )
+                    when {
+                        isBlocked -> {
+                            Text(
+                                text = "\uD83D\uDEAB Blocked",
+                                color = colors.mutedText,
+                                fontSize = 13.sp
                             )
                         }
-                    }
-                    if (isBlocked) {
-                        Text(
-                            text = "[BLOCKED]",
-                            color = colors.mutedText,
-                            fontSize = 13.sp
-                        )
-                    } else if (peer.handle.isNotEmpty()) {
-                        Text(
-                            text = "@${peer.handle}",
-                            color = colors.mutedText,
-                            fontSize = 13.sp
-                        )
+                        isMuted -> {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (unreadCount > 0) {
+                                    val unreadLabel = if (unreadCount == 1) {
+                                        "1 Unread Message"
+                                    } else {
+                                        "$unreadCount Unread Messages"
+                                    }
+                                    Text(
+                                        text = "$unreadLabel \u2022 ",
+                                        color = colors.mutedText,
+                                        fontSize = 13.sp
+                                    )
+                                }
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.VolumeOff,
+                                    contentDescription = "Muted",
+                                    tint = colors.mutedText,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Muted",
+                                    color = colors.mutedText,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                        unreadCount > 0 -> {
+                            val unreadLabel = if (unreadCount == 1) {
+                                "1 Unread Message"
+                            } else {
+                                "$unreadCount Unread Messages"
+                            }
+                            Text(
+                                text = unreadLabel,
+                                color = colors.cyanAccent,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 13.sp
+                            )
+                        }
                     }
                 }
             }
@@ -668,7 +804,7 @@ fun OneTimeUsernameDialog(
     var ageInput by remember { mutableStateOf("") }
 
     val hasSpace = usernameInput.any { it.isWhitespace() }
-    val tooLong = usernameInput.length > 8
+    val tooLong = usernameInput.length > 7
     val isUsernameValid = usernameInput.isNotEmpty() && !hasSpace && !tooLong
 
     val trimmedAge = ageInput.trim()
@@ -679,7 +815,7 @@ fun OneTimeUsernameDialog(
 
     val errorMessage = when {
         hasSpace -> "Spaces are not allowed in your username."
-        tooLong -> "Username must be 8 characters or fewer."
+        tooLong -> "Username must be 7 characters or fewer."
         else -> null
     }
 
@@ -723,11 +859,11 @@ fun OneTimeUsernameDialog(
                     onValueChange = { usernameInput = it },
                     singleLine = true,
                     placeholder = {
-                        Text("Up to 8 chars, no spaces", color = colors.mutedText)
+                        Text("Up to 7 chars, no spaces", color = colors.mutedText)
                     },
                     supportingText = {
                         Text(
-                            text = errorMessage ?: "${usernameInput.length}/8 characters • No spaces",
+                            text = errorMessage ?: "${usernameInput.length}/7 characters • No spaces",
                             color = if (errorMessage != null) Color(0xFFFF5252) else colors.mutedText,
                             fontSize = 12.sp
                         )
@@ -816,7 +952,7 @@ fun OneTimeUsernameDialog(
                 onClick = {
                     val chosenGender = selectedGender ?: GenderOption.MALE
                     val chosenAge = parsedAge ?: return@Button
-                    onConfirmUsername(usernameInput, chosenGender, chosenAge)
+                    onConfirmUsername(usernameInput.trim().take(7), chosenGender, chosenAge)
                 }
             ) {
                 Text("Save Profile")

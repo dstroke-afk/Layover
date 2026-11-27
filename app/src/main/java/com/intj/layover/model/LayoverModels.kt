@@ -83,7 +83,7 @@ data class NearbyPeer(
     val id: String,
     val displayName: String,
     val handle: String = "",
-    val gender: GenderOption = GenderOption.MALE,
+    val gender: GenderOption? = null,
     val age: Int? = null,
     val status: ConnectionStatus = ConnectionStatus.NONE,
     val avatar: PeerAvatar = PeerAvatar(
@@ -91,6 +91,23 @@ data class NearbyPeer(
         initials = displayName.split(" ").mapNotNull { it.firstOrNull()?.toString() }.take(2).joinToString("").ifEmpty { "?" }
     )
 )
+
+fun formatPeerNameWithBadge(
+    displayName: String,
+    age: Int?,
+    gender: GenderOption?
+): String {
+    val cleanName = displayName.trim()
+    val validAge = age?.takeIf { it > 0 }
+    return when {
+        validAge != null && gender != null -> {
+            val genderShort = if (gender == GenderOption.FEMALE) "F" else "M"
+            "$cleanName($validAge$genderShort)"
+        }
+        validAge != null -> "$cleanName($validAge)"
+        else -> cleanName
+    }
+}
 
 data class ChatMessage(
     val id: String,
@@ -152,6 +169,7 @@ data class LayoverUiState(
     val userProfile: UserProfile = UserProfile(),
     val nearbyPeers: List<NearbyPeer> = emptyList(),
     val chatMessages: Map<String, List<ChatMessage>> = emptyMap(),
+    val unreadCountsByPeerId: Map<String, Int> = emptyMap(),
     val blockedPeerIds: Set<String> = emptySet(),
     val blockedByPeerIds: Set<String> = emptySet(),
     val mutedPeerIds: Set<String> = emptySet(),

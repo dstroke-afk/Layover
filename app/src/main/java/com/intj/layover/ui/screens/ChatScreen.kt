@@ -42,6 +42,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
@@ -334,6 +336,26 @@ fun ChatScreen(
                         onDismissRequest = { showChatMenu = false },
                         modifier = Modifier.background(colors.cardSurface)
                     ) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = if (isMuted) "Unmute Peer" else "Mute Peer",
+                                    color = colors.lightText
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = if (isMuted) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                                    contentDescription = null,
+                                    tint = colors.cyanPrimary
+                                )
+                            },
+                            onClick = {
+                                chatTrace("TopBar:MUTE_TOGGLE", "peerId=$peerId, currentMuted=$isMuted")
+                                showChatMenu = false
+                                onToggleMutePeer(peerId)
+                            }
+                        )
                         DropdownMenuItem(
                             text = { Text(if (isBlocked) "Unblock Peer" else "Block Peer", color = Color(0xFFFF5252)) },
                             leadingIcon = {

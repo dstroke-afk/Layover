@@ -46,6 +46,33 @@ class GattSessionManager(
         val LAYOVER_AVATAR_CHAR_UUID: UUID = UUID.fromString("9a51c3e2-4b18-4d7a-8c2f-1e6b9f3a7044")
         val CLIENT_CONFIG_DESCRIPTOR_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         private const val AVATAR_CHUNK_SIZE = 500
+        const val DEFAULT_ATT_MTU = 23
+        const val ATT_HEADER_OVERHEAD = 3
+        const val MIN_SAFE_GATT_CHUNK_BYTES = 20
+        const val MAX_SAFE_GATT_CHUNK_BYTES = 480
+        const val MAX_OUTBOUND_FRAME_BYTES = 65_536
+
+        fun computeSafeChunkSize(negotiatedMtu: Int): Int {
+            val mtuPayload = negotiatedMtu - ATT_HEADER_OVERHEAD
+            return mtuPayload.coerceIn(MIN_SAFE_GATT_CHUNK_BYTES, MAX_SAFE_GATT_CHUNK_BYTES)
+        }
+
+        fun chunkGattPacket(
+            packet: ByteArray,
+            maxChunkSize: Int = MAX_SAFE_GATT_CHUNK_BYTES
+        ): List<ByteArray> {
+            if (packet.isEmpty()) return emptyList()
+            val safeChunkSize = maxChunkSize.coerceIn(MIN_SAFE_GATT_CHUNK_BYTES, MAX_SAFE_GATT_CHUNK_BYTES)
+            if (packet.size <= safeChunkSize) return listOf(packet)
+            val chunks = ArrayList<ByteArray>((packet.size + safeChunkSize - 1) / safeChunkSize)
+            var offset = 0
+            while (offset < packet.size) {
+                val end = min(packet.size, offset + safeChunkSize)
+                chunks.add(packet.copyOfRange(offset, end))
+                offset = end
+            }
+            return chunks
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + Job())
@@ -76,6 +103,10 @@ class GattSessionManager(
     private val subscribedClients = mutableSetOf<BluetoothDevice>()
     private val avatarReadBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
     private val avatarReadOffsets = ConcurrentHashMap<String, Int>()
+    private val serverClientMtuByAddress = ConcurrentHashMap<String, Int>()
+
+    @Volatile
+    private var negotiatedClientMtu: Int = DEFAULT_ATT_MTU
 
     @Volatile
     private var writeCompletion: CompletableDeferred<Boolean>? = null
@@ -123,13 +154,23 @@ class GattSessionManager(
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     LayoverFileLogger.log("GATT Server: Client disconnected: ${device?.address}")
-                    device?.address?.let { avatarReadOffsets.remove(it) }
+                    device?.address?.let {
+                        avatarReadOffsets.remove(it)
+                        serverClientMtuByAddress.remove(it)
+                    }
                     device?.let { synchronized(subscribedClients) { subscribedClients.remove(it) } }
                     if (connectedDevice?.address == device?.address) {
                         connectedDevice = null
                         setConnectionState(RfcommConnectionState.DISCONNECTED)
                         _isGattReady.value = false
                     }
+                }
+            }
+
+            override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
+                if (device != null && mtu > DEFAULT_ATT_MTU) {
+                    serverClientMtuByAddress[device.address] = mtu
+                    LayoverFileLogger.log("GATT Server: Client MTU updated for ${device.address}: mtu=$mtu")
                 }
             }
 
@@ -464,6 +505,7 @@ class GattSessionManager(
         setConnectionState(RfcommConnectionState.CONNECTING, "GATT Client connecting to ${device.address}...")
         _isGattReady.value = false
         isDescriptorWriteInFlight = false
+        negotiatedClientMtu = DEFAULT_ATT_MTU
         connectedDevice = device
 
         var serviceDiscoveryRetryCount = 0
@@ -529,7 +571,10 @@ class GattSessionManager(
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-                LayoverFileLogger.log("GATT MTU updated to $mtu (status=$status). Enabling notifications...")
+                if (status == BluetoothGatt.GATT_SUCCESS && mtu > DEFAULT_ATT_MTU) {
+                    negotiatedClientMtu = mtu
+                }
+                LayoverFileLogger.log("GATT MTU updated to $mtu (status=$status, effectiveChunk=${computeSafeChunkSize(negotiatedClientMtu)}B). Enabling notifications...")
                 enableNotifications(gatt)
             }
 
@@ -755,37 +800,82 @@ class GattSessionManager(
                 return false
             }
 
-            LayoverFileLogger.log("GATT Client attempting writeCharacteristic: type=$frameType, size=${payload.size}, targetCharUUID=$LAYOVER_RX_CHAR_UUID, writeType=WRITE_TYPE_DEFAULT, remoteMac=$remoteMac")
+            val chunkSize = computeSafeChunkSize(negotiatedClientMtu)
+            val chunks = chunkGattPacket(fullPacket, chunkSize)
+            LayoverFileLogger.log(
+                "GATT Client attempting writeCharacteristic: type=$frameType, size=${payload.size}, " +
+                    "totalBytes=${fullPacket.size}, chunks=${chunks.size}, maxChunk=${chunkSize}B, " +
+                    "targetCharUUID=$LAYOVER_RX_CHAR_UUID, writeType=WRITE_TYPE_DEFAULT, remoteMac=$remoteMac"
+            )
 
-            val deferred = CompletableDeferred<Boolean>()
-            writeCompletion = deferred
-            val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                client.writeCharacteristic(rxChar, fullPacket, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == android.bluetooth.BluetoothStatusCodes.SUCCESS
-            } else {
-                rxChar.value = fullPacket
-                rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                @Suppress("DEPRECATION")
-                client.writeCharacteristic(rxChar)
-            }
-
-            if (!success) {
-                if (writeCompletion === deferred) writeCompletion = null
-                LayoverFileLogger.logError("GATT Client failed to initiate writeCharacteristic for type=$frameType")
-                return false
-            }
-
-            return try {
-                withTimeout(2500) {
-                    val written = deferred.await()
-                    LayoverFileLogger.log("GATT Client writeCharacteristic result for type=$frameType: success=$written")
-                    written
+            for ((chunkIndex, chunk) in chunks.withIndex()) {
+                val deferred = CompletableDeferred<Boolean>()
+                writeCompletion = deferred
+                val initiated = try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        client.writeCharacteristic(
+                            rxChar,
+                            chunk,
+                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        ) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+                    } else {
+                        rxChar.value = chunk
+                        rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        @Suppress("DEPRECATION")
+                        client.writeCharacteristic(rxChar)
+                    }
+                } catch (e: IllegalArgumentException) {
+                    if (writeCompletion === deferred) writeCompletion = null
+                    LayoverFileLogger.logError(
+                        "GATT Client writeCharacteristic IllegalArgumentException for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                        e
+                    )
+                    return false
+                } catch (e: Exception) {
+                    if (writeCompletion === deferred) writeCompletion = null
+                    LayoverFileLogger.logError(
+                        "GATT Client writeCharacteristic exception for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                        e
+                    )
+                    return false
                 }
-            } catch (e: Exception) {
-                LayoverFileLogger.logError("GATT Client writeCharacteristic timeout waiting for onCharacteristicWrite for type=$frameType", e)
-                false
-            } finally {
-                if (writeCompletion === deferred) writeCompletion = null
+
+                if (!initiated) {
+                    if (writeCompletion === deferred) writeCompletion = null
+                    LayoverFileLogger.logError(
+                        "GATT Client failed to initiate writeCharacteristic for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})"
+                    )
+                    return false
+                }
+
+                val chunkWritten = try {
+                    withTimeout(2500) {
+                        deferred.await()
+                    }
+                } catch (e: Exception) {
+                    LayoverFileLogger.logError(
+                        "GATT Client writeCharacteristic timeout waiting for onCharacteristicWrite for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size})",
+                        e
+                    )
+                    false
+                } finally {
+                    if (writeCompletion === deferred) writeCompletion = null
+                }
+
+                if (!chunkWritten) {
+                    LayoverFileLogger.logError(
+                        "GATT Client writeCharacteristic chunk ${chunkIndex + 1}/${chunks.size} failed for type=$frameType"
+                    )
+                    return false
+                }
             }
+
+            LayoverFileLogger.log("GATT Client writeCharacteristic result for type=$frameType: success=true (${chunks.size} chunk(s))")
+            return true
         } else {
             val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
             val targetDevices = synchronized(subscribedClients) {
@@ -801,15 +891,47 @@ class GattSessionManager(
 
             var anySuccess = false
             for (targetDevice in targetDevices) {
-                LayoverFileLogger.log("GATT Server attempting notify: type=$frameType, size=${payload.size}, targetCharUUID=$LAYOVER_RX_CHAR_UUID, remoteMac=${targetDevice.address}")
-                val notified = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    server.notifyCharacteristicChanged(targetDevice, rxChar, false, fullPacket) == android.bluetooth.BluetoothStatusCodes.SUCCESS
-                } else {
-                    rxChar.value = fullPacket
-                    @Suppress("DEPRECATION")
-                    server.notifyCharacteristicChanged(targetDevice, rxChar, false)
+                val deviceMtu = serverClientMtuByAddress[targetDevice.address] ?: negotiatedClientMtu
+                val chunkSize = computeSafeChunkSize(deviceMtu)
+                val chunks = chunkGattPacket(fullPacket, chunkSize)
+                LayoverFileLogger.log(
+                    "GATT Server attempting notify: type=$frameType, size=${payload.size}, " +
+                        "chunks=${chunks.size}, maxChunk=${chunkSize}B, targetCharUUID=$LAYOVER_RX_CHAR_UUID, remoteMac=${targetDevice.address}"
+                )
+                var allChunksSent = true
+                for ((chunkIndex, chunk) in chunks.withIndex()) {
+                    val notified = try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            server.notifyCharacteristicChanged(targetDevice, rxChar, false, chunk) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+                        } else {
+                            rxChar.value = chunk
+                            @Suppress("DEPRECATION")
+                            server.notifyCharacteristicChanged(targetDevice, rxChar, false)
+                        }
+                    } catch (e: IllegalArgumentException) {
+                        LayoverFileLogger.logError(
+                            "GATT Server notifyCharacteristicChanged IllegalArgumentException for type=$frameType " +
+                                "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                            e
+                        )
+                        false
+                    } catch (e: Exception) {
+                        LayoverFileLogger.logError(
+                            "GATT Server notifyCharacteristicChanged exception for type=$frameType " +
+                                "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                            e
+                        )
+                        false
+                    }
+                    if (!notified) {
+                        allChunksSent = false
+                        break
+                    }
+                    if (chunks.size > 1 && chunkIndex < chunks.lastIndex) {
+                        delay(15)
+                    }
                 }
-                if (notified) anySuccess = true
+                if (allChunksSent) anySuccess = true
             }
             val success = anySuccess
 
@@ -829,6 +951,7 @@ class GattSessionManager(
                 frameType == "CONNECTION_REQUEST" ||
                 frameType == "CONNECTION_ACCEPT" ||
                 frameType == "CONNECTION_DECLINE" ||
+                frameType == "PROFILE_SYNC" ||
                 frameType == "PEER_BLOCK_STATE" ||
                 frameType == "CHAT_ENCRYPTED"
 
@@ -837,7 +960,13 @@ class GattSessionManager(
             return false
         }
 
-        LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=${text.length}")
+        val byteSize = text.toByteArray(Charsets.UTF_8).size
+        if (byteSize <= 0 || byteSize > MAX_OUTBOUND_FRAME_BYTES) {
+            LayoverFileLogger.logError("Dropping oversized outbound frame: type=$frameType, bytes=$byteSize (max=$MAX_OUTBOUND_FRAME_BYTES)")
+            return false
+        }
+
+        LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=$byteSize")
         pendingOutboundFrames.add(text)
         if (activeGattClient != null && _isGattReady.value) {
             flushQueue()
@@ -859,6 +988,8 @@ class GattSessionManager(
         }
         activeGattClient = null
         connectedDevice = null
+        negotiatedClientMtu = DEFAULT_ATT_MTU
+        serverClientMtuByAddress.clear()
         stopServer()
         _connectionState.value = RfcommConnectionState.DISCONNECTED
     }
