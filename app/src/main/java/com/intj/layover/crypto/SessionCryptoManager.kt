@@ -1,7 +1,6 @@
 package com.intj.layover.crypto
 
 import android.os.Build
-import android.util.Base64
 import android.util.Log
 import java.security.KeyFactory
 import java.security.KeyPair
@@ -11,6 +10,8 @@ import java.security.PublicKey
 import java.security.SecureRandom
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
+import java.util.EnumMap
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.SecretKey
@@ -42,139 +43,466 @@ data class EncryptedPayload(
 
 enum class KeyAlgorithm(val algorithmName: String, val agreementName: String) {
     X25519("X25519", "X25519"),
-    EC_P256("EC", "ECDH")
+    EC_P256("EC", "ECDH");
+
+    companion object {
+        fun fromWireName(name: String): KeyAlgorithm {
+            return if (name.equals("X25519", ignoreCase = true) || name.equals("XDH", ignoreCase = true)) {
+                X25519
+            } else {
+                EC_P256
+            }
+        }
+    }
 }
 
-class SessionCryptoManager {
+enum class KeyEstablishStatus {
+    ESTABLISHED,
+    ALREADY_ESTABLISHED_SAME_KEY,
+    IGNORED_EXISTING_SESSION,
+    IGNORED_STALE_KEY,
+    ALGORITHM_UNSUPPORTED,
+    FAILED
+}
+
+data class KeyEstablishOutcome(
+    val status: KeyEstablishStatus,
+    val fingerprint: String? = null,
+    val localPublicKeyBase64: String? = null,
+    val localAlgorithm: String? = null
+) {
+    val isUsableSession: Boolean
+        get() = status == KeyEstablishStatus.ESTABLISHED ||
+            status == KeyEstablishStatus.ALREADY_ESTABLISHED_SAME_KEY
+}
+
+class SessionCryptoManager(
+    private val forceEcOnly: Boolean = false
+) {
     companion object {
         private const val TAG = "LayoverBLE"
+        private const val DEFAULT_PEER_KEY = "__default_peer__"
     }
 
-    private var currentAlgorithm: KeyAlgorithm = KeyAlgorithm.EC_P256
-    private var localKeyPair: KeyPair? = null
-    private var remotePublicKey: PublicKey? = null
-    private var secretKey: SecretKey? = null
-    private val random = SecureRandom()
+    private data class PeerSession(
+        val peerKey: String,
+        val aliases: MutableSet<String>,
+        val algorithm: KeyAlgorithm,
+        val localPublicKeyBase64: String,
+        val remotePublicKeyBase64: String,
+        val remotePublicKey: PublicKey,
+        val secretKey: SecretKey,
+        val fingerprint: String,
+        var allowRefreshOnReconnect: Boolean = false
+    )
 
-    var sessionFingerprint: String? = null
-        private set
+    private val lock = Any()
+    private val random = SecureRandom()
+    private val localKeyPairs = EnumMap<KeyAlgorithm, KeyPair>(KeyAlgorithm::class.java)
+    private val peerSessions = LinkedHashMap<String, PeerSession>()
+    private val supersededRemoteKeys = HashMap<String, MutableSet<String>>()
+
+    private var x25519SupportedCache: Boolean? = null
+    private var currentAlgorithm: KeyAlgorithm = KeyAlgorithm.EC_P256
+    private var activePeerKey: String? = null
+
+    val sessionFingerprint: String?
+        get() = synchronized(lock) {
+            activePeerKey?.let { peerSessions[it]?.fingerprint }
+        }
 
     val isSessionKeyEstablished: Boolean
-        get() = secretKey != null
+        get() = synchronized(lock) {
+            activePeerKey?.let { peerSessions[it] != null } == true
+        }
 
-    fun generateKeyPair(): String {
-        clearSession()
+    private fun logDebug(message: String) {
+        runCatching { Log.d(TAG, message) }
+    }
 
-        val pair = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                currentAlgorithm = KeyAlgorithm.X25519
+    private fun logWarn(message: String, throwable: Throwable? = null) {
+        runCatching {
+            if (throwable != null) Log.w(TAG, message, throwable) else Log.w(TAG, message)
+        }
+    }
+
+    private fun logError(message: String, throwable: Throwable? = null) {
+        runCatching {
+            if (throwable != null) Log.e(TAG, message, throwable) else Log.e(TAG, message)
+        }
+    }
+
+    private fun isX25519Supported(): Boolean {
+        if (forceEcOnly) return false
+        x25519SupportedCache?.let { return it }
+
+        val sdkInt = runCatching { Build.VERSION.SDK_INT }.getOrDefault(0)
+        val supported = if (sdkInt in 1 until Build.VERSION_CODES.TIRAMISU) {
+            false
+        } else {
+            runCatching {
+                KeyPairGenerator.getInstance("X25519")
+                KeyFactory.getInstance("X25519")
+                KeyAgreement.getInstance("X25519")
+                true
+            }.getOrDefault(false)
+        }
+        x25519SupportedCache = supported
+        return supported
+    }
+
+    private fun preferredAlgorithm(): KeyAlgorithm {
+        return if (isX25519Supported()) KeyAlgorithm.X25519 else KeyAlgorithm.EC_P256
+    }
+
+    private fun createKeyPair(algorithm: KeyAlgorithm): KeyPair {
+        return when (algorithm) {
+            KeyAlgorithm.X25519 -> {
                 val kpg = KeyPairGenerator.getInstance("X25519")
                 val generated = kpg.generateKeyPair()
-                Log.d(TAG, "Generated ephemeral X25519 key pair.")
+                logDebug("Generated ephemeral X25519 key pair.")
                 generated
-            } catch (e: Exception) {
-                Log.d(TAG, "X25519 key gen failed, falling back to EC secp256r1", e)
-                generateEcFallback()
             }
-        } else {
-            generateEcFallback()
+            KeyAlgorithm.EC_P256 -> {
+                val kpg = KeyPairGenerator.getInstance("EC")
+                kpg.initialize(ECGenParameterSpec("secp256r1"))
+                val generated = kpg.generateKeyPair()
+                logDebug("Generated ephemeral EC secp256r1 key pair.")
+                generated
+            }
         }
-
-        localKeyPair = pair
-        return Base64.encodeToString(pair.public.encoded, Base64.NO_WRAP)
     }
 
-    private fun generateEcFallback(): KeyPair {
-        currentAlgorithm = KeyAlgorithm.EC_P256
-        val kpg = KeyPairGenerator.getInstance("EC")
-        kpg.initialize(ECGenParameterSpec("secp256r1"))
-        val generated = kpg.generateKeyPair()
-        Log.d(TAG, "Generated ephemeral EC secp256r1 key pair.")
-        return generated
+    private fun getOrCreateLocalKeyPairLocked(algorithm: KeyAlgorithm): KeyPair {
+        localKeyPairs[algorithm]?.let { return it }
+        val effectiveAlgo = if (algorithm == KeyAlgorithm.X25519 && !isX25519Supported()) {
+            KeyAlgorithm.EC_P256
+        } else {
+            algorithm
+        }
+        localKeyPairs[effectiveAlgo]?.let { return it }
+        val created = try {
+            createKeyPair(effectiveAlgo)
+        } catch (e: Exception) {
+            logWarn("${effectiveAlgo.algorithmName} key gen failed, falling back to EC secp256r1", e)
+            createKeyPair(KeyAlgorithm.EC_P256)
+        }
+        val actualAlgo = if (created.public.algorithm.equals("XDH", ignoreCase = true) ||
+            created.public.algorithm.equals("X25519", ignoreCase = true)
+        ) {
+            KeyAlgorithm.X25519
+        } else {
+            KeyAlgorithm.EC_P256
+        }
+        localKeyPairs[actualAlgo] = created
+        return created
     }
 
-    fun getLocalPublicKeyBase64(): String? {
-        val pub = localKeyPair?.public ?: return null
-        return Base64.encodeToString(pub.encoded, Base64.NO_WRAP)
+    private fun encodePublicKey(keyPair: KeyPair): String {
+        return Base64.getEncoder().encodeToString(keyPair.public.encoded)
     }
 
-    fun getAlgorithmName(): String = currentAlgorithm.algorithmName
+    /**
+     * Ensures a stable local key pair exists without clearing established peer sessions.
+     */
+    fun ensureLocalKeyPair(targetAlgo: String? = null): String = synchronized(lock) {
+        val desired = if (targetAlgo != null) {
+            val parsed = KeyAlgorithm.fromWireName(targetAlgo)
+            if (parsed == KeyAlgorithm.X25519 && !isX25519Supported()) KeyAlgorithm.EC_P256 else parsed
+        } else {
+            if (localKeyPairs.containsKey(currentAlgorithm)) currentAlgorithm else preferredAlgorithm()
+        }
+        val pair = getOrCreateLocalKeyPairLocked(desired)
+        currentAlgorithm = if (localKeyPairs[KeyAlgorithm.X25519] === pair) {
+            KeyAlgorithm.X25519
+        } else {
+            KeyAlgorithm.EC_P256
+        }
+        encodePublicKey(pair)
+    }
 
-    fun generateKeyPairForAlgorithm(targetAlgo: String): String {
-        val prevSecret = secretKey
-        val prevRemote = remotePublicKey
-        val prevFingerprint = sessionFingerprint
-        clearSession()
-        val pair = if (targetAlgo.equals("X25519", ignoreCase = true) || targetAlgo.equals("XDH", ignoreCase = true)) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                try {
-                    currentAlgorithm = KeyAlgorithm.X25519
-                    KeyPairGenerator.getInstance("X25519").generateKeyPair()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Requested X25519 not supported, using EC secp256r1", e)
-                    generateEcFallback()
+    /**
+     * Generates a fresh local key pair and clears existing peer sessions.
+     */
+    fun generateKeyPair(): String = synchronized(lock) {
+        clearSessionLocked()
+        val desired = preferredAlgorithm()
+        val pair = getOrCreateLocalKeyPairLocked(desired)
+        currentAlgorithm = if (localKeyPairs[KeyAlgorithm.X25519] === pair) {
+            KeyAlgorithm.X25519
+        } else {
+            KeyAlgorithm.EC_P256
+        }
+        encodePublicKey(pair)
+    }
+
+    fun generateKeyPairForAlgorithm(targetAlgo: String): String = synchronized(lock) {
+        val parsed = KeyAlgorithm.fromWireName(targetAlgo)
+        val desired = if (parsed == KeyAlgorithm.X25519 && !isX25519Supported()) {
+            logWarn("Requested X25519 not supported, using EC secp256r1")
+            KeyAlgorithm.EC_P256
+        } else {
+            parsed
+        }
+        val pair = createKeyPair(desired)
+        localKeyPairs[desired] = pair
+        currentAlgorithm = desired
+        encodePublicKey(pair)
+    }
+
+    fun getLocalPublicKeyBase64(): String? = synchronized(lock) {
+        val pair = localKeyPairs[currentAlgorithm] ?: localKeyPairs.values.firstOrNull() ?: return null
+        encodePublicKey(pair)
+    }
+
+    fun getLocalPublicKeyBase64ForAlgorithm(algorithmName: String): String? = synchronized(lock) {
+        val algo = KeyAlgorithm.fromWireName(algorithmName)
+        val pair = localKeyPairs[algo] ?: return null
+        encodePublicKey(pair)
+    }
+
+    fun getAlgorithmName(): String = synchronized(lock) { currentAlgorithm.algorithmName }
+
+    private fun normalizeAliases(peerId: String?, peerAliases: Collection<String>): Set<String> {
+        val out = LinkedHashSet<String>()
+        fun addIfValid(raw: String?) {
+            val trimmed = raw?.trim()?.lowercase() ?: return
+            if (trimmed.isNotEmpty() &&
+                trimmed != "local" &&
+                trimmed != "user" &&
+                trimmed != "remote_peer" &&
+                trimmed != "unknown_mac" &&
+                trimmed != "00000000"
+            ) {
+                out.add(trimmed)
+            }
+        }
+        addIfValid(peerId)
+        peerAliases.forEach { addIfValid(it) }
+        return out
+    }
+
+    private fun hasConflictingDevId(a: Set<String>, b: Set<String>): Boolean {
+        val devA = a.filter { it.startsWith("dev_") }.toSet()
+        val devB = b.filter { it.startsWith("dev_") }.toSet()
+        return devA.isNotEmpty() && devB.isNotEmpty() && devA.intersect(devB).isEmpty()
+    }
+
+    private fun findSessionLocked(candidates: Set<String>, allowSingleSessionFallback: Boolean): PeerSession? {
+        if (candidates.isNotEmpty()) {
+            val directMatch = peerSessions.values.firstOrNull { session ->
+                candidates.any { cand -> cand == session.peerKey || session.aliases.contains(cand) }
+            }
+            if (directMatch != null) {
+                if (!hasConflictingDevId(directMatch.aliases, candidates)) {
+                    directMatch.aliases.addAll(candidates)
                 }
-            } else {
-                generateEcFallback()
+                return directMatch
             }
-        } else {
-            generateEcFallback()
+            if (allowSingleSessionFallback && peerSessions.size == 1) {
+                val sole = peerSessions.values.first()
+                if (sole.peerKey == DEFAULT_PEER_KEY || !hasConflictingDevId(sole.aliases, candidates)) {
+                    return sole
+                }
+            }
+            return null
         }
-        localKeyPair = pair
-        remotePublicKey = prevRemote
-        secretKey = prevSecret
-        sessionFingerprint = prevFingerprint
-        return Base64.encodeToString(pair.public.encoded, Base64.NO_WRAP)
+        return activePeerKey?.let { peerSessions[it] } ?: peerSessions.values.lastOrNull()
     }
 
     fun establishRemoteKey(remotePublicKeyBase64: String, algorithmName: String = "EC"): Boolean {
+        val outcome = establishRemoteKeyForPeer(
+            peerId = DEFAULT_PEER_KEY,
+            peerAliases = emptySet(),
+            remotePublicKeyBase64 = remotePublicKeyBase64,
+            algorithmName = algorithmName,
+            allowOverwrite = false
+        )
+        return outcome.isUsableSession
+    }
+
+    fun establishRemoteKeyForPeer(
+        peerId: String,
+        peerAliases: Set<String> = emptySet(),
+        remotePublicKeyBase64: String,
+        algorithmName: String = "EC",
+        allowOverwrite: Boolean = false
+    ): KeyEstablishOutcome = synchronized(lock) {
+        val trimmedB64 = remotePublicKeyBase64.trim()
+        if (trimmedB64.isEmpty()) {
+            return KeyEstablishOutcome(status = KeyEstablishStatus.FAILED)
+        }
+
+        val targetAlgo = KeyAlgorithm.fromWireName(algorithmName)
+        if (targetAlgo == KeyAlgorithm.X25519 && !isX25519Supported()) {
+            val fallbackPair = getOrCreateLocalKeyPairLocked(KeyAlgorithm.EC_P256)
+            currentAlgorithm = KeyAlgorithm.EC_P256
+            val fallbackPub = encodePublicKey(fallbackPair)
+            logWarn("Key algorithm unsupported on this device: remote=X25519, local fallback=EC")
+            return KeyEstablishOutcome(
+                status = KeyEstablishStatus.ALGORITHM_UNSUPPORTED,
+                localPublicKeyBase64 = fallbackPub,
+                localAlgorithm = KeyAlgorithm.EC_P256.algorithmName
+            )
+        }
+
+        val normalizedAliases = normalizeAliases(peerId, peerAliases)
+        val canonicalKey = normalizedAliases.firstOrNull { it.startsWith("dev_") }
+            ?: normalizedAliases.firstOrNull()
+            ?: DEFAULT_PEER_KEY
+
+        val existingSession = findSessionLocked(
+            candidates = normalizedAliases,
+            allowSingleSessionFallback = canonicalKey == DEFAULT_PEER_KEY
+        )
+
+        if (existingSession != null) {
+            existingSession.aliases.addAll(normalizedAliases)
+            activePeerKey = existingSession.peerKey
+
+            if (existingSession.remotePublicKeyBase64 == trimmedB64 && existingSession.algorithm == targetAlgo) {
+                existingSession.allowRefreshOnReconnect = false
+                currentAlgorithm = existingSession.algorithm
+                return KeyEstablishOutcome(
+                    status = KeyEstablishStatus.ALREADY_ESTABLISHED_SAME_KEY,
+                    fingerprint = existingSession.fingerprint,
+                    localPublicKeyBase64 = existingSession.localPublicKeyBase64,
+                    localAlgorithm = existingSession.algorithm.algorithmName
+                )
+            }
+
+            val retiredKeys = supersededRemoteKeys[existingSession.peerKey]
+            if (!allowOverwrite && retiredKeys != null && retiredKeys.contains(trimmedB64)) {
+                logWarn("Ignoring stale superseded remote public key for peer=${existingSession.peerKey}")
+                return KeyEstablishOutcome(
+                    status = KeyEstablishStatus.IGNORED_STALE_KEY,
+                    fingerprint = existingSession.fingerprint,
+                    localPublicKeyBase64 = existingSession.localPublicKeyBase64,
+                    localAlgorithm = existingSession.algorithm.algorithmName
+                )
+            }
+
+            if (!allowOverwrite && !existingSession.allowRefreshOnReconnect) {
+                logWarn(
+                    "Preserving existing E2EE session for peer=${existingSession.peerKey} " +
+                        "(fingerprint=${existingSession.fingerprint}); ignoring non-reset different key."
+                )
+                return KeyEstablishOutcome(
+                    status = KeyEstablishStatus.IGNORED_EXISTING_SESSION,
+                    fingerprint = existingSession.fingerprint,
+                    localPublicKeyBase64 = existingSession.localPublicKeyBase64,
+                    localAlgorithm = existingSession.algorithm.algorithmName
+                )
+            }
+        }
+
         return try {
-            val trimmedB64 = remotePublicKeyBase64.trim()
-            val keyBytes = Base64.decode(trimmedB64, Base64.NO_WRAP)
-            val normalizedAlgo = if (algorithmName.equals("X25519", ignoreCase = true) || algorithmName.equals("XDH", ignoreCase = true)) {
-                "X25519"
-            } else {
-                "EC"
-            }
+            val keyBytes = Base64.getDecoder().decode(trimmedB64)
+            val localPair = getOrCreateLocalKeyPairLocked(targetAlgo)
+            val localPubB64 = encodePublicKey(localPair)
 
-            // Ensure local keypair uses the matching algorithm so KeyAgreement succeeds across peers
-            var localPair = localKeyPair
-            if (localPair == null || !currentAlgorithm.algorithmName.equals(normalizedAlgo, ignoreCase = true)) {
-                generateKeyPairForAlgorithm(normalizedAlgo)
-                localPair = localKeyPair ?: return false
-            }
-
-            // If X25519 was requested but this device had to fall back to EC, we cannot combine EC private + X25519 public
-            if (!currentAlgorithm.algorithmName.equals(normalizedAlgo, ignoreCase = true)) {
-                Log.e(TAG, "Key algorithm mismatch: local=${currentAlgorithm.algorithmName}, remote=$normalizedAlgo")
-                return false
-            }
-
-            val keyFactory = KeyFactory.getInstance(normalizedAlgo)
+            val keyFactory = KeyFactory.getInstance(targetAlgo.algorithmName)
             val pubKey = keyFactory.generatePublic(X509EncodedKeySpec(keyBytes))
 
-            val keyAgreement = KeyAgreement.getInstance(
-                if (normalizedAlgo == "X25519") "X25519" else "ECDH"
-            )
+            val keyAgreement = KeyAgreement.getInstance(targetAlgo.agreementName)
             keyAgreement.init(localPair.private)
             keyAgreement.doPhase(pubKey, true)
             val rawSharedSecret = keyAgreement.generateSecret()
-            remotePublicKey = pubKey
 
-            // Derive 256-bit AES key via SHA-256 HKDF-like context digest
+            // Derive 256-bit AES key via SHA-256 context-bound digest
             val md = MessageDigest.getInstance("SHA-256")
             md.update("Layover-E2EE-v1".toByteArray(Charsets.UTF_8))
             md.update(rawSharedSecret)
             val sessionKeyBytes = md.digest()
 
-            secretKey = SecretKeySpec(sessionKeyBytes, "AES")
-            sessionFingerprint = computeFingerprint(localPair.public.encoded, pubKey.encoded)
-            Log.d(TAG, "E2EE AES-256 session key established successfully. Fingerprint=$sessionFingerprint")
-            true
+            val derivedSecret = SecretKeySpec(sessionKeyBytes, "AES")
+            val fingerprint = computeFingerprint(localPair.public.encoded, pubKey.encoded)
+
+            val sessionKey = existingSession?.peerKey ?: canonicalKey
+            if (existingSession != null && existingSession.remotePublicKeyBase64 != trimmedB64) {
+                supersededRemoteKeys
+                    .getOrPut(sessionKey) { LinkedHashSet() }
+                    .add(existingSession.remotePublicKeyBase64)
+            }
+
+            val mergedAliases = LinkedHashSet<String>().apply {
+                existingSession?.aliases?.let { addAll(it) }
+                addAll(normalizedAliases)
+                add(sessionKey)
+            }
+
+            val newSession = PeerSession(
+                peerKey = sessionKey,
+                aliases = mergedAliases,
+                algorithm = targetAlgo,
+                localPublicKeyBase64 = localPubB64,
+                remotePublicKeyBase64 = trimmedB64,
+                remotePublicKey = pubKey,
+                secretKey = derivedSecret,
+                fingerprint = fingerprint,
+                allowRefreshOnReconnect = false
+            )
+            peerSessions[sessionKey] = newSession
+            activePeerKey = sessionKey
+            currentAlgorithm = targetAlgo
+
+            logDebug("E2EE AES-256 session key established for peer=$sessionKey (${targetAlgo.algorithmName}). Fingerprint=$fingerprint")
+            KeyEstablishOutcome(
+                status = KeyEstablishStatus.ESTABLISHED,
+                fingerprint = fingerprint,
+                localPublicKeyBase64 = localPubB64,
+                localAlgorithm = targetAlgo.algorithmName
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to establish remote key for E2EE", e)
-            clearSession()
-            false
+            logError("Failed to establish remote key for E2EE (peer=$canonicalKey, algo=${targetAlgo.algorithmName})", e)
+            KeyEstablishOutcome(status = KeyEstablishStatus.FAILED)
+        }
+    }
+
+    fun hasSessionForPeer(peerCandidates: Collection<String> = emptyList()): Boolean = synchronized(lock) {
+        val normalized = normalizeAliases(null, peerCandidates)
+        findSessionLocked(normalized, allowSingleSessionFallback = true) != null
+    }
+
+    fun getSessionFingerprintForPeer(peerCandidates: Collection<String> = emptyList()): String? = synchronized(lock) {
+        val normalized = normalizeAliases(null, peerCandidates)
+        findSessionLocked(normalized, allowSingleSessionFallback = true)?.fingerprint
+    }
+
+    fun needsReconnectConfirmation(peerCandidates: Collection<String> = emptyList()): Boolean = synchronized(lock) {
+        val normalized = normalizeAliases(null, peerCandidates)
+        val session = findSessionLocked(normalized, allowSingleSessionFallback = true) ?: return true
+        session.allowRefreshOnReconnect
+    }
+
+    fun markPeerDisconnected(peerCandidates: Collection<String> = emptyList()) = synchronized(lock) {
+        val normalized = normalizeAliases(null, peerCandidates)
+        if (normalized.isEmpty()) {
+            peerSessions.values.forEach { it.allowRefreshOnReconnect = true }
+        } else {
+            val session = findSessionLocked(normalized, allowSingleSessionFallback = false)
+            if (session != null) {
+                session.allowRefreshOnReconnect = true
+            } else {
+                peerSessions.values.forEach { it.allowRefreshOnReconnect = true }
+            }
+        }
+    }
+
+    fun clearPeerSession(peerCandidates: Collection<String> = emptyList()) = synchronized(lock) {
+        val normalized = normalizeAliases(null, peerCandidates)
+        val target = findSessionLocked(normalized, allowSingleSessionFallback = true)
+        if (target != null) {
+            supersededRemoteKeys
+                .getOrPut(target.peerKey) { LinkedHashSet() }
+                .add(target.remotePublicKeyBase64)
+            peerSessions.remove(target.peerKey)
+            if (activePeerKey == target.peerKey) {
+                activePeerKey = peerSessions.keys.lastOrNull()
+            }
+        } else if (normalized.isEmpty()) {
+            peerSessions.clear()
+            activePeerKey = null
         }
     }
 
@@ -205,8 +533,12 @@ class SessionCryptoManager {
         return a.size.compareTo(b.size)
     }
 
-    fun encryptText(plaintext: String): EncryptedPayload? {
-        val key = secretKey ?: return null
+    fun encryptText(plaintext: String, peerCandidates: Collection<String> = emptyList()): EncryptedPayload? {
+        val key = synchronized(lock) {
+            val normalized = normalizeAliases(null, peerCandidates)
+            findSessionLocked(normalized, allowSingleSessionFallback = true)?.secretKey
+        } ?: return null
+
         return try {
             val iv = ByteArray(12)
             random.nextBytes(iv)
@@ -218,13 +550,17 @@ class SessionCryptoManager {
             val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
             EncryptedPayload(iv = iv, ciphertext = ciphertext)
         } catch (e: Exception) {
-            Log.e(TAG, "AES-GCM Encryption failed", e)
+            logError("AES-GCM Encryption failed", e)
             null
         }
     }
 
-    fun decryptText(payload: EncryptedPayload): String? {
-        val key = secretKey ?: return null
+    fun decryptText(payload: EncryptedPayload, peerCandidates: Collection<String> = emptyList()): String? {
+        val key = synchronized(lock) {
+            val normalized = normalizeAliases(null, peerCandidates)
+            findSessionLocked(normalized, allowSingleSessionFallback = true)?.secretKey
+        } ?: return null
+
         return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val spec = GCMParameterSpec(128, payload.iv)
@@ -233,15 +569,19 @@ class SessionCryptoManager {
             val plaintextBytes = cipher.doFinal(payload.ciphertext)
             String(plaintextBytes, Charsets.UTF_8)
         } catch (e: Exception) {
-            Log.e(TAG, "AES-GCM Decryption failed", e)
+            logError("AES-GCM Decryption failed", e)
             null
         }
     }
 
-    fun clearSession() {
-        secretKey = null
-        localKeyPair = null
-        remotePublicKey = null
-        sessionFingerprint = null
+    private fun clearSessionLocked() {
+        peerSessions.clear()
+        supersededRemoteKeys.clear()
+        localKeyPairs.clear()
+        activePeerKey = null
+    }
+
+    fun clearSession() = synchronized(lock) {
+        clearSessionLocked()
     }
 }

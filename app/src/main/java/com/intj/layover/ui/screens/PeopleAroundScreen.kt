@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.Settings
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -63,8 +65,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.diagnostics.LayoverFileLogger
@@ -529,7 +534,7 @@ fun BlePermissionRecoveryCard(
             Spacer(modifier = Modifier.width(14.dp))
 
             Text(
-                text = "BLE permission needed for discovery - click to allow",
+                text = "The app needs Nearby Devices permission to discover devices and send and receive media.",
                 color = colors.lightText,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp,
@@ -552,6 +557,7 @@ fun PeerListItemCard(
 ) {
     val colors = LayoverTheme.colors
     val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
+    var showEnlargedAvatar by remember(peer.id) { mutableStateOf(false) }
     val formattedPeerName = remember(peer.displayName, peer.age, peer.gender) {
         formatPeerNameWithBadge(peer.displayName, peer.age, peer.gender)
     }
@@ -603,6 +609,13 @@ fun PeerListItemCard(
                             1.5.dp,
                             if (isBlocked) colors.mutedText else colors.cyanPrimary,
                             CircleShape
+                        )
+                        .then(
+                            if (!isBlocked && peerAvatarBitmap != null) {
+                                Modifier.clickable { showEnlargedAvatar = true }
+                            } else {
+                                Modifier
+                            }
                         ),
                     contentAlignment = Alignment.Center
                 ) {
@@ -625,25 +638,34 @@ fun PeerListItemCard(
                     }
                 }
 
-                Spacer(modifier = Modifier.width(14.dp))
+                Spacer(modifier = Modifier.width(12.dp))
 
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = formattedPeerName,
                         fontWeight = FontWeight.SemiBold,
                         color = if (isBlocked) colors.mutedText else colors.lightText,
-                        fontSize = 16.sp
+                        fontSize = 16.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     when {
                         isBlocked -> {
                             Text(
                                 text = "\uD83D\uDEAB Blocked",
                                 color = colors.mutedText,
-                                fontSize = 13.sp
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                         isMuted -> {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
                                 if (unreadCount > 0) {
                                     val unreadLabel = if (unreadCount == 1) {
                                         "1 Unread Message"
@@ -651,22 +673,34 @@ fun PeerListItemCard(
                                         "$unreadCount Unread Messages"
                                     }
                                     Text(
-                                        text = "$unreadLabel \u2022 ",
+                                        text = unreadLabel,
                                         color = colors.mutedText,
-                                        fontSize = 13.sp
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    Text(
+                                        text = "\u2022",
+                                        color = colors.mutedText,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        softWrap = false
                                     )
                                 }
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.VolumeOff,
                                     contentDescription = "Muted",
                                     tint = colors.mutedText,
-                                    modifier = Modifier.size(14.dp)
+                                    modifier = Modifier.size(13.dp)
                                 )
-                                Spacer(modifier = Modifier.width(4.dp))
                                 Text(
                                     text = "Muted",
                                     color = colors.mutedText,
-                                    fontSize = 13.sp
+                                    fontSize = 12.sp,
+                                    maxLines = 1,
+                                    softWrap = false
                                 )
                             }
                         }
@@ -680,7 +714,10 @@ fun PeerListItemCard(
                                 text = unreadLabel,
                                 color = colors.cyanAccent,
                                 fontWeight = FontWeight.Medium,
-                                fontSize = 13.sp
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                     }
@@ -788,6 +825,55 @@ fun PeerListItemCard(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if (showEnlargedAvatar && !isBlocked && peerAvatarBitmap != null) {
+        Dialog(
+            onDismissRequest = { showEnlargedAvatar = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            BackHandler { showEnlargedAvatar = false }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.94f))
+                    .clickable { showEnlargedAvatar = false }
+            ) {
+                Image(
+                    bitmap = peerAvatarBitmap,
+                    contentDescription = "$formattedPeerName full-screen photo",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp)
+                )
+
+                Text(
+                    text = formattedPeerName,
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 18.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .statusBarsPadding()
+                        .padding(horizontal = 20.dp, vertical = 16.dp)
+                )
+
+                IconButton(
+                    onClick = { showEnlargedAvatar = false },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Close photo",
+                        tint = Color.White
+                    )
                 }
             }
         }

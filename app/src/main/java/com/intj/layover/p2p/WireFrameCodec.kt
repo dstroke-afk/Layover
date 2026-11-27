@@ -1,15 +1,16 @@
 package com.intj.layover.p2p
 
-import android.util.Base64
 import com.intj.layover.crypto.EncryptedPayload
 import com.intj.layover.model.GenderOption
+import java.util.Base64
 
 sealed class WireFrame {
     data class KeyExchange(
         val senderId: String,
         val publicKeyBase64: String,
         val algorithm: String,
-        val isResponse: Boolean = false
+        val isResponse: Boolean = false,
+        val isReset: Boolean = false
     ) : WireFrame()
 
     data class ConnectionRequest(
@@ -55,10 +56,15 @@ object WireFrameCodec {
         senderId: String,
         publicKeyBase64: String,
         algorithm: String,
-        isResponse: Boolean = false
+        isResponse: Boolean = false,
+        isReset: Boolean = false
     ): String {
         val respFlag = if (isResponse) "1" else "0"
-        return "KEY_EXCHANGE|$senderId|$publicKeyBase64|$algorithm|$respFlag"
+        return if (isReset) {
+            "KEY_EXCHANGE|$senderId|$publicKeyBase64|$algorithm|$respFlag|1"
+        } else {
+            "KEY_EXCHANGE|$senderId|$publicKeyBase64|$algorithm|$respFlag"
+        }
     }
 
     fun encodeConnectionRequest(
@@ -91,7 +97,7 @@ object WireFrameCodec {
         val safeName = displayName.replace("|", " ")
         val agePart = age?.toString() ?: ""
         val avatarB64 = if (compactAvatarBytes != null && compactAvatarBytes.isNotEmpty()) {
-            Base64.encodeToString(compactAvatarBytes, Base64.NO_WRAP)
+            Base64.getEncoder().encodeToString(compactAvatarBytes)
         } else {
             ""
         }
@@ -109,8 +115,8 @@ object WireFrameCodec {
         timestamp: Long,
         payload: EncryptedPayload
     ): String {
-        val ivB64 = Base64.encodeToString(payload.iv, Base64.NO_WRAP)
-        val cipherB64 = Base64.encodeToString(payload.ciphertext, Base64.NO_WRAP)
+        val ivB64 = Base64.getEncoder().encodeToString(payload.iv)
+        val cipherB64 = Base64.getEncoder().encodeToString(payload.ciphertext)
         return "CHAT_ENCRYPTED|$msgId|$senderId|$timestamp|$ivB64|$cipherB64"
     }
 
@@ -122,11 +128,13 @@ object WireFrameCodec {
             "KEY_EXCHANGE" -> {
                 if (parts.size >= 4) {
                     val isResponse = parts.getOrNull(4)?.let { it == "1" || it.equals("true", ignoreCase = true) } ?: false
+                    val isReset = parts.getOrNull(5)?.let { it == "1" || it.equals("true", ignoreCase = true) } ?: false
                     WireFrame.KeyExchange(
                         senderId = parts[1],
                         publicKeyBase64 = parts[2],
                         algorithm = parts[3],
-                        isResponse = isResponse
+                        isResponse = isResponse,
+                        isReset = isReset
                     )
                 } else null
             }
