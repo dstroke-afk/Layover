@@ -37,6 +37,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 object PeerAliasRegistry {
     private val aliasGroups = CopyOnWriteArraySet<MutableSet<String>>()
     private val macRegex = Regex("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+    private val instanceHexRegex = Regex("^[0-9A-Fa-f]{8}$")
+    private val devIdRegex = Regex("^dev_[0-9A-Za-z_-]+$", RegexOption.IGNORE_CASE)
+    private val peerIdRegex = Regex("^peer_[0-9A-Za-z_-]+$", RegexOption.IGNORE_CASE)
 
     private fun isValidAlias(value: String?): Boolean {
         if (value == null) return false
@@ -48,6 +51,21 @@ object PeerAliasRegistry {
                 !trimmed.equals("remote_peer", ignoreCase = true) &&
                 !trimmed.equals("unknown_mac", ignoreCase = true) &&
                 !trimmed.startsWith("Layover Peer (", ignoreCase = true)
+    }
+
+    /**
+     * Returns true only for stable peer identifiers (`dev_...`, 8-hex BLE advertisement `Key`,
+     * Bluetooth MAC addresses, or synthetic `peer_...` IDs), explicitly excluding raw display
+     * names (`Name=...` or free-text names) so unrelated users sharing a display name never collide.
+     */
+    fun isStablePeerIdentifier(value: String?): Boolean {
+        if (!isValidAlias(value)) return false
+        val trimmed = value!!.trim()
+        if (trimmed.startsWith("Name=", ignoreCase = true)) return false
+        return devIdRegex.matches(trimmed) ||
+                instanceHexRegex.matches(trimmed) ||
+                macRegex.matches(trimmed) ||
+                peerIdRegex.matches(trimmed)
     }
 
     private fun expandSeedWithDerivedInstanceId(raw: String): Set<String> {
@@ -82,9 +100,17 @@ object PeerAliasRegistry {
         }
         if (clean.isEmpty()) return
 
+        val stableClean = clean.filter { isStablePeerIdentifier(it) }
         val overlapping = aliasGroups.filter { group ->
-            !hasConflictingDevIds(group, clean) &&
+            if (hasConflictingDevIds(group, clean)) return@filter false
+            if (stableClean.isNotEmpty()) {
+                group.any { existing ->
+                    isStablePeerIdentifier(existing) &&
+                        stableClean.any { candidate -> existing.equals(candidate, ignoreCase = true) }
+                }
+            } else {
                 group.any { existing -> clean.any { candidate -> existing.equals(candidate, ignoreCase = true) } }
+            }
         }
 
         val merged = linkedSetOf<String>().apply {
@@ -99,17 +125,60 @@ object PeerAliasRegistry {
     @Synchronized
     fun resolveAliases(identifier: String?): Set<String> {
         if (!isValidAlias(identifier)) return emptySet()
-        val seeds = expandSeedWithDerivedInstanceId(identifier!!.trim())
+        val trimmed = identifier!!.trim()
+        val seeds = expandSeedWithDerivedInstanceId(trimmed)
         val result = linkedSetOf<String>().apply { addAll(seeds) }
+        val requireStableOverlap = isStablePeerIdentifier(trimmed)
 
         aliasGroups.filter { group ->
-            !hasConflictingDevIds(group, seeds) &&
-                group.any { existing -> seeds.any { seed -> existing.equals(seed, ignoreCase = true) } }
+            if (hasConflictingDevIds(group, seeds)) return@filter false
+            group.any { existing ->
+                (!requireStableOverlap || isStablePeerIdentifier(existing)) &&
+                    seeds.any { seed -> existing.equals(seed, ignoreCase = true) }
+            }
         }.forEach { group ->
             result.addAll(group)
         }
 
         return result
+    }
+
+    /**
+     * Resolves only stable peer identifiers (`dev_...`, BLE advertisement `Key`, MACs, `peer_...`)
+     * for [identifier], strictly excluding raw display names.
+     */
+    @Synchronized
+    fun resolveStableIdentifiers(identifier: String?): Set<String> {
+        if (!isStablePeerIdentifier(identifier)) return emptySet()
+        return resolveAliases(identifier)
+            .filter { isStablePeerIdentifier(it) }
+            .toSet()
+    }
+
+    @Synchronized
+    fun resolveStableIdentifiers(identifiers: Collection<String?>): Set<String> {
+        val out = linkedSetOf<String>()
+        for (raw in identifiers) {
+            if (!isStablePeerIdentifier(raw)) continue
+            out.addAll(resolveStableIdentifiers(raw))
+        }
+        return out
+    }
+
+    /**
+     * Matches [candidates] against [blocklist] strictly via stable identifiers (`peerId`,
+     * advertisement `Key`, and rotating/known MACs). Raw display names (`Name=...` or free-text
+     * names) are never used for matching, preventing false blocks across users with the same name.
+     */
+    @Synchronized
+    fun matchesBlocklist(candidates: Collection<String?>, blocklist: Collection<String>): Boolean {
+        val expandedCandidates = resolveStableIdentifiers(candidates)
+        if (expandedCandidates.isEmpty()) return false
+        val expandedBlocklist = resolveStableIdentifiers(blocklist)
+        if (expandedBlocklist.isEmpty()) return false
+        return expandedCandidates.any { cand ->
+            expandedBlocklist.any { blocked -> cand.equals(blocked, ignoreCase = true) }
+        }
     }
 
     @Synchronized
@@ -126,6 +195,11 @@ object PeerAliasRegistry {
         val firstAliases = resolveAliases(first)
         val secondAliases = resolveAliases(second)
         if (hasConflictingDevIds(firstAliases, secondAliases)) return false
+        val firstStable = firstAliases.filter { isStablePeerIdentifier(it) }
+        val secondStable = secondAliases.filter { isStablePeerIdentifier(it) }
+        if (firstStable.isNotEmpty() && secondStable.isNotEmpty()) {
+            return firstStable.any { a -> secondStable.any { b -> a.equals(b, ignoreCase = true) } }
+        }
         return firstAliases.any { a -> secondAliases.any { b -> a.equals(b, ignoreCase = true) } }
     }
 
@@ -169,6 +243,18 @@ class BleProximityTransport(
     private val _incomingMessagesFlow = MutableSharedFlow<Pair<String, ChatMessage>>(extraBufferCapacity = 32)
     val incomingMessagesFlow: SharedFlow<Pair<String, ChatMessage>> = _incomingMessagesFlow.asSharedFlow()
 
+    private val _incomingMessageDeletesFlow = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 32)
+    val incomingMessageDeletesFlow: SharedFlow<Pair<String, String>> = _incomingMessageDeletesFlow.asSharedFlow()
+
+    private val _outgoingMessageSentFlow = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    val outgoingMessageSentFlow: SharedFlow<String> = _outgoingMessageSentFlow.asSharedFlow()
+
+    private val _incomingMessageDeliveredFlow = MutableSharedFlow<Pair<String, List<String>>>(extraBufferCapacity = 64)
+    val incomingMessageDeliveredFlow: SharedFlow<Pair<String, List<String>>> = _incomingMessageDeliveredFlow.asSharedFlow()
+
+    private val _incomingMessageSeenFlow = MutableSharedFlow<Pair<String, List<String>>>(extraBufferCapacity = 64)
+    val incomingMessageSeenFlow: SharedFlow<Pair<String, List<String>>> = _incomingMessageSeenFlow.asSharedFlow()
+
     private val _incomingConnectionRequestFlow = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 16)
     val incomingConnectionRequestFlow: SharedFlow<Pair<String, String>> = _incomingConnectionRequestFlow.asSharedFlow()
 
@@ -195,7 +281,10 @@ class BleProximityTransport(
     var onIncomingPhotoWireFrame: ((senderPeerId: String, frame: WireFrame) -> Unit)? = null
     var onSendPhotoRequested: ((peerId: String, uriString: String) -> Unit)? = null
     var onDownloadPhotoRequested: ((peerId: String, transferId: String) -> Unit)? = null
+    var onDownloadPeerDpRequested: ((peerId: String, avatarDigest: String) -> Unit)? = null
     var onCancelPhotoRequested: ((transferId: String) -> Unit)? = null
+    var onDeleteMessageForMeRequested: ((peerId: String, msgId: String) -> Unit)? = null
+    var onDeleteMessageForEveryoneRequested: ((peerId: String, msgId: String) -> Unit)? = null
 
     private val _e2eeSessionReadyFlow = MutableSharedFlow<String>(extraBufferCapacity = 16)
 
@@ -304,7 +393,42 @@ class BleProximityTransport(
         return sessionCryptoManager.decryptBytes(payload, aliases)
     }
 
-    fun sendPhotoWireFrame(targetPeerId: String, rawWireFrame: String): Boolean {
+    /**
+     * Proactively refreshes the GATT client link to [peerId] when a critical photo control frame
+     * (such as `PHOTO_DOWNLOAD_REQUEST`) received no response across existing routes.
+     */
+    suspend fun refreshPeerGattChannelForRetry(
+        peerId: String,
+        timeoutMs: Long = 5_000L
+    ): Boolean {
+        if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return false
+        }
+        if (peerId.isNotBlank()) {
+            activePeerId = peerId
+            linkOutboundPeerAliases(peerId)
+        }
+        val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val plan = gattSessionManager.inspectOutboundRoutePlan(peerAliases)
+        LayoverFileLogger.log(
+            "refreshPeerGattChannelForRetry: peerId=$peerId, currentPrimary=${plan.primary}, currentFallback=${plan.fallback}"
+        )
+        if (peerId.isNotBlank() && plan.primary != GattOutboundRoute.CLIENT_WRITE && !gattSessionManager.isClientConnecting()) {
+            // If we only had a GATT Server route (or no route), open a fresh GATT Client connection
+            // so retries can also deliver via ATT-acknowledged CLIENT_WRITE.
+            connectGattDevice(peerId)
+        } else if (peerId.isNotBlank() && plan.primary == GattOutboundRoute.CLIENT_WRITE && plan.fallback == GattOutboundRoute.NONE) {
+            handleGattReconnectRequest(lastGattMac, "photo_download_request_retry")
+        }
+        return ensureEncryptedChannelReady(peerId, timeoutMs = timeoutMs)
+    }
+
+    fun sendPhotoWireFrame(
+        targetPeerId: String,
+        rawWireFrame: String,
+        routePreference: GattRoutePreference = GattRoutePreference.AUTO
+    ): Boolean {
         if (isPeerIdentifierBlocked(targetPeerId, activePeerId, lastGattMac)) {
             diagnosticsTracker.incrementBlockedDrops()
             return false
@@ -315,15 +439,24 @@ class BleProximityTransport(
         }
         val peerAliases = collectPeerAliases(targetPeerId, activePeerId, lastGattMac)
         val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        val routePlan = gattSessionManager.inspectOutboundRoutePlan(peerAliases, routePreference)
+        val frameType = rawWireFrame.substringBefore("|")
+        LayoverFileLogger.log(
+            "sendPhotoWireFrame: type=$frameType, targetPeerId=$targetPeerId, pref=$routePreference, " +
+                "primary=${routePlan.primary}, fallback=${routePlan.fallback}, channelReady=$channelReady"
+        )
         if (!channelReady && !gattSessionManager.isClientConnecting() && targetPeerId.isNotBlank()) {
             connectGattDevice(targetPeerId)
         }
-        val sent = gattSessionManager.sendFrame(rawWireFrame, targetAliases = peerAliases)
+        val sent = gattSessionManager.sendFrame(
+            text = rawWireFrame,
+            targetAliases = peerAliases,
+            routePreference = routePreference
+        )
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
             diagnosticsTracker.updateLastErrorMessage(null)
         } else {
-            val frameType = rawWireFrame.substringBefore("|")
             LayoverFileLogger.logError("sendPhotoWireFrame failed to enqueue/send frame: type=$frameType, targetPeerId=$targetPeerId")
             diagnosticsTracker.updateLastErrorMessage("Failed to send $frameType frame")
         }
@@ -338,8 +471,20 @@ class BleProximityTransport(
         onDownloadPhotoRequested?.invoke(peerId, transferId)
     }
 
+    override fun downloadPeerProfilePicture(peerId: String, avatarDigest: String) {
+        onDownloadPeerDpRequested?.invoke(peerId, avatarDigest)
+    }
+
     override fun cancelPhotoTransfer(transferId: String) {
         onCancelPhotoRequested?.invoke(transferId)
+    }
+
+    override fun deleteMessageForMe(peerId: String, msgId: String) {
+        onDeleteMessageForMeRequested?.invoke(peerId, msgId)
+    }
+
+    override fun deleteMessageForEveryone(peerId: String, msgId: String) {
+        onDeleteMessageForEveryoneRequested?.invoke(peerId, msgId)
     }
 
     fun sendProfileSync(targetPeerId: String? = null) {
@@ -380,7 +525,10 @@ class BleProximityTransport(
     private var awaitingResetResponse: Boolean = false
     private val lastDecryptRecoveryTimeMs = ConcurrentHashMap<String, Long>()
     private val consecutiveDecryptRecoveries = ConcurrentHashMap<String, Int>()
-    private val pendingEncryptedRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+    private val pendingEncryptedRetries = java.util.concurrent.ConcurrentLinkedQueue<Triple<String, String, String>>()
+    private val pendingEncryptedDeleteRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+    private val pendingDeliveredAckRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, List<String>>>()
+    private val pendingSeenAckRetries = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, List<String>>>()
 
     val isE2eeEstablished: Boolean
         get() = sessionCryptoManager.isSessionKeyEstablished
@@ -402,8 +550,12 @@ class BleProximityTransport(
         for (raw in seeds) {
             if (raw.isNullOrBlank() || raw == "00000000" || raw == "user" || raw == "local") continue
             val trimmed = raw.trim()
-            out.add(trimmed)
-            out.addAll(PeerAliasRegistry.resolveAliases(trimmed))
+            if (PeerAliasRegistry.isStablePeerIdentifier(trimmed)) {
+                out.addAll(PeerAliasRegistry.resolveStableIdentifiers(trimmed))
+            } else {
+                out.add(trimmed)
+                out.addAll(PeerAliasRegistry.resolveAliases(trimmed))
+            }
         }
         return out
     }
@@ -415,30 +567,31 @@ class BleProximityTransport(
     }
 
     fun isPeerIdentifierBlocked(vararg candidates: String?): Boolean {
-        val expandedCandidates = collectPeerAliases(*candidates)
-        if (expandedCandidates.isEmpty()) return false
-
-        val expandedBlocked = linkedSetOf<String>()
-        for (b in blockedPeerIds) {
-            if (b.isBlank() || b == "00000000" || b == "user") continue
-            expandedBlocked.add(b.trim())
-            expandedBlocked.addAll(PeerAliasRegistry.resolveAliases(b))
+        val matched = PeerAliasRegistry.matchesBlocklist(candidates.toList(), blockedPeerIds)
+        if (matched) {
+            val stableCandidates = PeerAliasRegistry.resolveStableIdentifiers(candidates.toList())
+            LayoverFileLogger.log("BLOCK EVALUATION: Matched blocked stable alias across candidates=$stableCandidates")
         }
-
-        val matched = expandedCandidates.firstOrNull { cand ->
-            expandedBlocked.any { blocked -> cand.equals(blocked, ignoreCase = true) }
-        }
-
-        if (matched != null) {
-            LayoverFileLogger.log("BLOCK EVALUATION: Matched blocked alias '$matched' across candidates=$expandedCandidates")
-            return true
-        }
-        return false
+        return matched
     }
 
     init {
         gattSessionManager.compactAvatarBytesProvider = {
             currentUserProfile.compactTransferAvatarBytes ?: currentUserProfile.avatarBytes
+        }
+
+        gattSessionManager.onOutboundFrameTransmitted = { rawFrame ->
+            when (val decoded = WireFrameCodec.decodeFrame(rawFrame)) {
+                is WireFrame.ChatEncrypted -> {
+                    _outgoingMessageSentFlow.tryEmit(decoded.msgId)
+                }
+                is WireFrame.PhotoPreview -> {
+                    if (!decoded.transferId.startsWith("dp_", ignoreCase = true)) {
+                        _outgoingMessageSentFlow.tryEmit("photo_${decoded.transferId}")
+                    }
+                }
+                else -> Unit
+            }
         }
 
         gattSessionManager.startServer()
@@ -502,6 +655,9 @@ class BleProximityTransport(
                     is WireFrame.ProfileSync -> frame.senderId
                     is WireFrame.PeerBlockState -> frame.senderId
                     is WireFrame.ChatEncrypted -> frame.senderId
+                    is WireFrame.DeleteMessage -> frame.senderId
+                    is WireFrame.MessageDelivered -> frame.senderId
+                    is WireFrame.MessageSeen -> frame.senderId
                     is WireFrame.PhotoPreview -> frame.senderId
                     is WireFrame.PhotoDownloadRequest -> frame.senderId
                     is WireFrame.WifiApReady -> frame.senderId
@@ -518,7 +674,6 @@ class BleProximityTransport(
                 val activeMatchesSender = !isDistinctPeerDevId(activePeerId, frameSenderId)
                 val matchedDiscovered = discoveryManager.findDiscoveredPeer(frameSenderId)
                     ?: discoveryManager.findDiscoveredPeer(rawSenderMac)
-                    ?: frameDisplayName.takeIf { it.isNotBlank() }?.let { discoveryManager.findDiscoveredPeer(it) }
                     ?: activePeerId?.takeIf { activeMatchesSender }?.let { discoveryManager.findDiscoveredPeer(it) }
                 val latestDiscoveredMac = discoveryManager.getDiscoveredDevice(frameSenderId)?.address
                     ?: matchedDiscovered?.id?.let { discoveryManager.getDiscoveredDevice(it)?.address }
@@ -530,18 +685,16 @@ class BleProximityTransport(
                 val aliasesToLink = buildList {
                     add(rawSenderMac)
                     add(frameSenderId)
-                    if (frameDisplayName.isNotEmpty()) add(frameDisplayName)
                     latestDiscoveredMac?.let { add(it) }
                     matchedDiscovered?.id?.let { add(it) }
                     matchedDiscovered?.handle?.takeIf { it.isNotEmpty() }?.let { add(it) }
-                    matchedDiscovered?.displayName?.takeIf { it.isNotEmpty() }?.let { add(it) }
                     if (activeMatchesSender && activePeerId != null) {
                         add(activePeerId)
                     }
                     if (activeMatchesSender && lastGattMac != null) {
                         add(lastGattMac)
                     }
-                }
+                }.filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
                 PeerAliasRegistry.linkAliases(aliasesToLink)
 
                 val effectivePeerId = frameSenderId
@@ -553,7 +706,6 @@ class BleProximityTransport(
                     val isBlocked = isPeerIdentifierBlocked(
                         effectivePeerId,
                         frameSenderId,
-                        frameDisplayName,
                         rawSenderMac,
                         lastGattMac.takeIf { activeMatchesSender }
                     )
@@ -570,6 +722,9 @@ class BleProximityTransport(
                         frame is WireFrame.ConnectionDecline ||
                         frame is WireFrame.ProfileSync ||
                         frame is WireFrame.PeerBlockState ||
+                        frame is WireFrame.DeleteMessage ||
+                        frame is WireFrame.MessageDelivered ||
+                        frame is WireFrame.MessageSeen ||
                         frame is WireFrame.PhotoDownloadRequest ||
                         frame is WireFrame.WifiApReady ||
                         frame is WireFrame.WifiApFallback ||
@@ -692,6 +847,7 @@ class BleProximityTransport(
                                 timestampMillis = arrivalMillis
                             )
                             _incomingMessagesFlow.emit(Pair(effectivePeerId, newMsg))
+                            sendMessageDeliveredAck(effectivePeerId, listOf(frame.msgId))
                         } else {
                             val currentFp = sessionCryptoManager.getSessionFingerprintForPeer(peerAliases)
                                 ?: sessionCryptoManager.sessionFingerprint
@@ -706,12 +862,91 @@ class BleProximityTransport(
                         }
                     }
 
+                    is WireFrame.DeleteMessage -> {
+                        if (effectivePeerId.isNotEmpty()) {
+                            activePeerId = effectivePeerId
+                        }
+                        val iv = try {
+                            Base64.decode(frame.ivBase64.trim(), Base64.NO_WRAP)
+                        } catch (_: Exception) {
+                            diagnosticsTracker.updateLastErrorMessage("Invalid DELETE_MESSAGE IV Base64")
+                            return@collect
+                        }
+                        val cipherBytes = try {
+                            Base64.decode(frame.ciphertextBase64.trim(), Base64.NO_WRAP)
+                        } catch (_: Exception) {
+                            diagnosticsTracker.updateLastErrorMessage("Invalid DELETE_MESSAGE Ciphertext Base64")
+                            return@collect
+                        }
+                        val peerAliases = collectPeerAliases(effectivePeerId, frame.senderId, rawSenderMac, lastGattMac)
+                        val decryptedMsgId = sessionCryptoManager.decryptText(
+                            payload = EncryptedPayload(iv = iv, ciphertext = cipherBytes),
+                            peerCandidates = peerAliases
+                        )?.trim()
+                        if (!decryptedMsgId.isNullOrEmpty()) {
+                            consecutiveDecryptRecoveries.remove(canonicalRecoveryKey(effectivePeerId))
+                            LayoverFileLogger.log(
+                                "DISPATCH DELETE_MESSAGE -> runtime: msgId=$decryptedMsgId, effectivePeerId=$effectivePeerId"
+                            )
+                            _incomingMessageDeletesFlow.emit(Pair(effectivePeerId, decryptedMsgId))
+                        } else {
+                            LayoverFileLogger.logError(
+                                "Failed to decrypt incoming DELETE_MESSAGE from $effectivePeerId (aliases=$peerAliases)"
+                            )
+                            triggerDecryptRecoveryRehandshake(effectivePeerId, peerAliases)
+                        }
+                    }
+
+                    is WireFrame.MessageDelivered -> {
+                        if (effectivePeerId.isNotEmpty()) {
+                            activePeerId = effectivePeerId
+                        }
+                        val iv = runCatching { Base64.decode(frame.ivBase64.trim(), Base64.NO_WRAP) }.getOrNull() ?: return@collect
+                        val cipherBytes = runCatching { Base64.decode(frame.ciphertextBase64.trim(), Base64.NO_WRAP) }.getOrNull() ?: return@collect
+                        val peerAliases = collectPeerAliases(effectivePeerId, frame.senderId, rawSenderMac, lastGattMac)
+                        val decryptedPayload = sessionCryptoManager.decryptText(
+                            payload = EncryptedPayload(iv = iv, ciphertext = cipherBytes),
+                            peerCandidates = peerAliases
+                        )
+                        val msgIds = decryptedPayload
+                            ?.split(",")
+                            ?.map { it.trim() }
+                            ?.filter { it.isNotEmpty() }
+                            .orEmpty()
+                        if (msgIds.isNotEmpty()) {
+                            LayoverFileLogger.log("DISPATCH MESSAGE_DELIVERED -> runtime: peerId=$effectivePeerId, msgIds=$msgIds")
+                            _incomingMessageDeliveredFlow.emit(Pair(effectivePeerId, msgIds))
+                        }
+                    }
+
+                    is WireFrame.MessageSeen -> {
+                        if (effectivePeerId.isNotEmpty()) {
+                            activePeerId = effectivePeerId
+                        }
+                        val iv = runCatching { Base64.decode(frame.ivBase64.trim(), Base64.NO_WRAP) }.getOrNull() ?: return@collect
+                        val cipherBytes = runCatching { Base64.decode(frame.ciphertextBase64.trim(), Base64.NO_WRAP) }.getOrNull() ?: return@collect
+                        val peerAliases = collectPeerAliases(effectivePeerId, frame.senderId, rawSenderMac, lastGattMac)
+                        val decryptedPayload = sessionCryptoManager.decryptText(
+                            payload = EncryptedPayload(iv = iv, ciphertext = cipherBytes),
+                            peerCandidates = peerAliases
+                        )
+                        val msgIds = decryptedPayload
+                            ?.split(",")
+                            ?.map { it.trim() }
+                            ?.filter { it.isNotEmpty() }
+                            .orEmpty()
+                        if (msgIds.isNotEmpty()) {
+                            LayoverFileLogger.log("DISPATCH MESSAGE_SEEN -> runtime: peerId=$effectivePeerId, msgIds=$msgIds")
+                            _incomingMessageSeenFlow.emit(Pair(effectivePeerId, msgIds))
+                        }
+                    }
+
                     is WireFrame.PhotoPreview,
                     is WireFrame.PhotoDownloadRequest,
                     is WireFrame.WifiApReady,
                     is WireFrame.WifiApFallback,
                     is WireFrame.PhotoTransferDone -> {
-                        if (effectivePeerId.isNotEmpty() && frame is WireFrame.PhotoPreview) {
+                        if (effectivePeerId.isNotEmpty()) {
                             activePeerId = effectivePeerId
                         }
                         onIncomingPhotoWireFrame?.invoke(effectivePeerId, frame)
@@ -978,13 +1213,26 @@ class BleProximityTransport(
     }
 
     override fun sendBlockState(peerId: String, blocked: Boolean) {
-        LayoverFileLogger.log("sendBlockState to peerId=$peerId, blocked=$blocked")
+        if (peerId.isBlank()) return
+        linkOutboundPeerAliases(peerId)
+        val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        LayoverFileLogger.log(
+            "sendBlockState to peerId=$peerId, blocked=$blocked, channelReady=$channelReady, aliases=$peerAliases"
+        )
+        if (!channelReady && !gattSessionManager.isClientConnecting()) {
+            connectGattDevice(peerId)
+        }
         val localId = currentUserProfile.handle.ifEmpty { "user" }
         val frame = WireFrameCodec.encodePeerBlockState(
             senderId = localId,
             blocked = blocked
         )
-        val sent = gattSessionManager.sendFrame(frame, collectPeerAliases(peerId, activePeerId, lastGattMac))
+        val sent = gattSessionManager.sendFrame(
+            text = frame,
+            targetAliases = peerAliases,
+            routePreference = GattRoutePreference.BOTH_IF_AVAILABLE
+        )
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
         }
@@ -1116,10 +1364,9 @@ class BleProximityTransport(
                 deviceMac?.let { add(it) }
                 discovered?.id?.let { add(it) }
                 discovered?.handle?.takeIf { it.isNotEmpty() }?.let { add(it) }
-                discovered?.displayName?.takeIf { it.isNotEmpty() }?.let { add(it) }
                 if (activeMatchesTarget && activePeerId != null) add(activePeerId)
                 if (activeMatchesTarget && lastGattMac != null) add(lastGattMac)
-            }
+            }.filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
         )
     }
 
@@ -1294,22 +1541,175 @@ class BleProximityTransport(
         val activeAliases = collectPeerAliases(activePeerId, lastGattMac)
         if (!sessionCryptoManager.hasSessionForPeer(activeAliases)) return
         if (!gattSessionManager.hasReadyChannel()) return
-        val remaining = mutableListOf<Pair<String, String>>()
+        val remaining = mutableListOf<Triple<String, String, String>>()
         while (pendingEncryptedRetries.isNotEmpty()) {
             val item = pendingEncryptedRetries.poll() ?: break
             val itemAliases = collectPeerAliases(item.first, activePeerId, lastGattMac)
             if (sessionCryptoManager.hasSessionForPeer(itemAliases) &&
                 !sessionCryptoManager.needsReconnectConfirmation(itemAliases)
             ) {
-                sendMessage(item.first, item.second)
+                sendMessage(item.first, item.second, item.third)
             } else {
                 remaining.add(item)
             }
         }
         remaining.forEach { pendingEncryptedRetries.add(it) }
+
+        val remainingDeletes = mutableListOf<Pair<String, String>>()
+        while (pendingEncryptedDeleteRetries.isNotEmpty()) {
+            val item = pendingEncryptedDeleteRetries.poll() ?: break
+            val itemAliases = collectPeerAliases(item.first, activePeerId, lastGattMac)
+            if (sessionCryptoManager.hasSessionForPeer(itemAliases) &&
+                !sessionCryptoManager.needsReconnectConfirmation(itemAliases)
+            ) {
+                sendDeleteMessage(item.first, item.second)
+            } else {
+                remainingDeletes.add(item)
+            }
+        }
+        remainingDeletes.forEach { pendingEncryptedDeleteRetries.add(it) }
+
+        val remainingDeliveredAcks = mutableListOf<Pair<String, List<String>>>()
+        while (pendingDeliveredAckRetries.isNotEmpty()) {
+            val item = pendingDeliveredAckRetries.poll() ?: break
+            val itemAliases = collectPeerAliases(item.first, activePeerId, lastGattMac)
+            if (sessionCryptoManager.hasSessionForPeer(itemAliases) &&
+                !sessionCryptoManager.needsReconnectConfirmation(itemAliases)
+            ) {
+                sendMessageDeliveredAck(item.first, item.second)
+            } else {
+                remainingDeliveredAcks.add(item)
+            }
+        }
+        remainingDeliveredAcks.forEach { pendingDeliveredAckRetries.add(it) }
+
+        val remainingSeenAcks = mutableListOf<Pair<String, List<String>>>()
+        while (pendingSeenAckRetries.isNotEmpty()) {
+            val item = pendingSeenAckRetries.poll() ?: break
+            val itemAliases = collectPeerAliases(item.first, activePeerId, lastGattMac)
+            if (sessionCryptoManager.hasSessionForPeer(itemAliases) &&
+                !sessionCryptoManager.needsReconnectConfirmation(itemAliases)
+            ) {
+                sendMessageSeenAck(item.first, item.second)
+            } else {
+                remainingSeenAcks.add(item)
+            }
+        }
+        remainingSeenAcks.forEach { pendingSeenAckRetries.add(it) }
     }
 
-    override fun sendMessage(peerId: String, text: String) {
+    fun sendMessageDeliveredAck(peerId: String, msgIds: List<String>): Boolean {
+        return sendEncryptedMessageAck(peerId = peerId, msgIds = msgIds, isSeen = false)
+    }
+
+    fun sendMessageSeenAck(peerId: String, msgIds: List<String>): Boolean {
+        return sendEncryptedMessageAck(peerId = peerId, msgIds = msgIds, isSeen = true)
+    }
+
+    private fun sendEncryptedMessageAck(
+        peerId: String,
+        msgIds: List<String>,
+        isSeen: Boolean
+    ): Boolean {
+        val cleanIds = msgIds.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (peerId.isBlank() || cleanIds.isEmpty()) return false
+        if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
+            return false
+        }
+        linkOutboundPeerAliases(peerId)
+        val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        val hasSession = sessionCryptoManager.hasSessionForPeer(peerAliases) &&
+            !sessionCryptoManager.needsReconnectConfirmation(peerAliases)
+
+        if (!channelReady || !hasSession) {
+            if (isSeen) {
+                pendingSeenAckRetries.add(peerId to cleanIds)
+            } else {
+                pendingDeliveredAckRetries.add(peerId to cleanIds)
+            }
+            return false
+        }
+
+        val localId = currentUserProfile.handle.ifEmpty { "user" }
+        val payloadText = cleanIds.joinToString(",")
+        val encrypted = sessionCryptoManager.encryptText(payloadText, peerAliases) ?: return false
+        val wireFrame = if (isSeen) {
+            WireFrameCodec.encodeMessageSeen(senderId = localId, encryptedMsgIdsPayload = encrypted)
+        } else {
+            WireFrameCodec.encodeMessageDelivered(senderId = localId, encryptedMsgIdsPayload = encrypted)
+        }
+        val sent = gattSessionManager.sendFrame(
+            text = wireFrame,
+            targetAliases = peerAliases,
+            routePreference = GattRoutePreference.AUTO
+        )
+        LayoverFileLogger.log(
+            "Sent encrypted ${if (isSeen) "MESSAGE_SEEN" else "MESSAGE_DELIVERED"} ACK -> peerId=$peerId, msgIds=$cleanIds, sent=$sent"
+        )
+        return sent
+    }
+
+    fun sendDeleteMessage(peerId: String, msgId: String): Boolean {
+        if (msgId.isBlank()) return false
+        if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return false
+        }
+        if (peerId.isNotEmpty()) {
+            activePeerId = peerId
+        }
+        linkOutboundPeerAliases(peerId)
+        val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val readyForPeer = gattSessionManager.isReadyForPeer(peerAliases)
+        val channelReady = readyForPeer || gattSessionManager.hasReadyChannel()
+        val needsConfirm = sessionCryptoManager.needsReconnectConfirmation(peerAliases)
+
+        if (!channelReady || needsConfirm) {
+            LayoverFileLogger.log(
+                "Deferring encrypted DELETE_MESSAGE(msgId=$msgId) for peerId=$peerId until GATT & E2EE confirmed " +
+                    "(channelReady=$channelReady, needsConfirm=$needsConfirm)."
+            )
+            pendingEncryptedDeleteRetries.add(peerId to msgId)
+            if (!channelReady && !gattSessionManager.isClientConnecting()) {
+                connectGattDevice(peerId)
+            } else if (channelReady) {
+                initiateE2eeHandshake(isReset = false)
+            }
+            return false
+        }
+
+        val localId = currentUserProfile.handle.ifEmpty { "user" }
+        val encryptedPayload = sessionCryptoManager.encryptText(msgId, peerAliases)
+        return if (encryptedPayload != null) {
+            val wirePayload = WireFrameCodec.encodeDeleteMessage(
+                senderId = localId,
+                encryptedMsgIdPayload = encryptedPayload
+            )
+            val sent = gattSessionManager.sendFrame(
+                text = wirePayload,
+                targetAliases = peerAliases,
+                routePreference = GattRoutePreference.BOTH_IF_AVAILABLE
+            )
+            LayoverFileLogger.log("Sent encrypted DELETE_MESSAGE(msgId=$msgId) -> peerId=$peerId, sent=$sent")
+            if (sent) {
+                diagnosticsTracker.incrementMessagesSent()
+            }
+            sent
+        } else {
+            LayoverFileLogger.logError("Failed to encrypt DELETE_MESSAGE(msgId=$msgId) for peerId=$peerId; queueing retry.")
+            pendingEncryptedDeleteRetries.add(peerId to msgId)
+            if (gattSessionManager.hasReadyChannel()) {
+                synchronized(handshakeLock) { hasSentKeyExchange = false }
+                initiateE2eeHandshake(isReset = false)
+            } else if (!gattSessionManager.isClientConnecting()) {
+                connectGattDevice(peerId)
+            }
+            false
+        }
+    }
+
+    override fun sendMessage(peerId: String, text: String, msgId: String) {
         if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
@@ -1325,7 +1725,7 @@ class BleProximityTransport(
         val routePlan = gattSessionManager.inspectOutboundRoutePlan(peerAliases)
 
         LayoverFileLogger.log(
-            "sendMessage routing for peerId=$peerId: primary=${routePlan.primary}, fallback=${routePlan.fallback}, " +
+            "sendMessage routing for peerId=$peerId: msgId=$msgId, primary=${routePlan.primary}, fallback=${routePlan.fallback}, " +
                 "channelReady=$channelReady, readyForPeer=$readyForPeer, needsConfirm=$needsConfirm, " +
                 "clientConnecting=${gattSessionManager.isClientConnecting()}, aliases=$peerAliases"
         )
@@ -1335,7 +1735,7 @@ class BleProximityTransport(
                 "Deferring encrypted chat message for peerId=$peerId until GATT & E2EE session confirmed " +
                     "(channelReady=$channelReady, needsConfirm=$needsConfirm)."
             )
-            pendingEncryptedRetries.add(peerId to text)
+            pendingEncryptedRetries.add(Triple(peerId, text, msgId))
             if (!channelReady && !gattSessionManager.isClientConnecting()) {
                 connectGattDevice(peerId)
             } else if (channelReady) {
@@ -1345,12 +1745,12 @@ class BleProximityTransport(
         }
 
         val localId = currentUserProfile.handle.ifEmpty { "user" }
-        val msgId = "msg_${System.currentTimeMillis()}"
+        val resolvedMsgId = msgId.ifBlank { "msg_${System.currentTimeMillis()}" }
 
         val encryptedPayload = sessionCryptoManager.encryptText(text, peerAliases)
         if (encryptedPayload != null) {
             val wirePayload = WireFrameCodec.encodeChatEncrypted(
-                msgId = msgId,
+                msgId = resolvedMsgId,
                 senderId = localId,
                 timestamp = System.currentTimeMillis(),
                 payload = encryptedPayload
@@ -1364,7 +1764,7 @@ class BleProximityTransport(
             }
         } else {
             LayoverFileLogger.logError("Failed to encrypt text for peerId=$peerId. Queueing message & initiating E2EE key exchange...")
-            pendingEncryptedRetries.add(peerId to text)
+            pendingEncryptedRetries.add(Triple(peerId, text, resolvedMsgId))
             if (gattSessionManager.hasReadyChannel()) {
                 synchronized(handshakeLock) { hasSentKeyExchange = false }
                 initiateE2eeHandshake(isReset = false)
@@ -1389,6 +1789,9 @@ class BleProximityTransport(
         lastDecryptRecoveryTimeMs.clear()
         consecutiveDecryptRecoveries.clear()
         pendingEncryptedRetries.clear()
+        pendingEncryptedDeleteRetries.clear()
+        pendingDeliveredAckRetries.clear()
+        pendingSeenAckRetries.clear()
         gattSessionManager.cleanup()
     }
 }

@@ -4,9 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
+import android.media.ExifInterface
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +33,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
@@ -83,11 +84,16 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.UserProfile
 import com.intj.layover.navigation.LayoverBackground
 import com.intj.layover.ui.theme.LayoverTheme
+import com.intj.layover.wifi.EncryptedPhotoStreamProtocol
+import com.intj.layover.wifi.PhotoSizeValidationResult
+import com.intj.layover.wifi.PhotoSizeValidator
+import com.intj.layover.wifi.PhotoTransferConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -96,17 +102,88 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+private const val MAX_CROPPED_FULL_RES_DP_DIM = 2048
+private const val MAX_LOCAL_DISPLAY_DP_DIM = 512
+private const val MAX_BLE_COMPACT_AVATAR_BYTES = 6 * 1024L
+
 private data class ProcessedAvatarBundle(
+    val fullResCroppedBytes: ByteArray,
+    val fullResSha256Hex: String,
     val displayBytes: ByteArray,
     val compactTransferBytes: ByteArray,
     val croppedWidth: Int,
     val croppedHeight: Int
 )
 
-private fun decodeSampledBitmap(context: Context, uri: Uri, maxDim: Int = 2048): Bitmap? {
+/**
+ * Computes the target square pixel dimension for the cropped full-resolution profile picture
+ * based on the source bitmap dimensions, cropper viewport size, and user zoom factor.
+ * Preserves native cropped resolution up to [maxDim] without artificially upscaling small images.
+ */
+internal fun computeCroppedFullResDimension(
+    srcWidth: Int,
+    srcHeight: Int,
+    viewportSizePx: Float,
+    zoom: Float,
+    maxDim: Int = MAX_CROPPED_FULL_RES_DP_DIM
+): Int {
+    val safeSrcW = srcWidth.coerceAtLeast(1).toFloat()
+    val safeSrcH = srcHeight.coerceAtLeast(1).toFloat()
+    val safeViewport = viewportSizePx.coerceAtLeast(1f)
+    val safeZoom = zoom.coerceAtLeast(1f)
+    val coverScale = max(safeViewport / safeSrcW, safeViewport / safeSrcH)
+    val nativeCropSide = (safeViewport / (coverScale * safeZoom)).roundToInt()
+    val minSourceSide = min(srcWidth, srcHeight).coerceAtLeast(128)
+    val floorDim = min(safeViewport.roundToInt().coerceAtLeast(128), minSourceSide)
+    return nativeCropSide.coerceIn(floorDim, maxDim.coerceAtLeast(floorDim))
+}
+
+private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+    val matrix = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            matrix.postRotate(90f)
+            matrix.preScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            matrix.postRotate(270f)
+            matrix.preScale(-1f, 1f)
+        }
+        else -> return bitmap
+    }
+    return runCatching {
+        val transformed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (transformed != bitmap) {
+            bitmap.recycle()
+        }
+        transformed
+    }.getOrDefault(bitmap)
+}
+
+private fun decodeSampledBitmapFromUri(
+    context: Context,
+    uri: Uri,
+    maxDim: Int = MAX_CROPPED_FULL_RES_DP_DIM
+): Bitmap? {
+    val exifOrientation = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            ExifInterface(stream).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
+        }
+    }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
+
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    context.contentResolver.openInputStream(uri)?.use { stream ->
-        BitmapFactory.decodeStream(stream, null, bounds)
+    runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, bounds)
+        }
     }
     val w = bounds.outWidth
     val h = bounds.outHeight
@@ -121,19 +198,48 @@ private fun decodeSampledBitmap(context: Context, uri: Uri, maxDim: Int = 2048):
         inSampleSize = sampleSize
         inPreferredConfig = Bitmap.Config.ARGB_8888
     }
-    return context.contentResolver.openInputStream(uri)?.use { stream ->
-        BitmapFactory.decodeStream(stream, null, decodeOpts)
-    }
+    val rawBitmap = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, decodeOpts)
+        }
+    }.getOrNull() ?: return null
+
+    return applyExifOrientation(rawBitmap, exifOrientation)
 }
 
-private fun bitmapToPngOrJpegBytes(bitmap: Bitmap, compressAsJpeg: Boolean, quality: Int = 85): ByteArray {
-    val out = ByteArrayOutputStream()
-    if (compressAsJpeg) {
-        bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
-    } else {
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+private fun compressJpegWithinByteCap(
+    bitmap: Bitmap,
+    maxBytes: Long,
+    qualities: IntArray = intArrayOf(92, 85, 78, 70, 60, 50)
+): ByteArray? {
+    var working = bitmap
+    var ownsWorking = false
+    try {
+        repeat(4) {
+            for (quality in qualities) {
+                val out = ByteArrayOutputStream()
+                working.compress(Bitmap.CompressFormat.JPEG, quality, out)
+                val encoded = out.toByteArray()
+                if (encoded.isNotEmpty() && encoded.size.toLong() <= maxBytes) {
+                    return encoded
+                }
+            }
+            val nextW = (working.width * 0.8f).roundToInt().coerceAtLeast(128)
+            val nextH = (working.height * 0.8f).roundToInt().coerceAtLeast(128)
+            if (nextW == working.width && nextH == working.height) return null
+            val scaled = Bitmap.createScaledBitmap(working, nextW, nextH, true)
+            if (ownsWorking && working != scaled) {
+                working.recycle()
+            }
+            working = scaled
+            ownsWorking = true
+        }
+    } finally {
+        if (ownsWorking) {
+            working.recycle()
+        }
     }
-    return out.toByteArray()
+    return null
 }
 
 private fun computeScaledBitmapSizePx(
@@ -170,19 +276,24 @@ private fun cropCircularAndDownscale(
     rotationDegrees: Float,
     viewportSizePx: Float,
     transferSizePx: Int = 112
-): ProcessedAvatarBundle {
+): ProcessedAvatarBundle? {
     val srcW = source.width.toFloat().coerceAtLeast(1f)
     val srcH = source.height.toFloat().coerceAtLeast(1f)
 
     val (scaledW, scaledH) = computeScaledBitmapSizePx(srcW, srcH, viewportSizePx, zoom)
     val clampedPan = clampPanOffset(panOffsetPx, srcW, srcH, viewportSizePx, zoom)
 
-    val outDim = max(128, viewportSizePx.roundToInt().coerceAtLeast(1))
-    val renderedViewport = Bitmap.createBitmap(outDim, outDim, Bitmap.Config.ARGB_8888)
-    val vpCanvas = Canvas(renderedViewport)
+    val fullResDim = computeCroppedFullResDimension(
+        srcWidth = source.width,
+        srcHeight = source.height,
+        viewportSizePx = viewportSizePx,
+        zoom = zoom
+    )
+    val renderedCropped = Bitmap.createBitmap(fullResDim, fullResDim, Bitmap.Config.ARGB_8888)
+    val vpCanvas = Canvas(renderedCropped)
 
-    val scaleRatio = outDim.toFloat() / viewportSizePx.coerceAtLeast(1f)
-    val centerPx = outDim / 2f
+    val scaleRatio = fullResDim.toFloat() / viewportSizePx.coerceAtLeast(1f)
+    val centerPx = fullResDim / 2f
     val drawScaledW = scaledW * scaleRatio
     val drawScaledH = scaledH * scaleRatio
     val drawLeft = centerPx - drawScaledW / 2f + clampedPan.x * scaleRatio
@@ -195,35 +306,66 @@ private fun cropCircularAndDownscale(
     vpCanvas.drawBitmap(source, null, dstRect, paint)
     vpCanvas.restore()
 
-    val maskedCropped = Bitmap.createBitmap(outDim, outDim, Bitmap.Config.ARGB_8888)
-    val maskCanvas = Canvas(maskedCropped)
-    val radius = outDim / 2f
-    val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    maskCanvas.drawCircle(radius, radius, radius, maskPaint)
-    maskPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
-    maskCanvas.drawBitmap(renderedViewport, 0f, 0f, maskPaint)
-    renderedViewport.recycle()
+    return try {
+        val fullResCroppedBytes = compressJpegWithinByteCap(
+            bitmap = renderedCropped,
+            maxBytes = PhotoTransferConfig.MAX_PHOTO_SIZE_BYTES
+        ) ?: return null
+        if (PhotoSizeValidator.validateSize(fullResCroppedBytes.size.toLong()) !is PhotoSizeValidationResult.Valid) {
+            return null
+        }
+        val fullResSha256Hex = EncryptedPhotoStreamProtocol.sha256Hex(fullResCroppedBytes)
 
-    val clampedTransferDim = transferSizePx.coerceIn(96, 128)
-    val compactBitmap = Bitmap.createScaledBitmap(
-        maskedCropped,
-        clampedTransferDim,
-        clampedTransferDim,
-        true
-    )
+        val displayDim = min(fullResDim, MAX_LOCAL_DISPLAY_DP_DIM)
+        val displayBitmap = if (displayDim < fullResDim) {
+            Bitmap.createScaledBitmap(renderedCropped, displayDim, displayDim, true)
+        } else {
+            renderedCropped
+        }
+        val displayBytes = try {
+            compressJpegWithinByteCap(
+                bitmap = displayBitmap,
+                maxBytes = 256 * 1024L,
+                qualities = intArrayOf(88, 80, 72)
+            ) ?: fullResCroppedBytes
+        } finally {
+            if (displayBitmap != renderedCropped) {
+                displayBitmap.recycle()
+            }
+        }
 
-    val displayBytes = bitmapToPngOrJpegBytes(maskedCropped, compressAsJpeg = false)
-    val compactBytes = bitmapToPngOrJpegBytes(compactBitmap, compressAsJpeg = true, quality = 82)
+        val clampedTransferDim = transferSizePx.coerceIn(96, 128)
+        val compactBitmap = Bitmap.createScaledBitmap(
+            renderedCropped,
+            clampedTransferDim,
+            clampedTransferDim,
+            true
+        )
+        val compactBytes = try {
+            compressJpegWithinByteCap(
+                bitmap = compactBitmap,
+                maxBytes = MAX_BLE_COMPACT_AVATAR_BYTES,
+                qualities = intArrayOf(82, 74, 65, 55, 45)
+            ) ?: run {
+                val fallbackOut = ByteArrayOutputStream()
+                compactBitmap.compress(Bitmap.CompressFormat.JPEG, 70, fallbackOut)
+                fallbackOut.toByteArray()
+            }
+        } finally {
+            compactBitmap.recycle()
+        }
 
-    maskedCropped.recycle()
-    compactBitmap.recycle()
-
-    return ProcessedAvatarBundle(
-        displayBytes = displayBytes,
-        compactTransferBytes = compactBytes,
-        croppedWidth = outDim,
-        croppedHeight = outDim
-    )
+        ProcessedAvatarBundle(
+            fullResCroppedBytes = fullResCroppedBytes,
+            fullResSha256Hex = fullResSha256Hex,
+            displayBytes = displayBytes,
+            compactTransferBytes = compactBytes,
+            croppedWidth = fullResDim,
+            croppedHeight = fullResDim
+        )
+    } finally {
+        renderedCropped.recycle()
+    }
 }
 
 @Composable
@@ -250,6 +392,8 @@ fun ProfileScreen(
     }
 
     var pendingSourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var savedFullResBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var avatarErrorMessage by remember { mutableStateOf<String?>(null) }
     var isProcessingImage by remember { mutableStateOf(false) }
 
     var isVisible by remember(profile.isVisibleToNearby) {
@@ -266,6 +410,10 @@ fun ProfileScreen(
         }
     }
 
+    val wifiPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { }
+
     val pickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -273,11 +421,14 @@ fun ProfileScreen(
             scope.launch {
                 isProcessingImage = true
                 val decoded = withContext(Dispatchers.IO) {
-                    decodeSampledBitmap(context, uri)
+                    decodeSampledBitmapFromUri(context, uri)
                 }
                 isProcessingImage = false
                 if (decoded != null) {
+                    avatarErrorMessage = null
                     pendingSourceBitmap = decoded
+                } else {
+                    avatarErrorMessage = "Unable to decode selected photo"
                 }
             }
         }
@@ -307,10 +458,27 @@ fun ProfileScreen(
                     pendingSourceBitmap = null
                     isProcessingImage = false
 
+                    if (processed == null) {
+                        avatarErrorMessage = "Cropped photo exceeds 3 MB limit or could not be encoded"
+                        return@launch
+                    }
+
                     avatarBytes = processed.displayBytes
                     compactAvatarBytes = processed.compactTransferBytes
+                    savedFullResBytes = processed.fullResCroppedBytes
                     resolutionLabel = "${processed.croppedWidth} x ${processed.croppedHeight} px"
-                    LayoverFileLogger.log("ProfileScreen cropped avatar: display=${processed.displayBytes.size}B, compact=${processed.compactTransferBytes.size}B")
+                    avatarErrorMessage = null
+                    LayoverFileLogger.log(
+                        "ProfileScreen cropped avatar: croppedFullRes=${processed.fullResCroppedBytes.size}B, " +
+                            "sha256=${processed.fullResSha256Hex.take(12)}, " +
+                            "display=${processed.displayBytes.size}B, " +
+                            "compact=${processed.compactTransferBytes.size}B, " +
+                            "dim=${processed.croppedWidth}x${processed.croppedHeight}"
+                    )
+                    val missingWifi = BlePermissionHelper.getMissingWifiHotspotPermissions(context)
+                    if (missingWifi.isNotEmpty()) {
+                        wifiPermissionLauncher.launch(missingWifi.toTypedArray())
+                    }
                 }
             }
         )
@@ -535,6 +703,39 @@ fun ProfileScreen(
                         )
                     }
 
+                    avatarErrorMessage?.let { errMsg ->
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0x33FF5252))
+                                .border(1.dp, Color(0x88FF5252), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = errMsg,
+                                color = Color(0xFFFF8A80),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = { avatarErrorMessage = null },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Dismiss error",
+                                    tint = Color(0xFFFF8A80),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(14.dp))
 
                     Text(
@@ -641,16 +842,21 @@ fun ProfileScreen(
                     Button(
                         onClick = {
                             val effectiveCompact = compactAvatarBytes ?: avatarBytes
-                            LayoverFileLogger.log("ProfileScreen saving profile: compactBytes=${effectiveCompact?.size ?: 0}")
+                            LayoverFileLogger.log(
+                                "ProfileScreen saving profile: compactBytes=${effectiveCompact?.size ?: 0}, " +
+                                    "pendingFullResBytes=${savedFullResBytes?.size ?: 0}"
+                            )
                             val updatedProfile = profile.copy(
                                 displayName = profile.displayName.trim().take(7),
                                 age = selectedAge,
                                 avatarBytes = avatarBytes,
                                 compactTransferAvatarBytes = effectiveCompact,
                                 croppedResolutionLabel = resolutionLabel,
+                                pendingFullResAvatarBytes = savedFullResBytes,
                                 isVisibleToNearby = isVisible
                             )
                             onSaveProfile(updatedProfile)
+                            savedFullResBytes = null
                             showSavedDialog = true
                         },
                         modifier = Modifier
@@ -708,9 +914,11 @@ fun ProfileScreen(
                                     avatarBytes = avatarBytes,
                                     compactTransferAvatarBytes = compactAvatarBytes ?: avatarBytes,
                                     croppedResolutionLabel = resolutionLabel,
+                                    pendingFullResAvatarBytes = savedFullResBytes,
                                     isVisibleToNearby = checked
                                 )
                                 onSaveProfile(updatedProfile)
+                                savedFullResBytes = null
                             },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = colors.darkBackground,

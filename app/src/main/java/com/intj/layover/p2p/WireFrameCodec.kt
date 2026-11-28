@@ -49,6 +49,24 @@ sealed class WireFrame {
         val ciphertextBase64: String
     ) : WireFrame()
 
+    data class DeleteMessage(
+        val senderId: String,
+        val ivBase64: String,
+        val ciphertextBase64: String
+    ) : WireFrame()
+
+    data class MessageDelivered(
+        val senderId: String,
+        val ivBase64: String,
+        val ciphertextBase64: String
+    ) : WireFrame()
+
+    data class MessageSeen(
+        val senderId: String,
+        val ivBase64: String,
+        val ciphertextBase64: String
+    ) : WireFrame()
+
     data class PhotoPreview(
         val transferId: String,
         val senderId: String,
@@ -94,6 +112,9 @@ object WireFrameCodec {
         "PROFILE_SYNC",
         "PEER_BLOCK_STATE",
         "CHAT_ENCRYPTED",
+        "DELETE_MESSAGE",
+        "MESSAGE_DELIVERED",
+        "MESSAGE_SEEN",
         "PHOTO_PREVIEW",
         "PHOTO_DOWNLOAD_REQUEST",
         "WIFI_AP_READY",
@@ -173,6 +194,33 @@ object WireFrameCodec {
         val ivB64 = Base64.getEncoder().encodeToString(payload.iv)
         val cipherB64 = Base64.getEncoder().encodeToString(payload.ciphertext)
         return "CHAT_ENCRYPTED|$msgId|$senderId|$timestamp|$ivB64|$cipherB64"
+    }
+
+    fun encodeDeleteMessage(
+        senderId: String,
+        encryptedMsgIdPayload: EncryptedPayload
+    ): String {
+        val ivB64 = Base64.getEncoder().encodeToString(encryptedMsgIdPayload.iv)
+        val cipherB64 = Base64.getEncoder().encodeToString(encryptedMsgIdPayload.ciphertext)
+        return "DELETE_MESSAGE|$senderId|$ivB64|$cipherB64"
+    }
+
+    fun encodeMessageDelivered(
+        senderId: String,
+        encryptedMsgIdsPayload: EncryptedPayload
+    ): String {
+        val ivB64 = Base64.getEncoder().encodeToString(encryptedMsgIdsPayload.iv)
+        val cipherB64 = Base64.getEncoder().encodeToString(encryptedMsgIdsPayload.ciphertext)
+        return "MESSAGE_DELIVERED|$senderId|$ivB64|$cipherB64"
+    }
+
+    fun encodeMessageSeen(
+        senderId: String,
+        encryptedMsgIdsPayload: EncryptedPayload
+    ): String {
+        val ivB64 = Base64.getEncoder().encodeToString(encryptedMsgIdsPayload.iv)
+        val cipherB64 = Base64.getEncoder().encodeToString(encryptedMsgIdsPayload.ciphertext)
+        return "MESSAGE_SEEN|$senderId|$ivB64|$cipherB64"
     }
 
     fun encodePhotoPreview(
@@ -309,6 +357,36 @@ object WireFrameCodec {
                         timestamp = parts[3].toLongOrNull() ?: System.currentTimeMillis(),
                         ivBase64 = parts[4],
                         ciphertextBase64 = parts[5]
+                    )
+                } else null
+            }
+
+            "DELETE_MESSAGE" -> {
+                if (parts.size >= 4 && parts[1].isNotBlank() && parts[2].isNotBlank() && parts[3].isNotBlank()) {
+                    WireFrame.DeleteMessage(
+                        senderId = parts[1],
+                        ivBase64 = parts[2],
+                        ciphertextBase64 = parts[3]
+                    )
+                } else null
+            }
+
+            "MESSAGE_DELIVERED" -> {
+                if (parts.size >= 4 && parts[1].isNotBlank() && parts[2].isNotBlank() && parts[3].isNotBlank()) {
+                    WireFrame.MessageDelivered(
+                        senderId = parts[1],
+                        ivBase64 = parts[2],
+                        ciphertextBase64 = parts[3]
+                    )
+                } else null
+            }
+
+            "MESSAGE_SEEN" -> {
+                if (parts.size >= 4 && parts[1].isNotBlank() && parts[2].isNotBlank() && parts[3].isNotBlank()) {
+                    WireFrame.MessageSeen(
+                        senderId = parts[1],
+                        ivBase64 = parts[2],
+                        ciphertextBase64 = parts[3]
                     )
                 } else null
             }

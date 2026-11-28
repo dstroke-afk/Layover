@@ -20,6 +20,9 @@ object PhotoTransferConfig {
     const val PREVIEW_MAX_EDGE_PX: Int = 120
     const val PREVIEW_MAX_TARGET_BYTES: Int = 15 * 1024
     const val AP_START_TIMEOUT_MS: Long = 15_000L
+    const val DOWNLOAD_REQUEST_RETRY_INTERVAL_MS: Long = 4_000L
+    const val POST_FINAL_RETRY_WAIT_MS: Long = 7_000L
+    const val MAX_DOWNLOAD_REQUEST_ATTEMPTS: Int = 3
     const val WIFI_NETWORK_CONNECT_TIMEOUT_MS: Long = 45_000L
     const val SOCKET_CONNECT_TIMEOUT_MS: Long = 15_000L
     const val SOCKET_ACCEPT_TIMEOUT_MS: Long = 55_000L

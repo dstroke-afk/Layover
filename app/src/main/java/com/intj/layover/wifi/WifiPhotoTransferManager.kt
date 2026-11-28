@@ -3,9 +3,12 @@ package com.intj.layover.wifi
 import android.content.Context
 import android.net.Uri
 import android.util.Base64
+import com.intj.layover.ble.GattRoutePreference
+import com.intj.layover.ble.PeerAliasRegistry
 import com.intj.layover.crypto.EncryptedPayload
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ChatMessage
+import com.intj.layover.model.PeerDpDownloadState
 import com.intj.layover.model.PhotoAttachment
 import com.intj.layover.model.PhotoTransferState
 import com.intj.layover.p2p.WireFrame
@@ -16,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -48,7 +52,15 @@ class WifiPhotoTransferManager(
     private val context: Context,
     private val localPeerIdProvider: () -> String,
     private val sendBleFrame: (targetPeerId: String, rawWireFrame: String) -> Boolean,
+    private val sendBleFrameWithRoute: (
+        targetPeerId: String,
+        rawWireFrame: String,
+        routePreference: GattRoutePreference
+    ) -> Boolean = { targetPeerId, rawWireFrame, _ -> sendBleFrame(targetPeerId, rawWireFrame) },
     private val ensureEncryptedChannelReady: suspend (peerId: String) -> Boolean = { true },
+    private val refreshPeerChannelForRetry: suspend (peerId: String) -> Boolean = { peerId ->
+        ensureEncryptedChannelReady(peerId)
+    },
     private val encryptBytesForPeer: (peerId: String, plaintextBytes: ByteArray) -> EncryptedPayload?,
     private val decryptBytesFromPeer: (peerId: String, payload: EncryptedPayload) -> ByteArray?,
     private val photoStorageDir: File = File(context.filesDir, "layover_photos"),
@@ -62,7 +74,17 @@ class WifiPhotoTransferManager(
         statusDetail: String?
     ) -> Unit,
     private val onPhotoValidationError: (peerId: String, message: String) -> Unit,
-    private val onClearPhotoError: (peerId: String) -> Unit
+    private val onClearPhotoError: (peerId: String) -> Unit,
+    private val peerDpCacheStore: PeerDpCacheStore = PeerDpCacheStore(context),
+    private val ownFullResAvatarProvider: () -> OwnFullResAvatarPayload? = { null },
+    private val onPeerDpStateUpdated: (
+        peerId: String,
+        avatarDigest: String,
+        state: PeerDpDownloadState
+    ) -> Unit = { _, _, _ -> },
+    private val downloadRequestRetryIntervalMs: Long = PhotoTransferConfig.DOWNLOAD_REQUEST_RETRY_INTERVAL_MS,
+    private val postFinalRetryWaitMs: Long = PhotoTransferConfig.POST_FINAL_RETRY_WAIT_MS,
+    private val maxDownloadRequestAttempts: Int = PhotoTransferConfig.MAX_DOWNLOAD_REQUEST_ATTEMPTS
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val hotspotController = LocalOnlyHotspotController(context)
@@ -86,14 +108,61 @@ class WifiPhotoTransferManager(
         val transferKey: SecretKey
     )
 
+    private data class PendingDpDownloadMeta(
+        val transferId: String,
+        val peerId: String,
+        val peerAliases: Set<String>,
+        val avatarDigest: String
+    )
+
     private val outgoingPhotos = ConcurrentHashMap<String, OutgoingPhotoSession>()
     private val incomingPhotos = ConcurrentHashMap<String, IncomingPhotoSession>()
+    private val pendingDpMetaByTransferId = ConcurrentHashMap<String, PendingDpDownloadMeta>()
+    private val pendingEarlyWifiApReadyByTransferId = ConcurrentHashMap<String, Pair<String, WireFrame.WifiApReady>>()
     private val activeTransferJobs = ConcurrentHashMap<String, Job>()
     private val activeApTimeoutJobs = ConcurrentHashMap<String, Job>()
     private val activeServers = ConcurrentHashMap<String, DirectPhotoSocketServer>()
     private val activeHotspotSessions = ConcurrentHashMap<String, StartedHotspotSession>()
     private val activeClientConnections = ConcurrentHashMap<String, HotspotClientConnection>()
     private val terminalFailureNotified = ConcurrentHashMap.newKeySet<String>()
+    private val senderRespondedTransfers = ConcurrentHashMap.newKeySet<String>()
+
+    private fun isDpTransferId(transferId: String): Boolean = transferId.startsWith("dp_")
+
+    private fun extractDigestFromDpTransferId(transferId: String): String? {
+        if (!isDpTransferId(transferId)) return null
+        val remainder = transferId.substring(3)
+        val lastUnderscore = remainder.lastIndexOf('_')
+        val candidate = if (lastUnderscore > 0) remainder.substring(0, lastUnderscore) else remainder
+        return candidate.takeIf { it.isNotBlank() }
+    }
+
+    private fun emitTransferStateUpdate(
+        transferId: String,
+        state: PhotoTransferState,
+        progress: Float,
+        localFilePath: String?,
+        statusDetail: String?
+    ) {
+        val dpMeta = pendingDpMetaByTransferId[transferId]
+        if (dpMeta != null) {
+            onPeerDpStateUpdated(
+                dpMeta.peerId,
+                dpMeta.avatarDigest,
+                PeerDpDownloadState(
+                    peerId = dpMeta.peerId,
+                    avatarDigest = dpMeta.avatarDigest,
+                    transferId = transferId,
+                    state = state,
+                    progress = progress.coerceIn(0f, 1f),
+                    localFilePath = localFilePath,
+                    statusDetail = statusDetail
+                )
+            )
+        } else {
+            onPhotoStateUpdated(transferId, state, progress, localFilePath, statusDetail)
+        }
+    }
 
     init {
         runCatching { photoStorageDir.mkdirs() }
@@ -281,6 +350,53 @@ class WifiPhotoTransferManager(
             sha256Hex = bundle.sha256Hex,
             transferKey = bundle.transferKey
         )
+
+        if (isDpTransferId(frame.transferId)) {
+            senderRespondedTransfers.add(frame.transferId)
+            val existingMeta = pendingDpMetaByTransferId[frame.transferId]
+            if (existingMeta != null) {
+                if (senderPeerId.isNotBlank()) {
+                    PeerAliasRegistry.linkAliases(listOf(existingMeta.peerId, senderPeerId))
+                    val mergedAliases = (
+                        existingMeta.peerAliases +
+                            senderPeerId +
+                            PeerAliasRegistry.resolveStableIdentifiers(listOf(existingMeta.peerId, senderPeerId))
+                        ).filter { it.isNotBlank() }.toSet()
+                    pendingDpMetaByTransferId[frame.transferId] = existingMeta.copy(peerAliases = mergedAliases)
+                }
+            } else if (senderPeerId.isNotBlank()) {
+                val parsedDigest = extractDigestFromDpTransferId(frame.transferId)
+                    ?: bundle.sha256Hex.take(16)
+                val stableAliases = (
+                    PeerAliasRegistry.resolveStableIdentifiers(senderPeerId) + senderPeerId
+                    ).filter { it.isNotBlank() }.toSet()
+                pendingDpMetaByTransferId[frame.transferId] = PendingDpDownloadMeta(
+                    transferId = frame.transferId,
+                    peerId = senderPeerId,
+                    peerAliases = stableAliases,
+                    avatarDigest = parsedDigest
+                )
+                downloadQueueStateMachine.registerAvailable(frame.transferId, senderPeerId)
+                emitTransferStateUpdate(
+                    transferId = frame.transferId,
+                    state = PhotoTransferState.AVAILABLE,
+                    progress = 0f,
+                    localFilePath = null,
+                    statusDetail = null
+                )
+            }
+            LayoverFileLogger.log(
+                "Received encrypted DP metadata PHOTO_PREVIEW from $senderPeerId: " +
+                    "transferId=${frame.transferId}, size=${bundle.fileSizeBytes}, sha256=${bundle.sha256Hex.take(12)}"
+            )
+            val earlyReady = pendingEarlyWifiApReadyByTransferId.remove(frame.transferId)
+            if (earlyReady != null) {
+                LayoverFileLogger.log("Processing stashed early WIFI_AP_READY for DP transfer ${frame.transferId}")
+                handleIncomingWifiApReady(earlyReady.first, earlyReady.second)
+            }
+            return
+        }
+
         downloadQueueStateMachine.registerAvailable(frame.transferId, senderPeerId)
 
         val now = System.currentTimeMillis()
@@ -308,6 +424,93 @@ class WifiPhotoTransferManager(
     }
 
     /**
+     * Viewer tapped a peer's circular avatar to open the full-screen DP lightbox.
+     * - Checks the local digest-keyed cache first (instant open with zero Wi-Fi).
+     * - Deduplicates in-flight/queued requests for the same peer + digest.
+     * - Serializes with active chat photo downloads via [downloadQueueStateMachine] so only
+     *   one `WifiNetworkSpecifier` session runs at a time.
+     */
+    fun requestPeerFullResDp(peerId: String, peerAliases: Set<String>, avatarDigest: String) {
+        if (peerId.isBlank() || avatarDigest.isBlank()) return
+        val normalizedAliases = (peerAliases + peerId).filter { it.isNotBlank() }.toSet()
+
+        val cachedFile = peerDpCacheStore.getCachedPeerDpFile(normalizedAliases, avatarDigest)
+        if (cachedFile != null) {
+            LayoverFileLogger.log(
+                "Peer full-res DP cache hit for peerId=$peerId, digest=$avatarDigest -> ${cachedFile.absolutePath}"
+            )
+            onPeerDpStateUpdated(
+                peerId,
+                avatarDigest,
+                PeerDpDownloadState(
+                    peerId = peerId,
+                    avatarDigest = avatarDigest,
+                    transferId = "dp_cached_$avatarDigest",
+                    state = PhotoTransferState.COMPLETED,
+                    progress = 1f,
+                    localFilePath = cachedFile.absolutePath,
+                    statusDetail = null
+                )
+            )
+            return
+        }
+
+        val existingInFlight = pendingDpMetaByTransferId.values.firstOrNull { meta ->
+            meta.avatarDigest == avatarDigest &&
+                meta.peerAliases.any { existingAlias ->
+                    normalizedAliases.any { candidate -> existingAlias.equals(candidate, ignoreCase = true) }
+                } &&
+                downloadQueueStateMachine.getSnapshot(meta.transferId)?.state in setOf(
+                    PhotoTransferState.QUEUED,
+                    PhotoTransferState.CONNECTING_WIFI,
+                    PhotoTransferState.DOWNLOADING
+                )
+        }
+        if (existingInFlight != null) {
+            LayoverFileLogger.log(
+                "Peer full-res DP download already in flight for peerId=$peerId, digest=$avatarDigest (transferId=${existingInFlight.transferId})"
+            )
+            return
+        }
+
+        val cleanDigest = PeerDpCacheStore.sanitizeKeySegment(avatarDigest)
+        val nonce = UUID.randomUUID().toString().replace("-", "").take(6)
+        val transferId = "dp_${cleanDigest}_$nonce"
+        pendingDpMetaByTransferId[transferId] = PendingDpDownloadMeta(
+            transferId = transferId,
+            peerId = peerId,
+            peerAliases = normalizedAliases,
+            avatarDigest = avatarDigest
+        )
+        terminalFailureNotified.remove(transferId)
+        pendingEarlyWifiApReadyByTransferId.remove(transferId)
+        downloadQueueStateMachine.registerAvailable(transferId, peerId)
+
+        LayoverFileLogger.log(
+            "Requesting on-demand full-res DP over BLE/Wi-Fi: transferId=$transferId, peerId=$peerId, digest=$avatarDigest"
+        )
+        when (val outcome = downloadQueueStateMachine.requestDownload(transferId)) {
+            is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow -> {
+                startReceiverDownloadRequest(outcome.transferId, outcome.senderPeerId)
+            }
+            is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.Queued -> {
+                LayoverFileLogger.log(
+                    "Queued DP download $transferId (position=${outcome.queuePosition}) while " +
+                        "${downloadQueueStateMachine.activeTransferId()} is active."
+                )
+                emitTransferStateUpdate(
+                    transferId,
+                    PhotoTransferState.QUEUED,
+                    0f,
+                    null,
+                    outcome.statusDetail
+                )
+            }
+            PhotoDownloadQueueStateMachine.DownloadRequestOutcome.Ignored -> Unit
+        }
+    }
+
+    /**
      * Recipient tapped **Download** (or Retry) on a photo preview bubble.
      * Serializes Wi-Fi sessions so only one `WifiNetworkSpecifier` runs at a time;
      * additional tapped photos are queued automatically with `"Waiting for current download..."`.
@@ -324,8 +527,15 @@ class WifiPhotoTransferManager(
             LayoverFileLogger.log("requestDownload ignored: no preview metadata for $transferId")
             return
         }
+        val candidates = listOf(peerId, incoming.senderPeerId).filter { it.isNotBlank() }
+        if (candidates.size > 1) {
+            PeerAliasRegistry.linkAliases(candidates)
+        }
+        val canonicalSenderPeerId = candidates.firstOrNull { it.startsWith("dev_", ignoreCase = true) }
+            ?: incoming.senderPeerId.ifBlank { peerId }
         terminalFailureNotified.remove(transferId)
-        downloadQueueStateMachine.registerAvailable(transferId, incoming.senderPeerId.ifBlank { peerId })
+        senderRespondedTransfers.remove(transferId)
+        downloadQueueStateMachine.registerAvailable(transferId, canonicalSenderPeerId)
 
         when (val outcome = downloadQueueStateMachine.requestDownload(transferId)) {
             is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow -> {
@@ -418,10 +628,16 @@ class WifiPhotoTransferManager(
     /**
      * Sender receives `PHOTO_DOWNLOAD_REQUEST(transferId)` -> starts a temporary
      * `LocalOnlyHotspot` + `DirectPhotoSocketServer`, then sends `WIFI_AP_READY` over BLE.
-     * On hotspot failure/timeout, emits `WIFI_AP_FALLBACK` so the receiver can attempt
-     * 1-on-1 role inversion or fail cleanly with retry.
+     * If a retried `PHOTO_DOWNLOAD_REQUEST` arrives while our hotspot & server are already active,
+     * immediately re-emits `WIFI_AP_READY` across available GATT routes so a dropped BLE frame
+     * recovers without restarting the hotspot.
      */
     fun handleIncomingPhotoDownloadRequest(requesterPeerId: String, frame: WireFrame.PhotoDownloadRequest) {
+        if (isDpTransferId(frame.transferId)) {
+            handleIncomingDpDownloadRequest(requesterPeerId, frame)
+            return
+        }
+
         val outgoing = outgoingPhotos[frame.transferId]
         if (outgoing == null) {
             LayoverFileLogger.log(
@@ -430,10 +646,9 @@ class WifiPhotoTransferManager(
             return
         }
         val transferId = outgoing.transferId
+        val targetPeerId = requesterPeerId.ifBlank { outgoing.recipientPeerId }
         if (activeTransferJobs[transferId]?.isActive == true) {
-            LayoverFileLogger.log(
-                "Ignoring duplicate PHOTO_DOWNLOAD_REQUEST for already-active transferId=$transferId from $requesterPeerId"
-            )
+            reemitActiveWifiApReadyIfRunning(transferId, targetPeerId)
             return
         }
 
@@ -448,84 +663,234 @@ class WifiPhotoTransferManager(
             return
         }
 
-        val targetPeerId = requesterPeerId.ifBlank { outgoing.recipientPeerId }
+        launchSenderHostForSession(targetPeerId = targetPeerId, outgoing = outgoing)
+    }
+
+    private fun reemitActiveWifiApReadyIfRunning(transferId: String, targetPeerId: String) {
+        val hotspot = activeHotspotSessions[transferId]
+        val server = activeServers[transferId]
+        if (hotspot != null && server != null && !server.isClosed) {
+            val localId = localPeerIdProvider().ifBlank { "user" }
+            val readyFrame = WireFrameCodec.encodeWifiApReady(
+                transferId = transferId,
+                senderId = localId,
+                ssid = hotspot.ssid,
+                passphrase = hotspot.passphrase,
+                port = server.localPort,
+                hostIp = hotspot.hostIp.orEmpty(),
+                isReceiverFallbackHost = false
+            )
+            LayoverFileLogger.log(
+                "Received retried PHOTO_DOWNLOAD_REQUEST while hotspot is already live for $transferId; " +
+                    "re-sending WIFI_AP_READY to $targetPeerId (ssid=${hotspot.ssid}, port=${server.localPort})."
+            )
+            sendBleFrameWithRoute(targetPeerId, readyFrame, GattRoutePreference.BOTH_IF_AVAILABLE)
+        } else {
+            LayoverFileLogger.log(
+                "Ignoring duplicate PHOTO_DOWNLOAD_REQUEST for already-starting transferId=$transferId from $targetPeerId"
+            )
+        }
+    }
+
+    /**
+     * Handles an on-demand full-resolution profile picture download request (`dp_*` transfer ID).
+     * Loads our stored full-res avatar (falling back gracefully to compact avatar bytes if legacy),
+     * sends an encrypted metadata-only `PHOTO_PREVIEW` (with size, SHA-256, and fresh AES-256 key),
+     * then hosts a temporary `LocalOnlyHotspot` + `DirectPhotoSocketServer` to stream the image.
+     */
+    private fun handleIncomingDpDownloadRequest(
+        requesterPeerId: String,
+        frame: WireFrame.PhotoDownloadRequest
+    ) {
+        val transferId = frame.transferId
+        if (activeTransferJobs[transferId]?.isActive == true) {
+            reemitActiveWifiApReadyIfRunning(transferId, requesterPeerId)
+            return
+        }
+
         terminalFailureNotified.remove(transferId)
         teardownTransferResources(transferId, notifyPeer = false)
 
         val job = scope.launch {
-            var hotspotSession: StartedHotspotSession? = null
-            var server: DirectPhotoSocketServer? = null
+            val thisJob = coroutineContext[Job]
             try {
-                hotspotSession = hotspotController.startHotspot(PhotoTransferConfig.AP_START_TIMEOUT_MS)
-                activeHotspotSessions[transferId] = hotspotSession
+                val ownDp = ownFullResAvatarProvider()
+                if (ownDp == null || ownDp.bytes.isEmpty() ||
+                    PhotoSizeValidator.validateSize(ownDp.bytes.size.toLong()) !is PhotoSizeValidationResult.Valid
+                ) {
+                    LayoverFileLogger.log(
+                        "Cannot serve full-res DP for $transferId to $requesterPeerId: local avatar unavailable or exceeds 3 MB"
+                    )
+                    notifyPeerFailureOnce(transferId, requesterPeerId)
+                    return@launch
+                }
 
-                server = DirectPhotoSocketServer()
-                activeServers[transferId] = server
+                val channelReady = ensureEncryptedChannelReady(requesterPeerId)
+                if (!channelReady) {
+                    LayoverFileLogger.logError(
+                        "Cannot serve full-res DP for $transferId: GATT/E2EE not ready for $requesterPeerId"
+                    )
+                    notifyPeerFailureOnce(transferId, requesterPeerId)
+                    return@launch
+                }
+
+                val transferKey = EncryptedPhotoStreamProtocol.generateTransferKey()
+                val servedFile = savePhotoBytes("dp_serve_latest", ownDp.bytes)
+                if (servedFile == null) {
+                    LayoverFileLogger.logError("Failed to stage local full-res DP for $transferId")
+                    notifyPeerFailureOnce(transferId, requesterPeerId)
+                    return@launch
+                }
+
+                val session = OutgoingPhotoSession(
+                    transferId = transferId,
+                    recipientPeerId = requesterPeerId,
+                    fileSizeBytes = ownDp.bytes.size.toLong(),
+                    mimeType = ownDp.mimeType,
+                    sha256Hex = ownDp.sha256Hex,
+                    transferKey = transferKey,
+                    originalFilePath = servedFile.absolutePath
+                )
+                outgoingPhotos[transferId] = session
+
+                val metadataBundle = EncryptedPhotoStreamProtocol.encodePreviewBundle(
+                    fileSizeBytes = ownDp.bytes.size.toLong(),
+                    mimeType = ownDp.mimeType,
+                    sha256Hex = ownDp.sha256Hex,
+                    transferKey = transferKey,
+                    previewBytes = ByteArray(0)
+                )
+                val encryptedMetadata = encryptBytesForPeer(requesterPeerId, metadataBundle)
+                if (encryptedMetadata == null) {
+                    LayoverFileLogger.logError("Failed to encrypt DP metadata PHOTO_PREVIEW for $transferId -> $requesterPeerId")
+                    notifyPeerFailureOnce(transferId, requesterPeerId)
+                    return@launch
+                }
 
                 val localId = localPeerIdProvider().ifBlank { "user" }
-                val readyFrame = WireFrameCodec.encodeWifiApReady(
+                val metaFrame = WireFrameCodec.encodePhotoPreview(
                     transferId = transferId,
                     senderId = localId,
-                    ssid = hotspotSession.ssid,
-                    passphrase = hotspotSession.passphrase,
-                    port = server.localPort,
-                    hostIp = hotspotSession.hostIp.orEmpty(),
-                    isReceiverFallbackHost = false
+                    encryptedPreviewBundle = encryptedMetadata
                 )
-                val readySent = sendBleFrame(targetPeerId, readyFrame)
-                if (!readySent) {
-                    LayoverFileLogger.logError("Failed to send WIFI_AP_READY over BLE for $transferId -> $targetPeerId")
-                    throw IllegalStateException("Failed to send WIFI_AP_READY over BLE")
+                val metaSent = sendBleFrame(requesterPeerId, metaFrame)
+                if (!metaSent) {
+                    LayoverFileLogger.logError("Failed to send DP metadata PHOTO_PREVIEW over BLE for $transferId -> $requesterPeerId")
+                    notifyPeerFailureOnce(transferId, requesterPeerId)
+                    return@launch
                 }
                 LayoverFileLogger.log(
-                    "Sender-as-AP ready for $transferId: ssid=${hotspotSession.ssid}, port=${server.localPort}"
+                    "Sent encrypted DP metadata PHOTO_PREVIEW for $transferId -> $requesterPeerId " +
+                        "(bytes=${ownDp.bytes.size}, sha256=${ownDp.sha256Hex.take(12)}); starting Sender-as-AP."
                 )
 
-                val plaintextBytes = originalFile.readBytes()
-                server.serveAsSenderHost(
-                    transferId = transferId,
-                    plaintextBytes = plaintextBytes,
-                    transferKey = outgoing.transferKey
+                runSenderHostOnCurrentCoroutine(
+                    targetPeerId = requesterPeerId,
+                    outgoing = session,
+                    preloadedBytes = ownDp.bytes
                 )
-                LayoverFileLogger.log("Sender-as-AP finished streaming encrypted photo $transferId and received completion ACK.")
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                val cancelledByTeardown = !isActive ||
-                    terminalFailureNotified.contains(transferId) ||
-                    (server?.isClosed == true && e.message?.contains("Socket closed", ignoreCase = true) == true)
-                if (cancelledByTeardown) {
-                    LayoverFileLogger.log("Sender-as-AP stopped cleanly after transfer teardown for $transferId.")
-                } else if (hotspotSession == null) {
-                    LayoverFileLogger.log(
-                        "Sender-as-AP failed before hotspot started for $transferId (${e.message}); notifying receiver for 1-on-1 fallback."
-                    )
-                    val localId = localPeerIdProvider().ifBlank { "user" }
-                    sendBleFrame(
-                        targetPeerId,
-                        WireFrameCodec.encodeWifiApFallback(
-                            transferId = transferId,
-                            senderId = localId,
-                            reason = e.message ?: "sender_hotspot_failed"
-                        )
-                    )
-                } else {
-                    LayoverFileLogger.logError(
-                        "Sender-as-AP transfer failed for $transferId after hotspot started (${e.message}); terminating cleanly.",
-                        e
-                    )
-                    notifyPeerFailureOnce(transferId, targetPeerId)
-                }
             } finally {
-                val thisJob = coroutineContext[Job]
-                runCatching { server?.close() }
-                if (server != null) activeServers.remove(transferId, server)
-                runCatching { hotspotSession?.close() }
-                if (hotspotSession != null) activeHotspotSessions.remove(transferId, hotspotSession)
                 if (thisJob != null) activeTransferJobs.remove(transferId, thisJob)
             }
         }
         activeTransferJobs[transferId] = job
+    }
+
+    private fun launchSenderHostForSession(
+        targetPeerId: String,
+        outgoing: OutgoingPhotoSession
+    ) {
+        val transferId = outgoing.transferId
+        terminalFailureNotified.remove(transferId)
+        teardownTransferResources(transferId, notifyPeer = false)
+
+        val job = scope.launch {
+            runSenderHostOnCurrentCoroutine(
+                targetPeerId = targetPeerId,
+                outgoing = outgoing,
+                preloadedBytes = null
+            )
+        }
+        activeTransferJobs[transferId] = job
+    }
+
+    private suspend fun runSenderHostOnCurrentCoroutine(
+        targetPeerId: String,
+        outgoing: OutgoingPhotoSession,
+        preloadedBytes: ByteArray?
+    ) {
+        val transferId = outgoing.transferId
+        var hotspotSession: StartedHotspotSession? = null
+        var server: DirectPhotoSocketServer? = null
+        try {
+            hotspotSession = hotspotController.startHotspot(PhotoTransferConfig.AP_START_TIMEOUT_MS)
+            activeHotspotSessions[transferId] = hotspotSession
+
+            server = DirectPhotoSocketServer()
+            activeServers[transferId] = server
+
+            val localId = localPeerIdProvider().ifBlank { "user" }
+            val readyFrame = WireFrameCodec.encodeWifiApReady(
+                transferId = transferId,
+                senderId = localId,
+                ssid = hotspotSession.ssid,
+                passphrase = hotspotSession.passphrase,
+                port = server.localPort,
+                hostIp = hotspotSession.hostIp.orEmpty(),
+                isReceiverFallbackHost = false
+            )
+            val readySent = sendBleFrame(targetPeerId, readyFrame)
+            if (!readySent) {
+                LayoverFileLogger.logError("Failed to send WIFI_AP_READY over BLE for $transferId -> $targetPeerId")
+                throw IllegalStateException("Failed to send WIFI_AP_READY over BLE")
+            }
+            LayoverFileLogger.log(
+                "Sender-as-AP ready for $transferId: ssid=${hotspotSession.ssid}, port=${server.localPort}"
+            )
+
+            val plaintextBytes = preloadedBytes ?: File(outgoing.originalFilePath).readBytes()
+            server.serveAsSenderHost(
+                transferId = transferId,
+                plaintextBytes = plaintextBytes,
+                transferKey = outgoing.transferKey
+            )
+            LayoverFileLogger.log("Sender-as-AP finished streaming encrypted photo $transferId and received completion ACK.")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val cancelledByTeardown = !currentCoroutineContext().isActive ||
+                terminalFailureNotified.contains(transferId) ||
+                (server?.isClosed == true && e.message?.contains("Socket closed", ignoreCase = true) == true)
+            if (cancelledByTeardown) {
+                LayoverFileLogger.log("Sender-as-AP stopped cleanly after transfer teardown for $transferId.")
+            } else if (hotspotSession == null) {
+                LayoverFileLogger.log(
+                    "Sender-as-AP failed before hotspot started for $transferId (${e.message}); notifying receiver for 1-on-1 fallback."
+                )
+                val localId = localPeerIdProvider().ifBlank { "user" }
+                sendBleFrame(
+                    targetPeerId,
+                    WireFrameCodec.encodeWifiApFallback(
+                        transferId = transferId,
+                        senderId = localId,
+                        reason = e.message ?: "sender_hotspot_failed"
+                    )
+                )
+            } else {
+                LayoverFileLogger.logError(
+                    "Sender-as-AP transfer failed for $transferId after hotspot started (${e.message}); terminating cleanly.",
+                    e
+                )
+                notifyPeerFailureOnce(transferId, targetPeerId)
+            }
+        } finally {
+            val thisJob = currentCoroutineContext()[Job]
+            runCatching { server?.close() }
+            if (server != null) activeServers.remove(transferId, server)
+            runCatching { hotspotSession?.close() }
+            if (hotspotSession != null) activeHotspotSessions.remove(transferId, hotspotSession)
+            if (thisJob != null) activeTransferJobs.remove(transferId, thisJob)
+        }
     }
 
     /**
@@ -546,7 +911,16 @@ class WifiPhotoTransferManager(
             val outgoing = outgoingPhotos[frame.transferId] ?: return
             runSenderFallbackClientPush(outgoing, frame)
         } else {
-            val incoming = incomingPhotos[frame.transferId] ?: return
+            val incoming = incomingPhotos[frame.transferId]
+            if (incoming == null) {
+                if (isDpTransferId(frame.transferId) && pendingDpMetaByTransferId.containsKey(frame.transferId)) {
+                    pendingEarlyWifiApReadyByTransferId[frame.transferId] = fromPeerId to frame
+                    LayoverFileLogger.log(
+                        "Stashed early WIFI_AP_READY for DP transfer ${frame.transferId} while awaiting encrypted metadata."
+                    )
+                }
+                return
+            }
             val snapshot = downloadQueueStateMachine.getSnapshot(frame.transferId)
             if (snapshot == null ||
                 snapshot.state == PhotoTransferState.COMPLETED ||
@@ -570,10 +944,14 @@ class WifiPhotoTransferManager(
      */
     fun handleIncomingWifiApFallback(fromPeerId: String, frame: WireFrame.WifiApFallback) {
         cancelTimeoutFor(frame.transferId)
+        senderRespondedTransfers.add(frame.transferId)
         LayoverFileLogger.log(
             "Received WIFI_AP_FALLBACK from $fromPeerId for ${frame.transferId}: reason=${frame.reason}"
         )
-        if (outgoingPhotos.containsKey(frame.transferId) && !incomingPhotos.containsKey(frame.transferId)) {
+        if (outgoingPhotos.containsKey(frame.transferId) &&
+            !incomingPhotos.containsKey(frame.transferId) &&
+            !pendingDpMetaByTransferId.containsKey(frame.transferId)
+        ) {
             teardownTransferResources(frame.transferId, notifyPeer = false)
             return
         }
@@ -586,14 +964,37 @@ class WifiPhotoTransferManager(
         )
         terminalFailureNotified.add(frame.transferId)
         teardownTransferResources(frame.transferId, notifyPeer = false)
-        if (!frame.success && incomingPhotos.containsKey(frame.transferId)) {
+        if (frame.success && isDpTransferId(frame.transferId)) {
+            val dpMeta = pendingDpMetaByTransferId[frame.transferId]
+            if (dpMeta != null) {
+                val cached = peerDpCacheStore.getCachedPeerDpFile(dpMeta.peerAliases + fromPeerId, dpMeta.avatarDigest)
+                if (cached != null) {
+                    emitTransferStateUpdate(
+                        transferId = frame.transferId,
+                        state = PhotoTransferState.COMPLETED,
+                        progress = 1f,
+                        localFilePath = cached.absolutePath,
+                        statusDetail = null
+                    )
+                }
+            }
+            return
+        }
+        if (!frame.success &&
+            (incomingPhotos.containsKey(frame.transferId) || pendingDpMetaByTransferId.containsKey(frame.transferId))
+        ) {
             val snapshot = downloadQueueStateMachine.getSnapshot(frame.transferId)
             if (snapshot != null &&
                 snapshot.state != PhotoTransferState.COMPLETED &&
                 snapshot.state != PhotoTransferState.FAILED
             ) {
-                val next = downloadQueueStateMachine.markFailed(frame.transferId, "Transfer interrupted")
-                onPhotoStateUpdated(frame.transferId, PhotoTransferState.FAILED, 0f, null, "Transfer interrupted")
+                val failMessage = if (isDpTransferId(frame.transferId) && !incomingPhotos.containsKey(frame.transferId)) {
+                    "Full-resolution photo unavailable"
+                } else {
+                    "Transfer interrupted"
+                }
+                val next = downloadQueueStateMachine.markFailed(frame.transferId, failMessage)
+                emitTransferStateUpdate(frame.transferId, PhotoTransferState.FAILED, 0f, null, failMessage)
                 next?.let { startReceiverDownloadRequest(it.transferId, it.senderPeerId) }
             }
         }
@@ -603,8 +1004,8 @@ class WifiPhotoTransferManager(
         LayoverFileLogger.log("Cancelling photo transfer $transferId")
         val cancelOutcome = downloadQueueStateMachine.cancel(transferId)
         teardownTransferResources(transferId, notifyPeer = cancelOutcome.wasActive)
-        if (incomingPhotos.containsKey(transferId)) {
-            onPhotoStateUpdated(transferId, PhotoTransferState.AVAILABLE, 0f, null, null)
+        if (incomingPhotos.containsKey(transferId) || pendingDpMetaByTransferId.containsKey(transferId)) {
+            emitTransferStateUpdate(transferId, PhotoTransferState.AVAILABLE, 0f, null, null)
         }
         cancelOutcome.nextDownload?.let { next ->
             startReceiverDownloadRequest(next.transferId, next.senderPeerId)
@@ -613,7 +1014,11 @@ class WifiPhotoTransferManager(
 
     private fun startReceiverDownloadRequest(transferId: String, senderPeerId: String) {
         terminalFailureNotified.remove(transferId)
-        onPhotoStateUpdated(
+        senderRespondedTransfers.remove(transferId)
+        cancelTimeoutFor(transferId)
+        activeTransferJobs.remove(transferId)?.cancel()
+
+        emitTransferStateUpdate(
             transferId,
             PhotoTransferState.CONNECTING_WIFI,
             0f,
@@ -621,6 +1026,7 @@ class WifiPhotoTransferManager(
             PhotoDownloadQueueStateMachine.REQUESTING_HOST_LABEL
         )
         val job = scope.launch {
+            val thisJob = coroutineContext[Job]
             try {
                 val channelReady = ensureEncryptedChannelReady(senderPeerId)
                 if (!channelReady) {
@@ -644,19 +1050,87 @@ class WifiPhotoTransferManager(
                     transferId = transferId,
                     senderId = localId
                 )
-                val reqSent = sendBleFrame(senderPeerId, reqFrame)
-                if (!reqSent) {
-                    LayoverFileLogger.logError("Failed to send PHOTO_DOWNLOAD_REQUEST over BLE: transferId=$transferId -> $senderPeerId")
-                    completeFailureAndAdvanceQueue(
-                        transferId = transferId,
-                        reason = "Failed to request photo download",
-                        skipCurrentJobCancel = true,
-                        notifyPeer = false
+
+                val totalAttempts = maxDownloadRequestAttempts.coerceAtLeast(1)
+                for (attempt in 1..totalAttempts) {
+                    if (!isActive || downloadQueueStateMachine.activeTransferId() != transferId) {
+                        return@launch
+                    }
+
+                    val routePref = when (attempt) {
+                        1 -> GattRoutePreference.AUTO
+                        else -> GattRoutePreference.BOTH_IF_AVAILABLE
+                    }
+
+                    if (attempt == totalAttempts && totalAttempts >= 3 && !senderRespondedTransfers.contains(transferId)) {
+                        LayoverFileLogger.log(
+                            "No sender response for $transferId after attempt ${attempt - 1}; " +
+                                "refreshing GATT channel before final PHOTO_DOWNLOAD_REQUEST retry."
+                        )
+                        refreshPeerChannelForRetry(senderPeerId)
+                        if (!isActive || downloadQueueStateMachine.activeTransferId() != transferId) {
+                            return@launch
+                        }
+                    }
+
+                    val reqSent = sendBleFrameWithRoute(senderPeerId, reqFrame, routePref)
+                    if (!reqSent && attempt == totalAttempts) {
+                        LayoverFileLogger.logError(
+                            "Failed to send PHOTO_DOWNLOAD_REQUEST over BLE on final attempt $attempt/$totalAttempts: " +
+                                "transferId=$transferId -> $senderPeerId"
+                        )
+                        completeFailureAndAdvanceQueue(
+                            transferId = transferId,
+                            reason = "Failed to request photo download",
+                            skipCurrentJobCancel = true,
+                            notifyPeer = false
+                        )
+                        return@launch
+                    }
+                    LayoverFileLogger.log(
+                        "Sent PHOTO_DOWNLOAD_REQUEST over BLE (attempt $attempt/$totalAttempts, route=$routePref, sent=$reqSent): " +
+                            "transferId=$transferId -> $senderPeerId"
                     )
-                    return@launch
+
+                    val waitMs = if (attempt < totalAttempts) {
+                        downloadRequestRetryIntervalMs
+                    } else {
+                        postFinalRetryWaitMs
+                    }
+                    delay(waitMs)
+
+                    // If sender already sent DP metadata while we waited, give its hotspot the remaining AP start window
+                    if (senderRespondedTransfers.contains(transferId) &&
+                        attempt < totalAttempts &&
+                        downloadQueueStateMachine.activeTransferId() == transferId
+                    ) {
+                        LayoverFileLogger.log(
+                            "Sender already responded with metadata for $transferId; waiting for WIFI_AP_READY before retrying."
+                        )
+                        delay(postFinalRetryWaitMs)
+                        if (!isActive || downloadQueueStateMachine.activeTransferId() != transferId) {
+                            return@launch
+                        }
+                    }
                 }
-                LayoverFileLogger.log("Sent PHOTO_DOWNLOAD_REQUEST over BLE: transferId=$transferId -> $senderPeerId")
-                scheduleSenderApTimeout(transferId)
+
+                val snapshot = downloadQueueStateMachine.getSnapshot(transferId)
+                if (isActive &&
+                    downloadQueueStateMachine.activeTransferId() == transferId &&
+                    snapshot?.state == PhotoTransferState.CONNECTING_WIFI
+                ) {
+                    val senderWasReachable = senderRespondedTransfers.contains(transferId)
+                    LayoverFileLogger.log(
+                        "Timed out waiting for sender WIFI_AP_READY for $transferId after $totalAttempts attempts " +
+                            "(senderResponded=$senderWasReachable)."
+                    )
+                    handleSenderApFailureOrTimeout(
+                        transferId = transferId,
+                        reason = if (senderWasReachable) "Sender hotspot timed out" else "Sender did not respond",
+                        allowRoleInversionFallback = senderWasReachable,
+                        skipCurrentJobCancel = true
+                    )
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -667,43 +1141,46 @@ class WifiPhotoTransferManager(
                     skipCurrentJobCancel = true,
                     notifyPeer = false
                 )
+            } finally {
+                if (thisJob != null) {
+                    activeTransferJobs.remove(transferId, thisJob)
+                }
+                ensureActiveSlotReleasedIfOrphaned(transferId, "Download request ended unexpectedly")
             }
         }
-        activeTransferJobs[transferId]?.cancel()
         activeTransferJobs[transferId] = job
     }
 
-    private fun scheduleSenderApTimeout(transferId: String) {
-        cancelTimeoutFor(transferId)
-        activeApTimeoutJobs[transferId] = scope.launch {
-            delay(PhotoTransferConfig.AP_START_TIMEOUT_MS)
-            val snapshot = downloadQueueStateMachine.getSnapshot(transferId) ?: return@launch
-            if (downloadQueueStateMachine.activeTransferId() == transferId &&
-                snapshot.state == PhotoTransferState.CONNECTING_WIFI
-            ) {
-                LayoverFileLogger.log("Timed out waiting for sender WIFI_AP_READY for $transferId.")
-                handleSenderApFailureOrTimeout(transferId, "Sender hotspot timed out")
-            }
-        }
-    }
-
-    private fun handleSenderApFailureOrTimeout(transferId: String, reason: String) {
+    private fun handleSenderApFailureOrTimeout(
+        transferId: String,
+        reason: String,
+        allowRoleInversionFallback: Boolean = true,
+        skipCurrentJobCancel: Boolean = false
+    ) {
         when (val outcome = downloadQueueStateMachine.handleSenderApFailureOrTimeout(
             transferId = transferId,
-            allowRoleInversionFallback = true,
+            allowRoleInversionFallback = allowRoleInversionFallback,
             reason = reason
         )) {
             is PhotoDownloadQueueStateMachine.SenderApFailureOutcome.StartReceiverFallbackHost -> {
                 val incoming = incomingPhotos[transferId]
                 if (incoming == null) {
-                    completeFailureAndAdvanceQueue(transferId, reason)
+                    completeFailureAndAdvanceQueue(
+                        transferId = transferId,
+                        reason = reason,
+                        skipCurrentJobCancel = skipCurrentJobCancel
+                    )
                 } else {
                     startReceiverFallbackHost(incoming)
                 }
             }
             is PhotoDownloadQueueStateMachine.SenderApFailureOutcome.Failed -> {
-                teardownTransferResources(transferId, notifyPeer = true)
-                onPhotoStateUpdated(transferId, PhotoTransferState.FAILED, 0f, null, outcome.reason)
+                teardownTransferResources(
+                    transferId = transferId,
+                    notifyPeer = allowRoleInversionFallback,
+                    cancelActiveJob = !skipCurrentJobCancel
+                )
+                emitTransferStateUpdate(transferId, PhotoTransferState.FAILED, 0f, null, outcome.reason)
                 outcome.nextDownload?.let { next ->
                     startReceiverDownloadRequest(next.transferId, next.senderPeerId)
                 }
@@ -712,13 +1189,37 @@ class WifiPhotoTransferManager(
         }
     }
 
+    /**
+     * Safety net invoked from receiver coroutine `finally` blocks: if a transfer coroutine exited
+     * without being replaced by a successor job (e.g. client download or fallback host) and the
+     * queue still holds [transferId] as active, immediately mark it failed and promote the next
+     * queued transfer so the download queue can never stall permanently.
+     */
+    private fun ensureActiveSlotReleasedIfOrphaned(transferId: String, fallbackReason: String) {
+        if (activeTransferJobs.containsKey(transferId)) return
+        if (downloadQueueStateMachine.activeTransferId() != transferId) return
+        val snapshot = downloadQueueStateMachine.getSnapshot(transferId) ?: return
+        if (snapshot.state == PhotoTransferState.COMPLETED) return
+        LayoverFileLogger.logError(
+            "Releasing orphaned active download slot for $transferId (state=${snapshot.state}) to unblock queue."
+        )
+        val nextQueued = downloadQueueStateMachine.markFailed(transferId, fallbackReason)
+        emitTransferStateUpdate(transferId, PhotoTransferState.FAILED, 0f, null, fallbackReason)
+        nextQueued?.let { next ->
+            startReceiverDownloadRequest(next.transferId, next.senderPeerId)
+        }
+    }
+
     private fun runReceiverClientDownload(
         incoming: IncomingPhotoSession,
         readyFrame: WireFrame.WifiApReady
     ) {
         val transferId = incoming.transferId
-        activeTransferJobs[transferId]?.cancel()
+        senderRespondedTransfers.add(transferId)
+        cancelTimeoutFor(transferId)
+        val previousJob = activeTransferJobs.remove(transferId)
         val job = scope.launch {
+            val thisJob = coroutineContext[Job]
             var wifiConn: HotspotClientConnection? = null
             var socket: Socket? = null
             try {
@@ -726,7 +1227,7 @@ class WifiPhotoTransferManager(
                     transferId,
                     PhotoDownloadQueueStateMachine.CONNECTING_WIFI_LABEL
                 )
-                onPhotoStateUpdated(
+                emitTransferStateUpdate(
                     transferId,
                     PhotoTransferState.CONNECTING_WIFI,
                     0f,
@@ -750,7 +1251,7 @@ class WifiPhotoTransferManager(
                 EncryptedPhotoStreamProtocol.readReadyAck(socket.getInputStream())
 
                 downloadQueueStateMachine.markDownloading(transferId, 0f)
-                onPhotoStateUpdated(transferId, PhotoTransferState.DOWNLOADING, 0f, null, "Downloading 0%")
+                emitTransferStateUpdate(transferId, PhotoTransferState.DOWNLOADING, 0f, null, "Downloading 0%")
 
                 val decryptedBytes = EncryptedPhotoStreamProtocol.readEncryptedPhotoStream(
                     expectedPlaintextSize = incoming.fileSizeBytes,
@@ -760,7 +1261,7 @@ class WifiPhotoTransferManager(
                     inputStream = socket.getInputStream(),
                     onProgress = { progress ->
                         downloadQueueStateMachine.markDownloading(transferId, progress)
-                        onPhotoStateUpdated(
+                        emitTransferStateUpdate(
                             transferId,
                             PhotoTransferState.DOWNLOADING,
                             progress,
@@ -799,14 +1300,15 @@ class WifiPhotoTransferManager(
                     )
                 }
             } finally {
-                val thisJob = coroutineContext[Job]
                 runCatching { socket?.close() }
                 runCatching { wifiConn?.close() }
                 if (wifiConn != null) activeClientConnections.remove(transferId, wifiConn)
                 if (thisJob != null) activeTransferJobs.remove(transferId, thisJob)
+                ensureActiveSlotReleasedIfOrphaned(transferId, "Download failed")
             }
         }
         activeTransferJobs[transferId] = job
+        previousJob?.cancel()
     }
 
     /**
@@ -815,12 +1317,14 @@ class WifiPhotoTransferManager(
      */
     private fun startReceiverFallbackHost(incoming: IncomingPhotoSession) {
         val transferId = incoming.transferId
-        activeTransferJobs[transferId]?.cancel()
+        cancelTimeoutFor(transferId)
+        val previousJob = activeTransferJobs.remove(transferId)
         val job = scope.launch {
+            val thisJob = coroutineContext[Job]
             var hotspotSession: StartedHotspotSession? = null
             var server: DirectPhotoSocketServer? = null
             try {
-                onPhotoStateUpdated(
+                emitTransferStateUpdate(
                     transferId,
                     PhotoTransferState.CONNECTING_WIFI,
                     0f,
@@ -843,7 +1347,11 @@ class WifiPhotoTransferManager(
                     hostIp = hotspotSession.hostIp.orEmpty(),
                     isReceiverFallbackHost = true
                 )
-                val readySent = sendBleFrame(incoming.senderPeerId, readyFrame)
+                val readySent = sendBleFrameWithRoute(
+                    incoming.senderPeerId,
+                    readyFrame,
+                    GattRoutePreference.BOTH_IF_AVAILABLE
+                )
                 if (!readySent) {
                     throw IllegalStateException("Failed to send fallback WIFI_AP_READY over BLE")
                 }
@@ -858,7 +1366,7 @@ class WifiPhotoTransferManager(
                     transferKey = incoming.transferKey,
                     onProgress = { progress ->
                         downloadQueueStateMachine.markDownloading(transferId, progress)
-                        onPhotoStateUpdated(
+                        emitTransferStateUpdate(
                             transferId,
                             PhotoTransferState.DOWNLOADING,
                             progress,
@@ -902,15 +1410,16 @@ class WifiPhotoTransferManager(
                     )
                 }
             } finally {
-                val thisJob = coroutineContext[Job]
                 runCatching { server?.close() }
                 if (server != null) activeServers.remove(transferId, server)
                 runCatching { hotspotSession?.close() }
                 if (hotspotSession != null) activeHotspotSessions.remove(transferId, hotspotSession)
                 if (thisJob != null) activeTransferJobs.remove(transferId, thisJob)
+                ensureActiveSlotReleasedIfOrphaned(transferId, "Wi-Fi transfer timed out")
             }
         }
         activeTransferJobs[transferId] = job
+        previousJob?.cancel()
     }
 
     private fun runSenderFallbackClientPush(
@@ -966,7 +1475,17 @@ class WifiPhotoTransferManager(
     }
 
     private fun completeReceiverDownload(incoming: IncomingPhotoSession, decryptedBytes: ByteArray) {
-        val savedFile = savePhotoBytes(incoming.transferId, decryptedBytes)
+        val dpMeta = pendingDpMetaByTransferId[incoming.transferId]
+        val savedFile = if (dpMeta != null) {
+            peerDpCacheStore.savePeerDp(
+                canonicalPeerKey = dpMeta.peerId,
+                peerAliases = dpMeta.peerAliases,
+                avatarDigest = dpMeta.avatarDigest,
+                bytes = decryptedBytes
+            )
+        } else {
+            savePhotoBytes(incoming.transferId, decryptedBytes)
+        }
         if (savedFile == null) {
             completeFailureAndAdvanceQueue(
                 transferId = incoming.transferId,
@@ -983,7 +1502,8 @@ class WifiPhotoTransferManager(
         )
 
         val nextQueued = downloadQueueStateMachine.markCompleted(incoming.transferId)
-        onPhotoStateUpdated(
+        pendingEarlyWifiApReadyByTransferId.remove(incoming.transferId)
+        emitTransferStateUpdate(
             incoming.transferId,
             PhotoTransferState.COMPLETED,
             1f,
@@ -991,8 +1511,8 @@ class WifiPhotoTransferManager(
             null
         )
         LayoverFileLogger.log(
-            "Photo download completed & verified: transferId=${incoming.transferId}, " +
-                "bytes=${decryptedBytes.size}, path=${savedFile.absolutePath}"
+            "${if (dpMeta != null) "Peer full-res DP" else "Photo"} download completed & verified: " +
+                "transferId=${incoming.transferId}, bytes=${decryptedBytes.size}, path=${savedFile.absolutePath}"
         )
 
         nextQueued?.let { next ->
@@ -1012,7 +1532,7 @@ class WifiPhotoTransferManager(
             cancelActiveJob = !skipCurrentJobCancel
         )
         val nextQueued = downloadQueueStateMachine.markFailed(transferId, reason)
-        onPhotoStateUpdated(transferId, PhotoTransferState.FAILED, 0f, null, reason)
+        emitTransferStateUpdate(transferId, PhotoTransferState.FAILED, 0f, null, reason)
         nextQueued?.let { next ->
             startReceiverDownloadRequest(next.transferId, next.senderPeerId)
         }
@@ -1023,6 +1543,7 @@ class WifiPhotoTransferManager(
         val localId = localPeerIdProvider().ifBlank { "user" }
         val peerId = explicitPeerId?.takeIf { it.isNotBlank() }
             ?: incomingPhotos[transferId]?.senderPeerId
+            ?: pendingDpMetaByTransferId[transferId]?.peerId
             ?: outgoingPhotos[transferId]?.recipientPeerId
         if (!peerId.isNullOrBlank()) {
             sendBleFrame(
@@ -1038,6 +1559,8 @@ class WifiPhotoTransferManager(
         cancelActiveJob: Boolean = true
     ) {
         cancelTimeoutFor(transferId)
+        senderRespondedTransfers.remove(transferId)
+        pendingEarlyWifiApReadyByTransferId.remove(transferId)
         if (cancelActiveJob) {
             activeTransferJobs.remove(transferId)?.cancel()
         }
@@ -1076,6 +1599,8 @@ class WifiPhotoTransferManager(
         activeHotspotSessions.clear()
         activeClientConnections.values.forEach { runCatching { it.close() } }
         activeClientConnections.clear()
+        pendingEarlyWifiApReadyByTransferId.clear()
+        senderRespondedTransfers.clear()
         terminalFailureNotified.clear()
         hotspotController.stopHotspot()
         downloadQueueStateMachine.clearAll()

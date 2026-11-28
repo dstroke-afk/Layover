@@ -1,7 +1,6 @@
 package com.intj.layover.ui.screens
 
 import android.graphics.BitmapFactory
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -16,12 +15,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.Card
@@ -38,19 +35,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.PeerDpDownloadState
 import com.intj.layover.model.formatPeerNameWithBadge
 import com.intj.layover.navigation.LayoverBackground
+import com.intj.layover.ui.components.PeerFullResAvatarViewerDialog
+import com.intj.layover.ui.components.decodeSampledImageBitmap
 import com.intj.layover.ui.theme.LayoverTheme
+import com.intj.layover.wifi.PeerDpCacheStore
+import java.io.File
 
 @Composable
 fun PeerProfileScreen(
@@ -60,6 +59,10 @@ fun PeerProfileScreen(
     fallbackAvatarBytes: ByteArray? = null,
     isBlocked: Boolean = false,
     isBlockedByPeer: Boolean = false,
+    avatarDigest: String? = null,
+    dpDownloadState: PeerDpDownloadState? = null,
+    cachedFullResDpPath: String? = null,
+    onRequestFullResDp: (avatarDigest: String) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val colors = LayoverTheme.colors
@@ -71,11 +74,26 @@ fun PeerProfileScreen(
     val avatarBytes = peer?.avatar?.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
         ?: fallbackAvatarBytes?.takeIf { it.isNotEmpty() }
 
+    val effectiveAvatarDigest = remember(avatarDigest, avatarBytes) {
+        avatarDigest?.takeIf { it.isNotBlank() } ?: PeerDpCacheStore.computeAvatarDigest(avatarBytes)
+    }
+
     val avatarBitmap = remember(avatarBytes) {
         avatarBytes?.let { bytes ->
             runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
         }
     }
+
+    val resolvedFullResPath = remember(dpDownloadState?.localFilePath, cachedFullResDpPath) {
+        listOfNotNull(dpDownloadState?.localFilePath, cachedFullResDpPath)
+            .firstOrNull { path -> path.isNotBlank() && File(path).exists() }
+    }
+
+    val fullResBitmap = remember(resolvedFullResPath) {
+        resolvedFullResPath?.let { path -> decodeSampledImageBitmap(path) }
+    }
+
+    val displayAvatarBitmap = fullResBitmap ?: avatarBitmap
 
     val resolvedAge = (age ?: peer?.age)?.takeIf { it in 1..255 }
     val resolvedGender = peer?.gender
@@ -135,14 +153,14 @@ fun PeerProfileScreen(
                             .clip(CircleShape)
                             .background(colors.incomingBubble)
                             .border(3.dp, colors.cyanPrimary, CircleShape)
-                            .clickable(enabled = avatarBitmap != null) {
+                            .clickable(enabled = displayAvatarBitmap != null) {
                                 showFullScreenAvatar = true
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        if (avatarBitmap != null) {
+                        if (displayAvatarBitmap != null) {
                             Image(
-                                bitmap = avatarBitmap,
+                                bitmap = displayAvatarBitmap,
                                 contentDescription = "$resolvedName Profile Avatar",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier
@@ -260,52 +278,18 @@ fun PeerProfileScreen(
         }
     }
 
-    if (showFullScreenAvatar && avatarBitmap != null) {
-        Dialog(
-            onDismissRequest = { showFullScreenAvatar = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            BackHandler { showFullScreenAvatar = false }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.94f))
-                    .clickable { showFullScreenAvatar = false }
-            ) {
-                Image(
-                    bitmap = avatarBitmap,
-                    contentDescription = "$formattedName full-screen photo",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp)
-                )
-
-                Text(
-                    text = formattedName,
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 18.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .statusBarsPadding()
-                        .padding(horizontal = 20.dp, vertical = 16.dp)
-                )
-
-                IconButton(
-                    onClick = { showFullScreenAvatar = false },
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .statusBarsPadding()
-                        .padding(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Close photo",
-                        tint = Color.White
-                    )
-                }
-            }
-        }
+    if (showFullScreenAvatar && displayAvatarBitmap != null) {
+        PeerFullResAvatarViewerDialog(
+            peerId = effectivePeerId,
+            title = formattedName,
+            thumbnailBitmap = avatarBitmap,
+            fullResBitmap = fullResBitmap,
+            avatarDigest = effectiveAvatarDigest,
+            dpDownloadState = dpDownloadState,
+            isBlocked = isBlocked,
+            isBlockedByPeer = isBlockedByPeer,
+            onRequestFullResDp = onRequestFullResDp,
+            onDismiss = { showFullScreenAvatar = false }
+        )
     }
 }

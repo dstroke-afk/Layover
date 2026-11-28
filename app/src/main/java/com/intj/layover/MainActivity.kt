@@ -6,7 +6,6 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -69,9 +68,13 @@ import com.intj.layover.navigation.LayoverNavGraph
 import com.intj.layover.navigation.LayoverRoute
 import com.intj.layover.notifications.LayoverNotificationManager
 import com.intj.layover.notifications.NotificationDeepLink
+import com.intj.layover.ui.components.PeerFullResAvatarViewerDialog
+import com.intj.layover.ui.components.decodeSampledImageBitmap
 import com.intj.layover.ui.screens.OneTimeUsernameDialog
 import com.intj.layover.ui.screens.initialsForName
+import com.intj.layover.ui.screens.resolvePeopleAroundCroppedDpPath
 import com.intj.layover.ui.theme.LayoverTheme
+import com.intj.layover.wifi.PeerDpCacheStore
 import kotlinx.coroutines.flow.MutableStateFlow
 
 class MainActivity : ComponentActivity() {
@@ -432,6 +435,60 @@ class MainActivity : ComponentActivity() {
                             runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
                         }
                     }
+                    val requesterContext = LocalContext.current
+                    val requesterStableSeeds = listOfNotNull(
+                        peerId.takeIf { it.isNotBlank() },
+                        matchedPeer?.id?.takeIf { it.isNotBlank() },
+                        matchedPeer?.handle?.takeIf { it.isNotBlank() }
+                    )
+                    val requesterStableAliases = remember(peerId, matchedPeer?.id, matchedPeer?.handle) {
+                        (PeerAliasRegistry.resolveStableIdentifiers(requesterStableSeeds) + requesterStableSeeds)
+                            .filter { it.isNotBlank() }
+                            .toSet()
+                    }
+                    val requesterAvatarDigest = remember(avatarBytes) {
+                        PeerDpCacheStore.computeAvatarDigest(avatarBytes)
+                    }
+                    val requesterDpDownloadState = remember(
+                        uiState.peerDpDownloadsByKey,
+                        requesterStableAliases,
+                        requesterAvatarDigest
+                    ) {
+                        if (requesterAvatarDigest.isNullOrBlank()) {
+                            null
+                        } else {
+                            requesterStableAliases.firstNotNullOfOrNull { alias ->
+                                uiState.peerDpDownloadsByKey["${alias.lowercase()}|$requesterAvatarDigest"]
+                            }
+                        }
+                    }
+                    val requesterCroppedFullResPath = remember(
+                        requesterAvatarDigest,
+                        matchedPeer?.avatar?.croppedFullResPath,
+                        matchedPeer?.avatar?.croppedFullResDigest,
+                        requesterDpDownloadState?.state,
+                        requesterDpDownloadState?.localFilePath
+                    ) {
+                        val targetAvatar = matchedPeer?.avatar ?: com.intj.layover.model.PeerAvatar(
+                            peerId = peerId,
+                            initials = initialsForName(resolvedName),
+                            avatarBase64OrBytes = avatarBytes
+                        )
+                        resolvePeopleAroundCroppedDpPath(
+                            avatarDigest = requesterAvatarDigest,
+                            peerAvatar = targetAvatar,
+                            dpDownloadState = requesterDpDownloadState,
+                            diskLookup = { digest ->
+                                PeerDpCacheStore(requesterContext)
+                                    .getCachedPeerDpFile(requesterStableAliases, digest)
+                                    ?.absolutePath
+                            }
+                        )
+                    }
+                    val requesterFullResBitmap = remember(requesterCroppedFullResPath) {
+                        requesterCroppedFullResPath?.let { path -> decodeSampledImageBitmap(path, maxDim = 2048) }
+                    }
+                    val requesterDisplayBitmap = requesterFullResBitmap ?: avatarBitmap
                     val initials = remember(resolvedName) { initialsForName(resolvedName) }
                     var showFullScreenRequesterPhoto by remember(peerId) { mutableStateOf(false) }
 
@@ -461,7 +518,7 @@ class MainActivity : ComponentActivity() {
                                         .background(colors.incomingBubble)
                                         .border(2.dp, colors.cyanPrimary, CircleShape)
                                         .then(
-                                            if (avatarBitmap != null) {
+                                            if (requesterDisplayBitmap != null) {
                                                 Modifier.clickable { showFullScreenRequesterPhoto = true }
                                             } else {
                                                 Modifier
@@ -469,9 +526,9 @@ class MainActivity : ComponentActivity() {
                                         ),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    if (avatarBitmap != null) {
+                                    if (requesterDisplayBitmap != null) {
                                         Image(
-                                            bitmap = avatarBitmap,
+                                            bitmap = requesterDisplayBitmap,
                                             contentDescription = "$formattedRequesterName profile photo",
                                             contentScale = ContentScale.Crop,
                                             modifier = Modifier
@@ -488,7 +545,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
 
-                                if (avatarBitmap != null) {
+                                if (requesterDisplayBitmap != null) {
                                     Spacer(modifier = Modifier.height(6.dp))
                                     Text(
                                         text = "Tap photo to enlarge",
@@ -550,53 +607,24 @@ class MainActivity : ComponentActivity() {
                         }
                     )
 
-                    if (showFullScreenRequesterPhoto && avatarBitmap != null) {
-                        Dialog(
-                            onDismissRequest = { showFullScreenRequesterPhoto = false },
-                            properties = DialogProperties(usePlatformDefaultWidth = false)
-                        ) {
-                            BackHandler { showFullScreenRequesterPhoto = false }
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(Color.Black.copy(alpha = 0.94f))
-                                    .clickable { showFullScreenRequesterPhoto = false }
-                            ) {
-                                Image(
-                                    bitmap = avatarBitmap,
-                                    contentDescription = "$formattedRequesterName full-screen photo",
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(16.dp)
-                                )
-
-                                Text(
-                                    text = formattedRequesterName,
-                                    color = Color.White,
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 18.sp,
-                                    modifier = Modifier
-                                        .align(Alignment.TopStart)
-                                        .statusBarsPadding()
-                                        .padding(horizontal = 20.dp, vertical = 16.dp)
-                                )
-
-                                IconButton(
-                                    onClick = { showFullScreenRequesterPhoto = false },
-                                    modifier = Modifier
-                                        .align(Alignment.TopEnd)
-                                        .statusBarsPadding()
-                                        .padding(8.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Close,
-                                        contentDescription = "Close photo",
-                                        tint = Color.White
-                                    )
+                    if (showFullScreenRequesterPhoto && requesterDisplayBitmap != null) {
+                        val targetDpPeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                        PeerFullResAvatarViewerDialog(
+                            peerId = targetDpPeerId,
+                            title = formattedRequesterName,
+                            thumbnailBitmap = avatarBitmap,
+                            fullResBitmap = requesterFullResBitmap,
+                            avatarDigest = requesterAvatarDigest,
+                            dpDownloadState = requesterDpDownloadState,
+                            isBlocked = false,
+                            isBlockedByPeer = false,
+                            onRequestFullResDp = { digest ->
+                                if (targetDpPeerId.isNotBlank() && digest.isNotBlank()) {
+                                    uiState.transport.downloadPeerProfilePicture(targetDpPeerId, digest)
                                 }
-                            }
-                        }
+                            },
+                            onDismiss = { showFullScreenRequesterPhoto = false }
+                        )
                     }
                 }
 

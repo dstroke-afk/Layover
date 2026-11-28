@@ -12,9 +12,12 @@ interface ProximityTransport {
     fun acceptConnectionRequest(peerId: String)
     fun declineConnectionRequest(peerId: String) {}
     fun sendBlockState(peerId: String, blocked: Boolean) {}
-    fun sendMessage(peerId: String, text: String)
+    fun sendMessage(peerId: String, text: String, msgId: String = "msg_${System.currentTimeMillis()}")
+    fun deleteMessageForMe(peerId: String, msgId: String) {}
+    fun deleteMessageForEveryone(peerId: String, msgId: String) {}
     fun sendPhoto(peerId: String, uriString: String) {}
     fun downloadPhoto(peerId: String, transferId: String) {}
+    fun downloadPeerProfilePicture(peerId: String, avatarDigest: String) {}
     fun cancelPhotoTransfer(transferId: String) {}
     fun resetDiagnosticsCounters() {}
 }
@@ -29,7 +32,7 @@ class NoOpProximityTransport : ProximityTransport {
     override fun acceptConnectionRequest(peerId: String) {}
     override fun declineConnectionRequest(peerId: String) {}
     override fun sendBlockState(peerId: String, blocked: Boolean) {}
-    override fun sendMessage(peerId: String, text: String) {}
+    override fun sendMessage(peerId: String, text: String, msgId: String) {}
 }
 
 enum class ConnectionStatus {
@@ -56,7 +59,9 @@ enum class GenderOption(val label: String) {
 data class PeerAvatar(
     val peerId: String,
     val initials: String,
-    val avatarBase64OrBytes: ByteArray? = null
+    val avatarBase64OrBytes: ByteArray? = null,
+    val croppedFullResPath: String? = null,
+    val croppedFullResDigest: String? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -66,6 +71,8 @@ data class PeerAvatar(
 
         if (peerId != other.peerId) return false
         if (initials != other.initials) return false
+        if (croppedFullResPath != other.croppedFullResPath) return false
+        if (croppedFullResDigest != other.croppedFullResDigest) return false
         if (avatarBase64OrBytes != null) {
             if (other.avatarBase64OrBytes == null) return false
             if (!avatarBase64OrBytes.contentEquals(other.avatarBase64OrBytes)) return false
@@ -78,6 +85,8 @@ data class PeerAvatar(
         var result = peerId.hashCode()
         result = 31 * result + initials.hashCode()
         result = 31 * result + (avatarBase64OrBytes?.contentHashCode() ?: 0)
+        result = 31 * result + (croppedFullResPath?.hashCode() ?: 0)
+        result = 31 * result + (croppedFullResDigest?.hashCode() ?: 0)
         return result
     }
 }
@@ -162,6 +171,13 @@ data class PhotoAttachment(
     }
 }
 
+enum class MessageDeliveryStatus {
+    SENDING,
+    SENT,
+    DELIVERED,
+    SEEN
+}
+
 data class ChatMessage(
     val id: String,
     val senderId: String,
@@ -170,7 +186,20 @@ data class ChatMessage(
     val isOutgoing: Boolean,
     val replyToText: String? = null,
     val timestampMillis: Long = System.currentTimeMillis(),
-    val photoAttachment: PhotoAttachment? = null
+    val photoAttachment: PhotoAttachment? = null,
+    val deliveryStatus: MessageDeliveryStatus = if (isOutgoing) MessageDeliveryStatus.SENDING else MessageDeliveryStatus.DELIVERED,
+    val deliveredAtMillis: Long? = null,
+    val seenAtMillis: Long? = null
+)
+
+data class PeerDpDownloadState(
+    val peerId: String,
+    val avatarDigest: String,
+    val transferId: String? = null,
+    val state: PhotoTransferState = PhotoTransferState.AVAILABLE,
+    val progress: Float = 0f,
+    val localFilePath: String? = null,
+    val statusDetail: String? = null
 )
 
 data class UserProfile(
@@ -181,6 +210,9 @@ data class UserProfile(
     val avatarBytes: ByteArray? = null,
     val compactTransferAvatarBytes: ByteArray? = null,
     val croppedResolutionLabel: String? = null,
+    val fullResAvatarFilePath: String? = null,
+    val fullResAvatarSha256: String? = null,
+    val pendingFullResAvatarBytes: ByteArray? = null,
     val isVisibleToNearby: Boolean = true
 ) {
     override fun equals(other: Any?): Boolean {
@@ -195,6 +227,8 @@ data class UserProfile(
         if (age != other.age) return false
         if (isVisibleToNearby != other.isVisibleToNearby) return false
         if (croppedResolutionLabel != other.croppedResolutionLabel) return false
+        if (fullResAvatarFilePath != other.fullResAvatarFilePath) return false
+        if (fullResAvatarSha256 != other.fullResAvatarSha256) return false
         if (avatarBytes != null) {
             if (other.avatarBytes == null) return false
             if (!avatarBytes.contentEquals(other.avatarBytes)) return false
@@ -203,6 +237,10 @@ data class UserProfile(
             if (other.compactTransferAvatarBytes == null) return false
             if (!compactTransferAvatarBytes.contentEquals(other.compactTransferAvatarBytes)) return false
         } else if (other.compactTransferAvatarBytes != null) return false
+        if (pendingFullResAvatarBytes != null) {
+            if (other.pendingFullResAvatarBytes == null) return false
+            if (!pendingFullResAvatarBytes.contentEquals(other.pendingFullResAvatarBytes)) return false
+        } else if (other.pendingFullResAvatarBytes != null) return false
 
         return true
     }
@@ -214,8 +252,11 @@ data class UserProfile(
         result = 31 * result + (age ?: 0)
         result = 31 * result + isVisibleToNearby.hashCode()
         result = 31 * result + (croppedResolutionLabel?.hashCode() ?: 0)
+        result = 31 * result + (fullResAvatarFilePath?.hashCode() ?: 0)
+        result = 31 * result + (fullResAvatarSha256?.hashCode() ?: 0)
         result = 31 * result + (avatarBytes?.contentHashCode() ?: 0)
         result = 31 * result + (compactTransferAvatarBytes?.contentHashCode() ?: 0)
+        result = 31 * result + (pendingFullResAvatarBytes?.contentHashCode() ?: 0)
         return result
     }
 }
@@ -226,6 +267,7 @@ data class LayoverUiState(
     val chatMessages: Map<String, List<ChatMessage>> = emptyMap(),
     val unreadCountsByPeerId: Map<String, Int> = emptyMap(),
     val photoErrorsByPeerId: Map<String, String> = emptyMap(),
+    val peerDpDownloadsByKey: Map<String, PeerDpDownloadState> = emptyMap(),
     val blockedPeerIds: Set<String> = emptySet(),
     val blockedByPeerIds: Set<String> = emptySet(),
     val mutedPeerIds: Set<String> = emptySet(),

@@ -70,7 +70,14 @@ class PhotoDownloadQueueStateMachine {
     @Synchronized
     fun registerAvailable(transferId: String, senderPeerId: String): TransferSnapshot {
         val existing = entries[transferId]
-        if (existing != null) return existing
+        if (existing != null) {
+            if (senderPeerId.isNotBlank() && existing.senderPeerId != senderPeerId) {
+                val updated = existing.copy(senderPeerId = senderPeerId)
+                entries[transferId] = updated
+                return updated
+            }
+            return existing
+        }
         val created = TransferSnapshot(
             transferId = transferId,
             senderPeerId = senderPeerId,

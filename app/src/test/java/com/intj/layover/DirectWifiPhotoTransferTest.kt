@@ -8,6 +8,7 @@ import com.intj.layover.p2p.WireFrame
 import com.intj.layover.p2p.WireFrameCodec
 import com.intj.layover.wifi.DirectPhotoSocketServer
 import com.intj.layover.wifi.EncryptedPhotoStreamProtocol
+import com.intj.layover.wifi.PeerDpCacheStore
 import com.intj.layover.wifi.PhotoDownloadQueueStateMachine
 import com.intj.layover.wifi.PhotoPreviewGenerator
 import com.intj.layover.wifi.PhotoSizeValidationResult
@@ -28,6 +29,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
+import java.nio.file.Files
 import java.util.Base64
 
 class DirectWifiPhotoTransferTest {
@@ -489,5 +491,207 @@ class DirectWifiPhotoTransferTest {
         val manualRetry = sm.requestDownload("ph_loop_guard")
         assertTrue(manualRetry is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow)
         assertEquals(PhotoTransferState.CONNECTING_WIFI, sm.getSnapshot("ph_loop_guard")?.state)
+    }
+
+    @Test
+    fun peerDpCacheStore_enforcesThreeMegabyteCap_fallsBackGracefully_andInvalidatesOnDigestChange() {
+        val tempDir = Files.createTempDirectory("layover_dp_cache_test").toFile()
+        try {
+            val store = PeerDpCacheStore(tempDir)
+
+            // 1. Own full-res avatar: rejects > 3 MB, accepts <= 3 MB
+            val oversizedAvatar = ByteArray(PhotoTransferConfig.MAX_PHOTO_SIZE_BYTES.toInt() + 1) { 0x1A }
+            assertNull("Own avatar > 3 MB must be rejected", store.saveOwnFullResAvatar(oversizedAvatar))
+
+            // Graceful fallback when no full-res file exists yet (legacy profile)
+            val legacyCompact = ByteArray(3_200) { (it * 5 and 0xFF).toByte() }
+            val fallbackLoaded = store.loadOwnFullResAvatar(
+                fullResFilePath = null,
+                fallbackAvatarBytes = null,
+                fallbackCompactBytes = legacyCompact
+            )
+            assertNotNull(fallbackLoaded)
+            assertArrayEquals(legacyCompact, fallbackLoaded!!.bytes)
+            assertEquals(EncryptedPhotoStreamProtocol.sha256Hex(legacyCompact), fallbackLoaded.sha256Hex)
+
+            // Save own full-res PNG avatar and verify load + SHA-256 + MIME detection
+            val pngHeader = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+            val fullResOwn = pngHeader + ByteArray(256 * 1024) { (it * 11 and 0xFF).toByte() }
+            val savedOwn = store.saveOwnFullResAvatar(fullResOwn)
+            assertNotNull(savedOwn)
+            val (ownFile, ownSha) = savedOwn!!
+            assertTrue(ownFile.exists())
+            assertEquals(EncryptedPhotoStreamProtocol.sha256Hex(fullResOwn), ownSha)
+
+            val loadedOwn = store.loadOwnFullResAvatar(
+                fullResFilePath = ownFile.absolutePath,
+                fallbackAvatarBytes = legacyCompact,
+                fallbackCompactBytes = legacyCompact
+            )
+            assertNotNull(loadedOwn)
+            assertArrayEquals(fullResOwn, loadedOwn!!.bytes)
+            assertEquals("image/png", loadedOwn.mimeType)
+            assertEquals(ownSha, loadedOwn.sha256Hex)
+
+            // 2. Peer DP digest-keyed caching & automatic invalidation/pruning on DP update
+            val bleThumbV1 = ByteArray(4_096) { (it and 0xFF).toByte() }
+            val bleThumbV2 = ByteArray(4_096) { ((it + 99) and 0xFF).toByte() }
+            val digestV1 = PeerDpCacheStore.computeAvatarDigest(bleThumbV1)!!
+            val digestV2 = PeerDpCacheStore.computeAvatarDigest(bleThumbV2)!!
+            assertFalse(digestV1 == digestV2)
+
+            val fullResPeerV1 = ByteArray(180 * 1024) { (it * 3 and 0xFF).toByte() }
+            val fullResPeerV2 = ByteArray(210 * 1024) { (it * 17 and 0xFF).toByte() }
+
+            // Cache miss before first download
+            assertNull(store.getCachedPeerDpFile(listOf("dev_peerA", "AA:BB:CC:DD:EE:FF"), digestV1))
+
+            // Save V1 full-res DP -> cache hit across peer aliases
+            val savedV1 = store.savePeerDp(
+                canonicalPeerKey = "dev_peerA",
+                peerAliases = listOf("dev_peerA", "AA:BB:CC:DD:EE:FF"),
+                avatarDigest = digestV1,
+                bytes = fullResPeerV1
+            )
+            assertNotNull(savedV1)
+            assertTrue(savedV1!!.exists())
+            val hitV1 = store.getCachedPeerDpFile(listOf("AA:BB:CC:DD:EE:FF", "dev_peerA"), digestV1)
+            assertNotNull(hitV1)
+            assertArrayEquals(fullResPeerV1, hitV1!!.readBytes())
+
+            // When peer changes DP (digestV2), old cache misses immediately
+            assertNull(store.getCachedPeerDpFile(listOf("dev_peerA"), digestV2))
+
+            // Saving V2 full-res DP caches V2 and prunes stale V1 file from disk
+            val savedV2 = store.savePeerDp(
+                canonicalPeerKey = "dev_peerA",
+                peerAliases = listOf("dev_peerA", "AA:BB:CC:DD:EE:FF"),
+                avatarDigest = digestV2,
+                bytes = fullResPeerV2
+            )
+            assertNotNull(savedV2)
+            assertTrue(savedV2!!.exists())
+            assertFalse("Stale V1 peer DP file should be pruned after V2 is cached", savedV1.exists())
+            val hitV2 = store.getCachedPeerDpFile(listOf("dev_peerA"), digestV2)
+            assertNotNull(hitV2)
+            assertArrayEquals(fullResPeerV2, hitV2!!.readBytes())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun dpTransfer_metadataOnlyPreviewAndQueueSerializationWithChatPhotos() {
+        val senderCrypto = SessionCryptoManager(forceEcOnly = true)
+        val receiverCrypto = SessionCryptoManager(forceEcOnly = true)
+        val senderPub = senderCrypto.ensureLocalKeyPair("EC")
+        val receiverPub = receiverCrypto.ensureLocalKeyPair("EC")
+        assertTrue(senderCrypto.establishRemoteKeyForPeer("dev_viewer", emptySet(), receiverPub, "EC").isUsableSession)
+        assertTrue(receiverCrypto.establishRemoteKeyForPeer("dev_owner", emptySet(), senderPub, "EC").isUsableSession)
+
+        // Metadata-only PHOTO_PREVIEW (empty previewBytes) for a dp_ transfer ID round-trips and passes GATT frame validation
+        val dpTransferId = "dp_9f3a2c1b0e_a1b2c3"
+        val dpKey = EncryptedPhotoStreamProtocol.generateTransferKey()
+        val fullResDp = ByteArray(140 * 1024) { ((it * 23 + 7) and 0xFF).toByte() }
+        val dpSha = EncryptedPhotoStreamProtocol.sha256Hex(fullResDp)
+
+        val metaBundle = EncryptedPhotoStreamProtocol.encodePreviewBundle(
+            fileSizeBytes = fullResDp.size.toLong(),
+            mimeType = "image/jpeg",
+            sha256Hex = dpSha,
+            transferKey = dpKey,
+            previewBytes = ByteArray(0)
+        )
+        val encryptedMeta = senderCrypto.encryptBytes(metaBundle, listOf("dev_viewer"))!!
+        val wireMeta = WireFrameCodec.encodePhotoPreview(dpTransferId, "dev_owner", encryptedMeta)
+        assertTrue(WireFrameCodec.isValidOutboundFrame(wireMeta))
+        assertTrue(GattSessionManager.isAllowedOutboundFrame(wireMeta))
+
+        val decodedMetaFrame = WireFrameCodec.decodeFrame(wireMeta) as WireFrame.PhotoPreview
+        assertEquals(dpTransferId, decodedMetaFrame.transferId)
+        val decryptedMeta = receiverCrypto.decryptBytes(
+            EncryptedPayload(
+                Base64.getDecoder().decode(decodedMetaFrame.ivBase64),
+                Base64.getDecoder().decode(decodedMetaFrame.ciphertextBase64)
+            ),
+            listOf("dev_owner")
+        )!!
+        val decodedBundle = EncryptedPhotoStreamProtocol.decodePreviewBundle(decryptedMeta)!!
+        assertEquals(fullResDp.size.toLong(), decodedBundle.fileSizeBytes)
+        assertEquals(dpSha, decodedBundle.sha256Hex)
+        assertEquals(0, decodedBundle.previewBytes.size)
+        assertArrayEquals(dpKey.encoded, decodedBundle.transferKey.encoded)
+
+        // Serialization: DP download queues cleanly behind an active chat photo and promotes upon completion
+        val sm = PhotoDownloadQueueStateMachine()
+        sm.registerAvailable("ph_chat_01", "dev_owner")
+        sm.registerAvailable(dpTransferId, "dev_owner")
+
+        val chatStart = sm.requestDownload("ph_chat_01")
+        assertTrue(chatStart is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow)
+        assertEquals("ph_chat_01", sm.activeTransferId())
+
+        val dpQueued = sm.requestDownload(dpTransferId)
+        assertTrue(dpQueued is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.Queued)
+        assertEquals(PhotoTransferState.QUEUED, sm.getSnapshot(dpTransferId)?.state)
+
+        // Completing the chat photo automatically promotes the queued full-res DP download
+        val promoted = sm.markCompleted("ph_chat_01")
+        assertNotNull(promoted)
+        assertEquals(dpTransferId, promoted!!.transferId)
+        assertEquals(dpTransferId, sm.activeTransferId())
+        assertEquals(PhotoTransferState.CONNECTING_WIFI, sm.getSnapshot(dpTransferId)?.state)
+
+        // Progress -> Completed cleanly releases active Wi-Fi slot
+        sm.markDownloading(dpTransferId, 0.72f)
+        assertEquals(PhotoTransferState.DOWNLOADING, sm.getSnapshot(dpTransferId)?.state)
+        assertNull(sm.markCompleted(dpTransferId))
+        assertEquals(PhotoTransferState.COMPLETED, sm.getSnapshot(dpTransferId)?.state)
+        assertNull(sm.activeTransferId())
+    }
+
+    @Test
+    fun downloadQueue_unblocksImmediatelyOnNoResponseTimeoutAndPromotesQueuedChatPhoto() {
+        val sm = PhotoDownloadQueueStateMachine()
+        // Initially registered with rotated MAC, then refreshed to canonical dev_ ID before download
+        sm.registerAvailable("ph_25053aa06c", "AA:BB:CC:DD:EE:FF")
+        sm.registerAvailable("ph_25053aa06c", "dev_sender")
+        sm.registerAvailable("ph_5069eed0ab", "dev_sender")
+
+        val firstStart = sm.requestDownload("ph_25053aa06c")
+        assertTrue(firstStart is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow)
+        assertEquals("dev_sender", (firstStart as PhotoDownloadQueueStateMachine.DownloadRequestOutcome.StartNow).senderPeerId)
+        assertEquals("ph_25053aa06c", sm.activeTransferId())
+
+        val secondQueued = sm.requestDownload("ph_5069eed0ab")
+        assertTrue(secondQueued is PhotoDownloadQueueStateMachine.DownloadRequestOutcome.Queued)
+        assertEquals(PhotoTransferState.QUEUED, sm.getSnapshot("ph_5069eed0ab")?.state)
+
+        // When sender never responds over BLE after retries, fail cleanly WITHOUT entering a 55s fallback hotspot
+        val timeoutOutcome = sm.handleSenderApFailureOrTimeout(
+            transferId = "ph_25053aa06c",
+            allowRoleInversionFallback = false,
+            reason = "Sender did not respond"
+        )
+        assertTrue(timeoutOutcome is PhotoDownloadQueueStateMachine.SenderApFailureOutcome.Failed)
+        val failed = timeoutOutcome as PhotoDownloadQueueStateMachine.SenderApFailureOutcome.Failed
+        assertEquals("Sender did not respond", failed.reason)
+        assertEquals(PhotoTransferState.FAILED, sm.getSnapshot("ph_25053aa06c")?.state)
+
+        // Queued transfer ph_5069eed0ab must be promoted immediately
+        val promoted = failed.nextDownload
+        assertNotNull(promoted)
+        assertEquals("ph_5069eed0ab", promoted!!.transferId)
+        assertEquals("dev_sender", promoted.senderPeerId)
+        assertEquals("ph_5069eed0ab", sm.activeTransferId())
+        assertEquals(PhotoTransferState.CONNECTING_WIFI, sm.getSnapshot("ph_5069eed0ab")?.state)
+        assertTrue(sm.queuedTransferIds().isEmpty())
+
+        // Verify retry timing constants stay bounded so a dead request does not stall the queue
+        val totalWaitBudgetMs =
+            (PhotoTransferConfig.MAX_DOWNLOAD_REQUEST_ATTEMPTS - 1) * PhotoTransferConfig.DOWNLOAD_REQUEST_RETRY_INTERVAL_MS +
+                PhotoTransferConfig.POST_FINAL_RETRY_WAIT_MS
+        assertEquals(3, PhotoTransferConfig.MAX_DOWNLOAD_REQUEST_ATTEMPTS)
+        assertEquals(15_000L, totalWaitBudgetMs)
     }
 }

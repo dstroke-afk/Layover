@@ -93,10 +93,10 @@ class NotificationEligibilityEvaluator(
         }
 
         val expandedSender = expandIdentifiers(senderCandidates)
-        if (intersectsIgnoringCase(expandedSender, blockedPeerIds)) {
+        if (PeerAliasRegistry.matchesBlocklist(senderCandidates, blockedPeerIds)) {
             return NotificationDecision(false, NotificationDecisionReason.PEER_BLOCKED)
         }
-        if (intersectsIgnoringCase(expandedSender, blockedByPeerIds)) {
+        if (PeerAliasRegistry.matchesBlocklist(senderCandidates, blockedByPeerIds)) {
             return NotificationDecision(false, NotificationDecisionReason.PEER_BLOCKED_BY_REMOTE)
         }
         if (intersectsIgnoringCase(expandedSender, mutedPeerIds)) {
@@ -163,10 +163,10 @@ class NotificationEligibilityEvaluator(
         }
 
         val expandedSender = expandIdentifiers(senderCandidates)
-        if (intersectsIgnoringCase(expandedSender, blockedPeerIds)) {
+        if (PeerAliasRegistry.matchesBlocklist(senderCandidates, blockedPeerIds)) {
             return NotificationDecision(false, NotificationDecisionReason.PEER_BLOCKED)
         }
-        if (intersectsIgnoringCase(expandedSender, blockedByPeerIds)) {
+        if (PeerAliasRegistry.matchesBlocklist(senderCandidates, blockedByPeerIds)) {
             return NotificationDecision(false, NotificationDecisionReason.PEER_BLOCKED_BY_REMOTE)
         }
         if (intersectsIgnoringCase(expandedSender, mutedPeerIds)) {

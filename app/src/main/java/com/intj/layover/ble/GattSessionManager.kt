@@ -43,6 +43,13 @@ enum class GattOutboundRoute {
     NONE
 }
 
+enum class GattRoutePreference {
+    AUTO,
+    PREFER_CLIENT,
+    PREFER_SERVER,
+    BOTH_IF_AVAILABLE
+}
+
 data class GattOutboundRoutePlan(
     val primary: GattOutboundRoute,
     val fallback: GattOutboundRoute = GattOutboundRoute.NONE
@@ -76,9 +83,85 @@ class GattSessionManager(
         const val MIN_SAFE_GATT_CHUNK_BYTES = 20
         const val MAX_SAFE_GATT_CHUNK_BYTES = 480
         const val MAX_OUTBOUND_FRAME_BYTES = 65_536
+        const val STALE_INCOMING_BUFFER_MS = 3_500L
 
         fun isAllowedOutboundFrame(text: String): Boolean {
             return WireFrameCodec.isValidOutboundFrame(text)
+        }
+
+        /**
+         * Returns true when [data] starts with a valid 4-byte Layover frame length header
+         * followed immediately by a known `WireFrameCodec.VALID_FRAME_PREFIXES` type + `|`.
+         * Used to self-heal if an earlier multi-chunk frame was truncated/dropped mid-flight.
+         */
+        fun startsWithValidWireFrameHeader(data: ByteArray): Boolean {
+            if (data.size < 8) return false
+            val frameLen = ByteBuffer.wrap(data, 0, 4).int
+            if (frameLen <= 0 || frameLen > MAX_OUTBOUND_FRAME_BYTES) return false
+            val inspectEnd = min(data.size, 4 + 32)
+            var pipeIdx = -1
+            for (i in 4 until inspectEnd) {
+                if (data[i] == '|'.code.toByte()) {
+                    pipeIdx = i
+                    break
+                }
+            }
+            if (pipeIdx <= 4) return false
+            val prefix = String(data, 4, pipeIdx - 4, Charsets.UTF_8)
+            return prefix in WireFrameCodec.VALID_FRAME_PREFIXES
+        }
+
+        /**
+         * Pure reassembly step used by [GattSessionManager.parseIncomingBytes] and unit tests.
+         * Automatically clears stale (> [staleTimeoutMs]) or orphaned incomplete partial buffers
+         * when a new framed WireFrame header arrives.
+         */
+        fun reassembleIncomingChunk(
+            buffer: MutableList<Byte>,
+            data: ByteArray,
+            lastAppendMs: Long,
+            nowMs: Long,
+            staleTimeoutMs: Long = STALE_INCOMING_BUFFER_MS
+        ): Pair<List<String>, String?> {
+            var resetReason: String? = null
+            if (buffer.isNotEmpty()) {
+                val ageMs = if (lastAppendMs > 0L) (nowMs - lastAppendMs) else 0L
+                if (lastAppendMs > 0L && ageMs > staleTimeoutMs) {
+                    resetReason = "stale_partial_buffer_${buffer.size}B_age_${ageMs}ms"
+                    buffer.clear()
+                } else if (startsWithValidWireFrameHeader(data)) {
+                    resetReason = "orphaned_partial_buffer_${buffer.size}B_new_frame_header"
+                    buffer.clear()
+                }
+            }
+
+            for (b in data) {
+                buffer.add(b)
+            }
+
+            val frames = mutableListOf<String>()
+            while (buffer.size >= 4) {
+                val lenBytes = byteArrayOf(buffer[0], buffer[1], buffer[2], buffer[3])
+                val frameLen = ByteBuffer.wrap(lenBytes).int
+                if (frameLen <= 0 || frameLen > MAX_OUTBOUND_FRAME_BYTES) {
+                    resetReason = "invalid_frame_len_$frameLen"
+                    buffer.clear()
+                    break
+                }
+                if (buffer.size >= 4 + frameLen) {
+                    val frameBytes = ByteArray(frameLen)
+                    for (idx in 0 until frameLen) {
+                        frameBytes[idx] = buffer[4 + idx]
+                    }
+                    repeat(4 + frameLen) {
+                        buffer.removeAt(0)
+                    }
+                    frames.add(String(frameBytes, Charsets.UTF_8))
+                } else {
+                    break
+                }
+            }
+            return frames to resetReason
         }
 
         fun computeSafeChunkSize(negotiatedMtu: Int): Int {
@@ -163,6 +246,22 @@ class GattSessionManager(
             }
         }
 
+        fun shouldPreferServerRoute(
+            snapshot: GattReadinessSnapshot,
+            targetAliases: Set<String>,
+            lastServerInboundMac: String?,
+            lastServerInboundMs: Long,
+            lastClientOutboundSuccessMs: Long,
+            lastClientInboundMs: Long
+        ): Boolean {
+            if (!isServerReadyForOutbound(snapshot)) return false
+            if (!isClientReadyForOutbound(snapshot)) return true
+            val targetMatchesServer = lastServerInboundMac != null &&
+                (targetAliases.isEmpty() || targetAliases.any { it.equals(lastServerInboundMac, ignoreCase = true) })
+            val latestClientActivityMs = maxOf(lastClientOutboundSuccessMs, lastClientInboundMs)
+            return targetMatchesServer && lastServerInboundMs > latestClientActivityMs
+        }
+
         /**
          * Strict readiness gate:
          * - When a GATT client connection is connected and mid-discovery/subscription, waits before
@@ -207,6 +306,9 @@ class GattSessionManager(
             if (frame.startsWith("KEY_EXCHANGE|")) {
                 queue.removeIf { it.startsWith("KEY_EXCHANGE|") }
                 queue.addFirst(frame)
+            } else if (frame.startsWith("PHOTO_DOWNLOAD_REQUEST|")) {
+                queue.removeIf { it == frame }
+                queue.addLast(frame)
             } else {
                 queue.addLast(frame)
             }
@@ -230,6 +332,7 @@ class GattSessionManager(
 
     var onGattReady: (() -> Unit)? = null
     var onReconnectRequested: ((failedMac: String?, reason: String) -> Boolean)? = null
+    var onOutboundFrameTransmitted: ((rawFrame: String) -> Unit)? = null
     var compactAvatarBytesProvider: (() -> ByteArray?)? = null
 
     private var gattServer: BluetoothGattServer? = null
@@ -239,8 +342,10 @@ class GattSessionManager(
     private var connectedDevice: BluetoothDevice? = null
 
     private val incomingBuffers = ConcurrentHashMap<String, MutableList<Byte>>()
+    private val incomingBufferLastAppendMs = ConcurrentHashMap<String, Long>()
     private val pendingOutboundFrames = ConcurrentLinkedDeque<String>()
     private val frameTargetAliases = ConcurrentHashMap<String, Set<String>>()
+    private val frameRoutePreferences = ConcurrentHashMap<String, GattRoutePreference>()
     private val isFlushingQueue = AtomicBoolean(false)
     private val subscribedClients = mutableListOf<BluetoothDevice>()
     private val avatarReadBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
@@ -267,6 +372,12 @@ class GattSessionManager(
 
     @Volatile
     private var lastClientOutboundSuccessMs: Long = 0L
+
+    @Volatile
+    private var lastClientInboundMs: Long = 0L
+
+    @Volatile
+    private var lastClientInboundMac: String? = null
 
     @Volatile
     private var isClientConnected: Boolean = false
@@ -304,19 +415,29 @@ class GattSessionManager(
     }
 
     private fun shouldPreferServerFor(targetAliases: Set<String>): Boolean {
-        val snapshot = currentReadinessSnapshot()
-        if (!isServerReadyForOutbound(snapshot)) return false
-        if (!isClientReadyForOutbound(snapshot)) return true
-        val serverMac = lastServerInboundMac
-        val targetMatchesServer = serverMac != null &&
-            (targetAliases.isEmpty() || targetAliases.any { it.equals(serverMac, ignoreCase = true) })
-        return targetMatchesServer && lastServerInboundMs > lastClientOutboundSuccessMs
+        return shouldPreferServerRoute(
+            snapshot = currentReadinessSnapshot(),
+            targetAliases = targetAliases,
+            lastServerInboundMac = lastServerInboundMac,
+            lastServerInboundMs = lastServerInboundMs,
+            lastClientOutboundSuccessMs = lastClientOutboundSuccessMs,
+            lastClientInboundMs = lastClientInboundMs
+        )
     }
 
-    fun inspectOutboundRoutePlan(targetAliases: Set<String> = emptySet()): GattOutboundRoutePlan {
+    fun inspectOutboundRoutePlan(
+        targetAliases: Set<String> = emptySet(),
+        routePreference: GattRoutePreference = GattRoutePreference.AUTO
+    ): GattOutboundRoutePlan {
+        val preferServer = when (routePreference) {
+            GattRoutePreference.PREFER_CLIENT -> false
+            GattRoutePreference.PREFER_SERVER -> true
+            GattRoutePreference.AUTO,
+            GattRoutePreference.BOTH_IF_AVAILABLE -> shouldPreferServerFor(targetAliases)
+        }
         return selectOutboundRoutePlan(
             snapshot = currentReadinessSnapshot(),
-            preferServer = shouldPreferServerFor(targetAliases)
+            preferServer = preferServer
         )
     }
 
@@ -406,6 +527,7 @@ class GattSessionManager(
                     device?.address?.let {
                         avatarReadOffsets.remove(it)
                         incomingBuffers.remove(it)
+                        incomingBufferLastAppendMs.remove(it)
                     }
                     // Do NOT mark ready or trigger E2EE handshake here; transient avatar probes connect
                     // only to read LAYOVER_AVATAR_CHAR_UUID and never subscribe to 0x2902 notifications.
@@ -415,6 +537,7 @@ class GattSessionManager(
                         avatarReadOffsets.remove(addr)
                         serverClientMtuByAddress.remove(addr)
                         incomingBuffers.remove(addr)
+                        incomingBufferLastAppendMs.remove(addr)
                     }
                     val wasSubscribed = device != null && synchronized(subscribedClients) {
                         subscribedClients.removeAll { it.address.equals(device.address, ignoreCase = true) }
@@ -1061,6 +1184,8 @@ class GattSessionManager(
                 if (activeGattClient !== gatt) return
                 LayoverFileLogger.log("GATT Client onCharacteristicChanged ENTRY: charUUID=${characteristic.uuid}, len=${value.size}")
                 if (characteristic.uuid.equals(LAYOVER_RX_CHAR_UUID)) {
+                    lastClientInboundMs = System.currentTimeMillis()
+                    lastClientInboundMac = device.address
                     parseIncomingBytes(value, device.address)
                 }
             }
@@ -1070,6 +1195,8 @@ class GattSessionManager(
                 if (gatt == null || activeGattClient !== gatt) return
                 LayoverFileLogger.log("GATT Client onCharacteristicChanged (deprecated) ENTRY: charUUID=${characteristic?.uuid}, len=${characteristic?.value?.size ?: 0}")
                 if (characteristic?.uuid?.equals(LAYOVER_RX_CHAR_UUID) == true) {
+                    lastClientInboundMs = System.currentTimeMillis()
+                    lastClientInboundMac = device.address
                     @Suppress("DEPRECATION")
                     characteristic.value?.let { parseIncomingBytes(it, device.address) }
                 }
@@ -1181,37 +1308,32 @@ class GattSessionManager(
 
     private fun parseIncomingBytes(data: ByteArray, remoteId: String) {
         val buffer = incomingBuffers.getOrPut(remoteId) { mutableListOf() }
+        val emittedFrames: List<String>
         synchronized(buffer) {
+            val nowMs = System.currentTimeMillis()
+            val lastAppendMs = incomingBufferLastAppendMs[remoteId] ?: 0L
             LayoverFileLogger.log("GATT reassembler ($remoteId): appending ${data.size} bytes. Current buffer size: ${buffer.size}")
-            for (b in data) {
-                buffer.add(b)
+            val (frames, resetReason) = reassembleIncomingChunk(
+                buffer = buffer,
+                data = data,
+                lastAppendMs = lastAppendMs,
+                nowMs = nowMs
+            )
+            if (resetReason != null) {
+                LayoverFileLogger.logError("GATT reassembler ($remoteId) self-healed buffer: $resetReason")
             }
-            while (buffer.size >= 4) {
-                val lenBytes = byteArrayOf(buffer[0], buffer[1], buffer[2], buffer[3])
-                val frameLen = ByteBuffer.wrap(lenBytes).int
-                if (frameLen <= 0 || frameLen > MAX_OUTBOUND_FRAME_BYTES) {
-                    LayoverFileLogger.logError("GATT reassembler error ($remoteId): invalid frameLen=$frameLen. Clearing buffer.")
-                    buffer.clear()
-                    break
-                }
-                if (buffer.size >= 4 + frameLen) {
-                    val frameBytes = ByteArray(frameLen)
-                    for (idx in 0 until frameLen) {
-                        frameBytes[idx] = buffer[4 + idx]
-                    }
-                    val totalToRemove = 4 + frameLen
-                    repeat(totalToRemove) {
-                        buffer.removeAt(0)
-                    }
-                    val text = String(frameBytes, Charsets.UTF_8)
-                    val frameType = text.substringBefore("|")
-                    LayoverFileLogger.log("GATT frame parsed successfully: type=$frameType, length=$frameLen")
-                    scope.launch {
-                        _incomingMessages.emit(P2PMessageFrame(senderId = remoteId, text = text))
-                    }
-                } else {
-                    break
-                }
+            if (buffer.isEmpty()) {
+                incomingBufferLastAppendMs.remove(remoteId)
+            } else {
+                incomingBufferLastAppendMs[remoteId] = nowMs
+            }
+            emittedFrames = frames
+        }
+        for (text in emittedFrames) {
+            val frameType = text.substringBefore("|")
+            LayoverFileLogger.log("GATT frame parsed successfully: type=$frameType, length=${text.toByteArray(Charsets.UTF_8).size}")
+            scope.launch {
+                _incomingMessages.emit(P2PMessageFrame(senderId = remoteId, text = text))
             }
         }
     }
@@ -1247,11 +1369,14 @@ class GattSessionManager(
 
                     val frame = pendingOutboundFrames.peekFirst() ?: break
                     val targetAliases = frameTargetAliases[frame].orEmpty()
-                    val success = sendFrameSuspended(frame, targetAliases)
+                    val routePreference = frameRoutePreferences[frame] ?: GattRoutePreference.AUTO
+                    val success = sendFrameSuspended(frame, targetAliases, routePreference)
                     if (success) {
                         pendingOutboundFrames.removeFirstOccurrence(frame)
                         frameTargetAliases.remove(frame)
+                        frameRoutePreferences.remove(frame)
                         retryCounts.remove(frame)
+                        onOutboundFrameTransmitted?.invoke(frame)
                         delay(60)
                     } else {
                         if (!hasReadyChannel()) {
@@ -1289,6 +1414,7 @@ class GattSessionManager(
                             LayoverFileLogger.logError("GATT outbound exhausted $maxRetriesPerFrame retries for frame type=${frame.substringBefore("|")}. Dropping frame.")
                             pendingOutboundFrames.removeFirstOccurrence(frame)
                             frameTargetAliases.remove(frame)
+                            frameRoutePreferences.remove(frame)
                             retryCounts.remove(frame)
                         } else {
                             val backoffMs = (250L * attempts).coerceAtMost(1500L)
@@ -1307,21 +1433,32 @@ class GattSessionManager(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun sendFrameSuspended(text: String, targetAliases: Set<String> = emptySet()): Boolean {
+    private suspend fun sendFrameSuspended(
+        text: String,
+        targetAliases: Set<String> = emptySet(),
+        routePreference: GattRoutePreference = GattRoutePreference.AUTO
+    ): Boolean {
         val payload = text.toByteArray(Charsets.UTF_8)
         val fullPacket = ByteBuffer.allocate(4 + payload.size).putInt(payload.size).put(payload).array()
         val frameType = text.substringBefore("|")
-        val plan = inspectOutboundRoutePlan(targetAliases)
+        val plan = inspectOutboundRoutePlan(targetAliases, routePreference)
+        val notifyAll = routePreference == GattRoutePreference.BOTH_IF_AVAILABLE
 
         LayoverFileLogger.log(
-            "GATT outbound route selected: type=$frameType, primary=${plan.primary}, fallback=${plan.fallback}, " +
+            "GATT outbound route selected: type=$frameType, pref=$routePreference, primary=${plan.primary}, fallback=${plan.fallback}, " +
                 "clientMac=${activeGattClient?.device?.address}, subscribedCount=${synchronized(subscribedClients) { subscribedClients.size }}"
         )
 
         suspend fun executeRoute(route: GattOutboundRoute): Boolean {
             return when (route) {
                 GattOutboundRoute.CLIENT_WRITE -> sendViaGattClient(fullPacket, payload.size, frameType)
-                GattOutboundRoute.SERVER_NOTIFY -> sendViaGattServer(fullPacket, payload.size, frameType, targetAliases)
+                GattOutboundRoute.SERVER_NOTIFY -> sendViaGattServer(
+                    fullPacket = fullPacket,
+                    payloadSize = payload.size,
+                    frameType = frameType,
+                    targetAliases = targetAliases,
+                    notifyAllSubscribed = notifyAll
+                )
                 GattOutboundRoute.NONE -> false
             }
         }
@@ -1329,6 +1466,27 @@ class GattSessionManager(
         if (plan.primary == GattOutboundRoute.NONE) {
             LayoverFileLogger.log("GATT outbound skipped (no ready route) for type=$frameType; keeping frame queued.")
             return false
+        }
+
+        if (routePreference == GattRoutePreference.BOTH_IF_AVAILABLE) {
+            val primarySuccess = executeRoute(plan.primary)
+            val secondaryRoute = when {
+                plan.fallback != GattOutboundRoute.NONE -> plan.fallback
+                plan.primary == GattOutboundRoute.CLIENT_WRITE && isServerReadyForOutbound(currentReadinessSnapshot()) ->
+                    GattOutboundRoute.SERVER_NOTIFY
+                plan.primary == GattOutboundRoute.SERVER_NOTIFY && isClientReadyForOutbound(currentReadinessSnapshot()) ->
+                    GattOutboundRoute.CLIENT_WRITE
+                else -> GattOutboundRoute.NONE
+            }
+            val secondarySuccess = if (secondaryRoute != GattOutboundRoute.NONE) {
+                LayoverFileLogger.log(
+                    "GATT redundant delivery (BOTH_IF_AVAILABLE): also sending type=$frameType via $secondaryRoute."
+                )
+                executeRoute(secondaryRoute)
+            } else {
+                false
+            }
+            return primarySuccess || secondarySuccess
         }
 
         val primarySuccess = executeRoute(plan.primary)
@@ -1465,7 +1623,8 @@ class GattSessionManager(
         fullPacket: ByteArray,
         payloadSize: Int,
         frameType: String,
-        targetAliases: Set<String>
+        targetAliases: Set<String>,
+        notifyAllSubscribed: Boolean = false
     ): Boolean {
         val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
         val subscribedSnapshot = synchronized(subscribedClients) { subscribedClients.toList() }
@@ -1499,7 +1658,7 @@ class GattSessionManager(
             LayoverFileLogger.log(
                 "GATT Server attempting notify: type=$frameType, size=$payloadSize, " +
                     "chunks=${chunks.size}, maxChunk=${chunkSize}B, targetCharUUID=$LAYOVER_RX_CHAR_UUID, " +
-                    "remoteMac=${targetDevice.address}, aliasMatch=$isExplicitAliasMatch"
+                    "remoteMac=${targetDevice.address}, aliasMatch=$isExplicitAliasMatch, notifyAll=$notifyAllSubscribed"
             )
             var allChunksSent = true
             for ((chunkIndex, chunk) in chunks.withIndex()) {
@@ -1564,8 +1723,8 @@ class GattSessionManager(
             if (allChunksSent) {
                 anySuccess = true
                 // If we matched an explicit alias target and delivered all chunks cleanly, stop here
-                // rather than broadcasting duplicate frames to unrelated subscribed clients.
-                if (isExplicitAliasMatch) break
+                // unless notifyAllSubscribed is explicitly requested (e.g. control-frame retry across RPA rotation).
+                if (isExplicitAliasMatch && !notifyAllSubscribed) break
             }
         }
 
@@ -1578,7 +1737,11 @@ class GattSessionManager(
     }
 
     @SuppressLint("MissingPermission")
-    fun sendFrame(text: String, targetAliases: Set<String> = emptySet()): Boolean {
+    fun sendFrame(
+        text: String,
+        targetAliases: Set<String> = emptySet(),
+        routePreference: GattRoutePreference = GattRoutePreference.AUTO
+    ): Boolean {
         val frameType = text.substringBefore("|")
         if (!isAllowedOutboundFrame(text)) {
             LayoverFileLogger.logError("Dropping malformed/unframed outbound payload: ${text.take(30)}")
@@ -1594,7 +1757,14 @@ class GattSessionManager(
         if (targetAliases.isNotEmpty()) {
             frameTargetAliases[text] = targetAliases
         }
-        LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=$byteSize, targetAliasCount=${targetAliases.size}")
+        if (routePreference != GattRoutePreference.AUTO) {
+            frameRoutePreferences[text] = routePreference
+        } else {
+            frameRoutePreferences.remove(text)
+        }
+        LayoverFileLogger.log(
+            "GATT sendFrame queued: type=$frameType, size=$byteSize, targetAliasCount=${targetAliases.size}, routePref=$routePreference"
+        )
         enqueueOutboundFrame(pendingOutboundFrames, text)
         if (hasReadyChannel()) {
             flushQueue()
@@ -1622,8 +1792,10 @@ class GattSessionManager(
         negotiatedClientMtu = DEFAULT_ATT_MTU
         serverClientMtuByAddress.clear()
         incomingBuffers.clear()
+        incomingBufferLastAppendMs.clear()
         pendingOutboundFrames.clear()
         frameTargetAliases.clear()
+        frameRoutePreferences.clear()
         stopServer()
         _connectionState.value = RfcommConnectionState.DISCONNECTED
     }

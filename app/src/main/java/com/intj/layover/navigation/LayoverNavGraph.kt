@@ -32,6 +32,7 @@ import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.LayoverUiState
+import com.intj.layover.model.MessageDeliveryStatus
 import com.intj.layover.ui.screens.ChatScreen
 import com.intj.layover.ui.screens.DEFAULT_LOADING_DISPLAY_MS
 import com.intj.layover.ui.screens.LayoverLoadingScreen
@@ -89,9 +90,17 @@ internal fun resolveChatMessagesForPeer(
                             (newAtt.progress > existingAtt.progress &&
                                 existingAtt.state != com.intj.layover.model.PhotoTransferState.COMPLETED)
                         )
-                    if (newWins) {
-                        mergedById[msg.id] = msg
-                    }
+                    val existingRank = com.intj.layover.ble.LayoverAppRuntime.deliveryStatusRank(existing.deliveryStatus)
+                    val newRank = com.intj.layover.ble.LayoverAppRuntime.deliveryStatusRank(msg.deliveryStatus)
+                    val bestStatus = if (newRank > existingRank) msg.deliveryStatus else existing.deliveryStatus
+                    val bestDeliveredAt = existing.deliveredAtMillis ?: msg.deliveredAtMillis
+                    val bestSeenAt = existing.seenAtMillis ?: msg.seenAtMillis
+                    val base = if (newWins) msg else existing
+                    mergedById[msg.id] = base.copy(
+                        deliveryStatus = bestStatus,
+                        deliveredAtMillis = bestDeliveredAt,
+                        seenAtMillis = bestSeenAt
+                    )
                 }
             }
         }
@@ -146,12 +155,11 @@ fun LayoverNavGraph(
     isRuntimeReady: Boolean = true
 ) {
     val toggleBlockPeer = { rawPeerId: String ->
-        val queryAliases = PeerAliasRegistry.resolveAliases(rawPeerId) + rawPeerId
+        val queryAliases = PeerAliasRegistry.resolveStableIdentifiers(rawPeerId).ifEmpty { setOf(rawPeerId.trim()) }
         val targetPeer = uiState.nearbyPeers.find { peer ->
             queryAliases.any { q ->
                 peer.id.equals(q, ignoreCase = true) ||
-                        peer.handle.equals(q, ignoreCase = true) ||
-                        peer.displayName.equals(q, ignoreCase = true)
+                        peer.handle.equals(q, ignoreCase = true)
             }
         }
 
@@ -160,42 +168,37 @@ fun LayoverNavGraph(
             ?: rawPeerId.trim()
 
         if (resolvedPeerId.isNotBlank() && resolvedPeerId != "00000000" && resolvedPeerId != "user") {
-            PeerAliasRegistry.linkAliases(
-                listOfNotNull(
-                    rawPeerId,
-                    resolvedPeerId,
-                    targetPeer?.id,
-                    targetPeer?.handle?.ifEmpty { null },
-                    targetPeer?.displayName?.ifEmpty { null }
-                )
-            )
+            val stableSeeds = listOfNotNull(
+                rawPeerId,
+                resolvedPeerId,
+                targetPeer?.id,
+                targetPeer?.handle?.ifEmpty { null }
+            ).filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
 
-            val aliases = (
-                    PeerAliasRegistry.resolveAliases(resolvedPeerId) +
-                            PeerAliasRegistry.resolveAliases(rawPeerId) +
-                            listOfNotNull(
-                                resolvedPeerId,
-                                targetPeer?.id,
-                                targetPeer?.handle?.ifEmpty { null },
-                                targetPeer?.displayName?.ifEmpty { null }
-                            )
-                    ).filter { it.isNotBlank() && it != "00000000" && it != "user" }.toSet()
+            PeerAliasRegistry.linkAliases(stableSeeds)
 
-            val updatedBlocked = uiState.blockedPeerIds.toMutableSet()
-            val isCurrentlyBlocked = aliases.any { candidate ->
-                updatedBlocked.any { existing -> existing.equals(candidate, ignoreCase = true) }
-            }
+            val stableAliases = PeerAliasRegistry.resolveStableIdentifiers(stableSeeds)
+                .ifEmpty { setOf(resolvedPeerId) }
+
+            val updatedBlocked = uiState.blockedPeerIds
+                .filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+                .toMutableSet()
+            val isCurrentlyBlocked = PeerAliasRegistry.matchesBlocklist(stableAliases, updatedBlocked)
 
             if (isCurrentlyBlocked) {
                 updatedBlocked.removeAll { existing ->
-                    aliases.any { candidate -> existing.equals(candidate, ignoreCase = true) }
+                    val expandedExisting = PeerAliasRegistry.resolveStableIdentifiers(existing)
+                    stableAliases.any { candidate ->
+                        existing.equals(candidate, ignoreCase = true) ||
+                            expandedExisting.any { it.equals(candidate, ignoreCase = true) }
+                    }
                 }
                 uiState.transport.sendBlockState(resolvedPeerId, false)
-                LayoverFileLogger.log("BLOCK ACTION: Unblocked peerId=$resolvedPeerId. Removed aliases=$aliases. Total blocked set size=${updatedBlocked.size}")
+                LayoverFileLogger.log("BLOCK ACTION: Unblocked peerId=$resolvedPeerId. Removed stable aliases=$stableAliases. Total blocked set size=${updatedBlocked.size}")
             } else {
-                updatedBlocked.addAll(aliases)
+                updatedBlocked.addAll(stableAliases)
                 uiState.transport.sendBlockState(resolvedPeerId, true)
-                LayoverFileLogger.log("BLOCK ACTION: Blocked peerId=$resolvedPeerId. Added aliases=$aliases. Total blocked set size=${updatedBlocked.size}, contents=$updatedBlocked")
+                LayoverFileLogger.log("BLOCK ACTION: Blocked peerId=$resolvedPeerId. Added stable aliases=$stableAliases. Total blocked set size=${updatedBlocked.size}, contents=$updatedBlocked")
             }
             onUpdateUiState(uiState.copy(blockedPeerIds = updatedBlocked))
         }
@@ -340,6 +343,11 @@ fun LayoverNavGraph(
                 },
                 onToggleBlockPeer = toggleBlockPeer,
                 onToggleMutePeer = toggleMutePeer,
+                onRequestPeerFullResDp = { peerId, digest ->
+                    if (peerId.isNotBlank() && digest.isNotBlank()) {
+                        uiState.transport.downloadPeerProfilePicture(peerId, digest)
+                    }
+                },
                 onNavigateToProfile = {
                     navController.navigate(LayoverRoute.Profile.route)
                 },
@@ -397,20 +405,17 @@ fun LayoverNavGraph(
                 candidateAliases = chatAliases
             )
 
-            val isBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
-                ?.isPeerIdentifierBlocked(peerId, peer?.id, peer?.handle, peer?.displayName)
-                ?: listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
-                    val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
-                    expanded.any { exp -> uiState.blockedPeerIds.any { it.equals(exp, ignoreCase = true) } }
-                }
+            val stableBlockCandidates = listOfNotNull(
+                peerId.takeIf { it.isNotBlank() },
+                peer?.id?.takeIf { it.isNotBlank() },
+                peer?.handle?.takeIf { it.isNotBlank() }
+            )
 
-            val isBlockedByPeer = listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
-                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
-                expanded.any { exp -> uiState.blockedByPeerIds.any { it.equals(exp, ignoreCase = true) } }
-            }
+            val isBlocked = PeerAliasRegistry.matchesBlocklist(stableBlockCandidates, uiState.blockedPeerIds)
+            val isBlockedByPeer = PeerAliasRegistry.matchesBlocklist(stableBlockCandidates, uiState.blockedByPeerIds)
 
-            val isMuted = listOfNotNull(peerId, peer?.id, peer?.handle, peer?.displayName).any { candidate ->
-                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
+            val isMuted = listOfNotNull(peerId, peer?.id, peer?.handle).any { candidate ->
+                val expanded = PeerAliasRegistry.resolveStableIdentifiers(candidate).ifEmpty { setOf(candidate) }
                 expanded.any { exp -> uiState.mutedPeerIds.any { it.equals(exp, ignoreCase = true) } }
             }
 
@@ -433,16 +438,19 @@ fun LayoverNavGraph(
                     onUpdateUiState(uiState.copy(photoErrorsByPeerId = updatedErrors))
                 },
                 onSendMessage = { text, replyTo ->
-                    uiState.transport.sendMessage(peerId, text)
+                    if (isBlocked || isBlockedByPeer) return@ChatScreen
                     val sentAtMillis = System.currentTimeMillis()
+                    val msgId = "msg_$sentAtMillis"
+                    uiState.transport.sendMessage(peerId, text, msgId)
                     val newMsg = ChatMessage(
-                        id = "msg_$sentAtMillis",
+                        id = msgId,
                         senderId = "user",
                         text = text,
                         timestampLabel = formatMessageBubbleTimestamp(sentAtMillis),
                         isOutgoing = true,
                         replyToText = replyTo,
-                        timestampMillis = sentAtMillis
+                        timestampMillis = sentAtMillis,
+                        deliveryStatus = MessageDeliveryStatus.SENDING
                     )
                     val updatedMap = uiState.chatMessages.toMutableMap()
                     val baseMessages = resolveChatMessagesForPeer(updatedMap, chatAliases).toMutableList()
@@ -475,15 +483,43 @@ fun LayoverNavGraph(
                     }
                 },
                 onSendPhotoUri = { uri ->
+                    if (isBlocked || isBlockedByPeer) return@ChatScreen
                     val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
                     uiState.transport.sendPhoto(targetPeerId, uri.toString())
                 },
                 onDownloadPhoto = { transferId ->
+                    if (isBlocked || isBlockedByPeer) return@ChatScreen
                     val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
                     uiState.transport.downloadPhoto(targetPeerId, transferId)
                 },
                 onCancelPhotoTransfer = { transferId ->
                     uiState.transport.cancelPhotoTransfer(transferId)
+                },
+                onDeleteMessageForMe = { message ->
+                    val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                    if (uiState.transport is com.intj.layover.ble.BleProximityTransport) {
+                        uiState.transport.deleteMessageForMe(targetPeerId, message.id)
+                    } else {
+                        val result = com.intj.layover.ble.LayoverAppRuntime.removeMessageFromHistory(
+                            chatMessages = uiState.chatMessages,
+                            msgId = message.id,
+                            peerAliases = chatAliases
+                        )
+                        onUpdateUiState(uiState.copy(chatMessages = result.updatedChatMessages))
+                    }
+                },
+                onDeleteMessageForEveryone = { message ->
+                    val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                    if (uiState.transport is com.intj.layover.ble.BleProximityTransport) {
+                        uiState.transport.deleteMessageForEveryone(targetPeerId, message.id)
+                    } else {
+                        val result = com.intj.layover.ble.LayoverAppRuntime.removeMessageFromHistory(
+                            chatMessages = uiState.chatMessages,
+                            msgId = message.id,
+                            peerAliases = chatAliases
+                        )
+                        onUpdateUiState(uiState.copy(chatMessages = result.updatedChatMessages))
+                    }
                 },
                 onNavigateBack = {
                     navController.popBackStack()
@@ -517,16 +553,41 @@ fun LayoverNavGraph(
                 gender = targetPeer.gender ?: resolvedPeerGender
             )
 
-            val peerBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
-                ?.isPeerIdentifierBlocked(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName)
-                ?: listOfNotNull(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName).any { candidate ->
-                    val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
-                    expanded.any { exp -> uiState.blockedPeerIds.any { it.equals(exp, ignoreCase = true) } }
-                }
+            val peerProfileStableIds = listOfNotNull(
+                targetPeerId.takeIf { it.isNotBlank() },
+                targetPeer?.id?.takeIf { it.isNotBlank() },
+                targetPeer?.handle?.takeIf { it.isNotBlank() }
+            )
+            val peerBlocked = PeerAliasRegistry.matchesBlocklist(peerProfileStableIds, uiState.blockedPeerIds)
+            val peerBlockedByPeer = PeerAliasRegistry.matchesBlocklist(peerProfileStableIds, uiState.blockedByPeerIds)
 
-            val peerBlockedByPeer = listOfNotNull(targetPeerId, targetPeer?.id, targetPeer?.handle, targetPeer?.displayName).any { candidate ->
-                val expanded = PeerAliasRegistry.resolveAliases(candidate) + candidate
-                expanded.any { exp -> uiState.blockedByPeerIds.any { it.equals(exp, ignoreCase = true) } }
+            val peerProfileContext = LocalContext.current
+            val resolvedTargetId = targetPeer?.id?.takeIf { it.isNotBlank() } ?: targetPeerId
+            val peerProfileAliases = remember(targetPeerId, targetPeer?.id, targetPeer?.handle) {
+                (PeerAliasRegistry.resolveStableIdentifiers(peerProfileStableIds) + peerProfileStableIds)
+                    .filter { it.isNotBlank() }
+                    .toSet()
+            }
+            val currentAvatarDigest = remember(targetAvatarBytes) {
+                com.intj.layover.wifi.PeerDpCacheStore.computeAvatarDigest(targetAvatarBytes)
+            }
+            val dpDownloadState = remember(uiState.peerDpDownloadsByKey, peerProfileAliases, currentAvatarDigest) {
+                if (currentAvatarDigest.isNullOrBlank()) {
+                    null
+                } else {
+                    peerProfileAliases.firstNotNullOfOrNull { alias ->
+                        uiState.peerDpDownloadsByKey["${alias.lowercase()}|$currentAvatarDigest"]
+                    }
+                }
+            }
+            val cachedFullResDpPath = remember(peerProfileAliases, currentAvatarDigest, dpDownloadState?.localFilePath) {
+                if (currentAvatarDigest.isNullOrBlank()) {
+                    null
+                } else {
+                    com.intj.layover.wifi.PeerDpCacheStore(peerProfileContext)
+                        .getCachedPeerDpFile(peerProfileAliases, currentAvatarDigest)
+                        ?.absolutePath
+                }
             }
 
             com.intj.layover.ui.screens.PeerProfileScreen(
@@ -536,6 +597,14 @@ fun LayoverNavGraph(
                 fallbackAvatarBytes = targetAvatarBytes,
                 isBlocked = peerBlocked,
                 isBlockedByPeer = peerBlockedByPeer,
+                avatarDigest = currentAvatarDigest,
+                dpDownloadState = dpDownloadState,
+                cachedFullResDpPath = cachedFullResDpPath,
+                onRequestFullResDp = { digest ->
+                    if (resolvedTargetId.isNotBlank() && digest.isNotBlank()) {
+                        uiState.transport.downloadPeerProfilePicture(resolvedTargetId, digest)
+                    }
+                },
                 onNavigateBack = {
                     navController.popBackStack()
                 }

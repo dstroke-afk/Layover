@@ -15,8 +15,10 @@ import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
+import com.intj.layover.model.MessageDeliveryStatus
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.PeerAvatar
+import com.intj.layover.model.PeerDpDownloadState
 import com.intj.layover.model.PhotoAttachment
 import com.intj.layover.model.PhotoTransferState
 import com.intj.layover.model.UserProfile
@@ -26,6 +28,7 @@ import com.intj.layover.notifications.UnreadMessageTracker
 import com.intj.layover.p2p.WireFrame
 import com.intj.layover.ui.screens.canonicalDeduplicatePeers
 import com.intj.layover.ui.screens.formatMessageBubbleTimestamp
+import com.intj.layover.wifi.PeerDpCacheStore
 import com.intj.layover.wifi.WifiPhotoTransferManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,6 +38,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -74,15 +78,15 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                     val base = "${encode(peerKey)}|${encode(msg.id)}|${encode(msg.senderId)}|" +
                         "$ts|$outgoingFlag|${encode(msg.text)}|$replyEncoded"
                     val photo = msg.photoAttachment
-                    if (photo != null) {
+                    val photoPart = if (photo != null) {
                         val pathEncoded = photo.localFilePath?.let { encode(it) } ?: ""
-                        lines.add(
-                            "$base|${encode(photo.transferId)}|${photo.fileSizeBytes}|" +
-                                "$pathEncoded|${photo.state.name}|${encode(photo.mimeType)}"
-                        )
+                        "${encode(photo.transferId)}|${photo.fileSizeBytes}|$pathEncoded|${photo.state.name}|${encode(photo.mimeType)}"
                     } else {
-                        lines.add(base)
+                        "||||"
                     }
+                    val deliveredAtPart = msg.deliveredAtMillis?.toString() ?: ""
+                    val seenAtPart = msg.seenAtMillis?.toString() ?: ""
+                    lines.add("$base|$photoPart|${msg.deliveryStatus.name}|$deliveredAtPart|$seenAtPart")
                 }
             }
             return lines.joinToString("\n")
@@ -138,6 +142,13 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                     } else {
                         null
                     }
+                    val defaultStatus = if (isOutgoing) MessageDeliveryStatus.SENT else MessageDeliveryStatus.DELIVERED
+                    val deliveryStatus = parts.getOrNull(12)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { runCatching { MessageDeliveryStatus.valueOf(it) }.getOrNull() }
+                        ?: defaultStatus
+                    val deliveredAtMillis = parts.getOrNull(13)?.takeIf { it.isNotBlank() }?.toLongOrNull()
+                    val seenAtMillis = parts.getOrNull(14)?.takeIf { it.isNotBlank() }?.toLongOrNull()
                     if (peerKey.isNotBlank() && msgId.isNotBlank()) {
                         val list = result.getOrPut(peerKey) { mutableListOf() }
                         if (list.none { it.id == msgId }) {
@@ -150,7 +161,10 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                                     isOutgoing = isOutgoing,
                                     replyToText = replyTo,
                                     timestampMillis = effectiveTs,
-                                    photoAttachment = photoAttachment
+                                    photoAttachment = photoAttachment,
+                                    deliveryStatus = deliveryStatus,
+                                    deliveredAtMillis = deliveredAtMillis,
+                                    seenAtMillis = seenAtMillis
                                 )
                             )
                         }
@@ -158,6 +172,171 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 }
             }
             return result
+        }
+
+        internal data class MessageDeletionResult(
+            val updatedChatMessages: Map<String, List<ChatMessage>>,
+            val removedMessages: List<ChatMessage>,
+            val orphanedPhotoFilePaths: Set<String>
+        )
+
+        /**
+         * Removes [msgId] from matching peer alias buckets (or all buckets when [peerAliases] is
+         * empty) and computes any photo local file paths that are no longer referenced by any
+         * remaining message across the entire history.
+         */
+        internal fun removeMessageFromHistory(
+            chatMessages: Map<String, List<ChatMessage>>,
+            msgId: String,
+            peerAliases: Collection<String> = emptyList()
+        ): MessageDeletionResult {
+            if (msgId.isBlank() || chatMessages.isEmpty()) {
+                return MessageDeletionResult(chatMessages, emptyList(), emptySet())
+            }
+            val cleanAliases = peerAliases
+                .mapNotNull { it.trim().takeIf { s -> s.isNotEmpty() } }
+                .toSet()
+
+            val removedByKey = LinkedHashMap<String, ChatMessage>()
+            val updatedMap = LinkedHashMap<String, List<ChatMessage>>(chatMessages.size)
+
+            for ((key, list) in chatMessages) {
+                val keyMatchesPeer = cleanAliases.isEmpty() ||
+                    cleanAliases.any { alias -> key.equals(alias, ignoreCase = true) }
+                if (!keyMatchesPeer) {
+                    // Check if any message with this msgId in this bucket has a matching senderId alias
+                    val hasSenderMatch = list.any { msg ->
+                        msg.id == msgId && cleanAliases.any { alias -> msg.senderId.equals(alias, ignoreCase = true) }
+                    }
+                    if (!hasSenderMatch) {
+                        updatedMap[key] = list
+                        continue
+                    }
+                }
+
+                val remaining = ArrayList<ChatMessage>(list.size)
+                for (msg in list) {
+                    if (msg.id == msgId) {
+                        removedByKey.putIfAbsent(msg.id + "|" + (msg.photoAttachment?.localFilePath ?: ""), msg)
+                    } else {
+                        remaining.add(msg)
+                    }
+                }
+                if (remaining.isNotEmpty()) {
+                    updatedMap[key] = remaining
+                }
+            }
+
+            if (removedByKey.isEmpty()) {
+                return MessageDeletionResult(chatMessages, emptyList(), emptySet())
+            }
+
+            val removedList = removedByKey.values.toList()
+            val candidatePaths = removedList
+                .mapNotNull { it.photoAttachment?.localFilePath?.takeIf { path -> path.isNotBlank() } }
+                .toSet()
+            val stillReferencedPaths = updatedMap.values
+                .asSequence()
+                .flatten()
+                .mapNotNull { it.photoAttachment?.localFilePath?.takeIf { path -> path.isNotBlank() } }
+                .toSet()
+            val orphanedPaths = candidatePaths - stillReferencedPaths
+
+            return MessageDeletionResult(
+                updatedChatMessages = updatedMap,
+                removedMessages = removedList,
+                orphanedPhotoFilePaths = orphanedPaths
+            )
+        }
+
+        internal fun deliveryStatusRank(status: MessageDeliveryStatus): Int = when (status) {
+            MessageDeliveryStatus.SENDING -> 0
+            MessageDeliveryStatus.SENT -> 1
+            MessageDeliveryStatus.DELIVERED -> 2
+            MessageDeliveryStatus.SEEN -> 3
+        }
+
+        /**
+         * Monotonically advances outgoing message delivery ticks (`SENDING -> SENT -> DELIVERED -> SEEN`)
+         * across all peer alias buckets, preserving timestamps and never regressing an already-higher tick.
+         */
+        internal fun applyMessageDeliveryStatusUpdate(
+            chatMessages: Map<String, List<ChatMessage>>,
+            msgIds: Collection<String>,
+            newStatus: MessageDeliveryStatus,
+            eventTimestampMillis: Long = System.currentTimeMillis()
+        ): Pair<Map<String, List<ChatMessage>>, Boolean> {
+            val targetIds = msgIds.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            if (targetIds.isEmpty() || chatMessages.isEmpty()) return chatMessages to false
+
+            val newRank = deliveryStatusRank(newStatus)
+            var modified = false
+            val updated = chatMessages.mapValues { (_, list) ->
+                list.map { msg ->
+                    if (msg.isOutgoing && msg.id in targetIds) {
+                        val currentRank = deliveryStatusRank(msg.deliveryStatus)
+                        if (newRank > currentRank) {
+                            modified = true
+                            val nextDeliveredAt = when (newStatus) {
+                                MessageDeliveryStatus.DELIVERED -> msg.deliveredAtMillis ?: eventTimestampMillis
+                                MessageDeliveryStatus.SEEN -> msg.deliveredAtMillis ?: eventTimestampMillis
+                                else -> msg.deliveredAtMillis
+                            }
+                            val nextSeenAt = if (newStatus == MessageDeliveryStatus.SEEN) {
+                                msg.seenAtMillis ?: eventTimestampMillis
+                            } else {
+                                msg.seenAtMillis
+                            }
+                            msg.copy(
+                                deliveryStatus = newStatus,
+                                deliveredAtMillis = nextDeliveredAt,
+                                seenAtMillis = nextSeenAt
+                            )
+                        } else {
+                            msg
+                        }
+                    } else {
+                        msg
+                    }
+                }
+            }
+            return (if (modified) updated else chatMessages) to modified
+        }
+
+        /**
+         * Updates `blockedByPeerIds` using ONLY stable peer identifiers (`dev_...`, BLE advertisement
+         * `Key`, known/rotating MACs, `peer_...`), stripping raw display names so unrelated peers
+         * sharing a display name are never marked as blocked.
+         */
+        internal fun applyPeerBlockStateUpdate(
+            currentBlockedByPeerIds: Set<String>,
+            peerId: String,
+            additionalStableIds: Collection<String?> = emptyList(),
+            isBlockedByPeer: Boolean
+        ): Set<String> {
+            val stableTargets = PeerAliasRegistry.resolveStableIdentifiers(
+                buildList {
+                    add(peerId)
+                    addAll(additionalStableIds)
+                }
+            )
+            val sanitizedCurrent = currentBlockedByPeerIds
+                .filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+                .toMutableSet()
+            if (stableTargets.isEmpty()) return sanitizedCurrent
+
+            if (isBlockedByPeer) {
+                sanitizedCurrent.addAll(stableTargets)
+            } else {
+                sanitizedCurrent.removeAll { existing ->
+                    val expandedExisting = PeerAliasRegistry.resolveStableIdentifiers(existing)
+                    stableTargets.any { target ->
+                        existing.equals(target, ignoreCase = true) ||
+                            expandedExisting.any { it.equals(target, ignoreCase = true) }
+                    }
+                }
+            }
+            return sanitizedCurrent
         }
 
         @Volatile
@@ -180,6 +359,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     val gattSessionManager = GattSessionManager(appContext)
     val bleDiscoveryManager: BleDiscoveryManager
     val bleTransport: BleProximityTransport
+    val peerDpCacheStore = PeerDpCacheStore(appContext)
     val wifiPhotoTransferManager: WifiPhotoTransferManager
     val notificationEvaluator = NotificationEligibilityEvaluator()
     val unreadTracker = UnreadMessageTracker()
@@ -192,6 +372,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     )
 
     private val cachedPeerMetaByAlias = ConcurrentHashMap<String, CachedPeerProfileMeta>()
+    private val sentSeenAckMsgIds = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
 
     private val _hasSetUsername: MutableStateFlow<Boolean>
     val hasSetUsername: StateFlow<Boolean>
@@ -269,6 +450,20 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             runCatching { Base64.decode(it, Base64.DEFAULT) }.getOrNull()
         }
         val savedResolutionLabel = prefs.getString("cropped_resolution", null)
+        val rawSavedFullResAvatarPath = prefs.getString("full_res_avatar_path", null)
+        val hasValidCroppedFullRes = PeerDpCacheStore.isCroppedOwnFullResPath(rawSavedFullResAvatarPath)
+        if (!rawSavedFullResAvatarPath.isNullOrBlank() && !hasValidCroppedFullRes) {
+            prefs.edit()
+                .remove("full_res_avatar_path")
+                .remove("full_res_avatar_sha256")
+                .apply()
+        }
+        val savedFullResAvatarPath = if (hasValidCroppedFullRes) rawSavedFullResAvatarPath else null
+        val savedFullResAvatarSha256 = if (hasValidCroppedFullRes) {
+            prefs.getString("full_res_avatar_sha256", null)
+        } else {
+            null
+        }
         val savedVisible = usernameAlreadySet && prefs.getBoolean("is_visible", true)
 
         val initialProfile = UserProfile(
@@ -279,11 +474,19 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             avatarBytes = savedAvatarBytes,
             compactTransferAvatarBytes = savedCompactAvatarBytes,
             croppedResolutionLabel = savedResolutionLabel,
+            fullResAvatarFilePath = savedFullResAvatarPath,
+            fullResAvatarSha256 = savedFullResAvatarSha256,
             isVisibleToNearby = savedVisible
         )
 
-        val savedBlocked = prefs.getStringSet(KEY_BLOCKED_PEER_IDS, emptySet())?.toSet().orEmpty()
-        val savedBlockedBy = prefs.getStringSet(KEY_BLOCKED_BY_PEER_IDS, emptySet())?.toSet().orEmpty()
+        val savedBlocked = prefs.getStringSet(KEY_BLOCKED_PEER_IDS, emptySet())
+            ?.filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+            ?.toSet()
+            .orEmpty()
+        val savedBlockedBy = prefs.getStringSet(KEY_BLOCKED_BY_PEER_IDS, emptySet())
+            ?.filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+            ?.toSet()
+            .orEmpty()
         val savedMuted = prefs.getStringSet(KEY_MUTED_PEER_IDS, emptySet())?.toSet().orEmpty()
         acceptedPeerIds = prefs.getStringSet(KEY_ACCEPTED_PEER_IDS, emptySet())?.toSet().orEmpty()
 
@@ -336,8 +539,14 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             sendBleFrame = { targetPeerId, rawWireFrame ->
                 bleTransport.sendPhotoWireFrame(targetPeerId, rawWireFrame)
             },
+            sendBleFrameWithRoute = { targetPeerId, rawWireFrame, routePreference ->
+                bleTransport.sendPhotoWireFrame(targetPeerId, rawWireFrame, routePreference)
+            },
             ensureEncryptedChannelReady = { peerId ->
                 bleTransport.ensureEncryptedChannelReady(peerId)
+            },
+            refreshPeerChannelForRetry = { peerId ->
+                bleTransport.refreshPeerGattChannelForRetry(peerId)
             },
             encryptBytesForPeer = { peerId, plaintextBytes ->
                 bleTransport.encryptKeyBytesForPeer(peerId, plaintextBytes)
@@ -359,6 +568,18 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             },
             onClearPhotoError = { peerId ->
                 clearPhotoErrorForPeer(peerId)
+            },
+            peerDpCacheStore = peerDpCacheStore,
+            ownFullResAvatarProvider = {
+                val currentProfile = _uiState.value.userProfile
+                peerDpCacheStore.loadOwnFullResAvatar(
+                    fullResFilePath = currentProfile.fullResAvatarFilePath,
+                    fallbackAvatarBytes = currentProfile.avatarBytes,
+                    fallbackCompactBytes = currentProfile.compactTransferAvatarBytes
+                )
+            },
+            onPeerDpStateUpdated = { peerId, avatarDigest, dpState ->
+                updatePeerDpDownloadState(peerId, avatarDigest, dpState)
             }
         )
 
@@ -370,8 +591,28 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         bleTransport.onDownloadPhotoRequested = { peerId, transferId ->
             wifiPhotoTransferManager.requestDownload(peerId, transferId)
         }
+        bleTransport.onDownloadPeerDpRequested = { peerId, avatarDigest ->
+            val matchedPeer = findMatchingPeer(_uiState.value.nearbyPeers, peerId)
+            val stableSeeds = listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle)
+                .filter { it.isNotBlank() }
+            val expandedAliases = (
+                PeerAliasRegistry.resolveStableIdentifiers(stableSeeds) + stableSeeds
+            ).filter { it.isNotBlank() }.toSet()
+            val targetPeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+            wifiPhotoTransferManager.requestPeerFullResDp(
+                peerId = targetPeerId,
+                peerAliases = expandedAliases,
+                avatarDigest = avatarDigest
+            )
+        }
         bleTransport.onCancelPhotoRequested = { transferId ->
             wifiPhotoTransferManager.cancelTransfer(transferId)
+        }
+        bleTransport.onDeleteMessageForMeRequested = { peerId, msgId ->
+            deleteMessage(peerId = peerId, msgId = msgId, deleteForEveryone = false)
+        }
+        bleTransport.onDeleteMessageForEveryoneRequested = { peerId, msgId ->
+            deleteMessage(peerId = peerId, msgId = msgId, deleteForEveryone = true)
         }
         bleTransport.onIncomingPhotoWireFrame = { senderPeerId, frame ->
             when (frame) {
@@ -431,6 +672,10 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         _isAppInForeground.value = inForeground
         if (!inForeground) {
             _activeChatPeerId.value = null
+        } else {
+            _activeChatPeerId.value?.let { activePeer ->
+                sendPendingSeenAcksForChat(activePeer)
+            }
         }
         LayoverFileLogger.log("LayoverAppRuntime foreground state changed: inForeground=$inForeground")
     }
@@ -445,6 +690,87 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 listOfNotNull(clean, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)
             )
             _uiState.update { it.copy(unreadCountsByPeerId = updatedUnread) }
+            if (_isAppInForeground.value) {
+                sendPendingSeenAcksForChat(clean)
+            }
+        }
+    }
+
+    private fun isPeerCurrentlyViewedInChat(peerId: String, matchedPeer: NearbyPeer?): Boolean {
+        if (!_isAppInForeground.value) return false
+        val activeChat = _activeChatPeerId.value ?: return false
+        val activeStable = PeerAliasRegistry.resolveStableIdentifiers(activeChat)
+        val peerStable = PeerAliasRegistry.resolveStableIdentifiers(
+            listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle)
+        )
+        if (activeStable.isNotEmpty() && peerStable.isNotEmpty()) {
+            return activeStable.any { a -> peerStable.any { b -> a.equals(b, ignoreCase = true) } }
+        }
+        return activeChat.equals(peerId, ignoreCase = true) ||
+            (matchedPeer != null && activeChat.equals(matchedPeer.id, ignoreCase = true))
+    }
+
+    private fun sendPendingSeenAcksForChat(peerId: String) {
+        val state = _uiState.value
+        val matchedPeer = findMatchingPeer(state.nearbyPeers, peerId)
+        val stableIds = PeerAliasRegistry.resolveStableIdentifiers(
+            listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle)
+        )
+        if (PeerAliasRegistry.matchesBlocklist(stableIds, state.blockedPeerIds) ||
+            PeerAliasRegistry.matchesBlocklist(stableIds, state.blockedByPeerIds)
+        ) {
+            return
+        }
+        val chatAliases = buildSet {
+            add(peerId)
+            addAll(stableIds)
+            matchedPeer?.id?.takeIf { it.isNotBlank() }?.let { add(it) }
+            matchedPeer?.handle?.takeIf { it.isNotBlank() }?.let { add(it) }
+            matchedPeer?.displayName?.takeIf { it.isNotBlank() }?.let { add(it) }
+        }
+        val unseenIncomingIds = LinkedHashSet<String>()
+        for ((key, list) in state.chatMessages) {
+            if (chatAliases.any { alias -> key.equals(alias, ignoreCase = true) }) {
+                for (msg in list) {
+                    if (!msg.isOutgoing && !sentSeenAckMsgIds.contains(msg.id)) {
+                        unseenIncomingIds.add(msg.id)
+                    }
+                }
+            }
+        }
+        if (unseenIncomingIds.isEmpty()) return
+
+        val batch = unseenIncomingIds.toList().takeLast(25)
+        synchronized(sentSeenAckMsgIds) {
+            sentSeenAckMsgIds.addAll(batch)
+            while (sentSeenAckMsgIds.size > 1_000) {
+                val oldest = sentSeenAckMsgIds.firstOrNull() ?: break
+                sentSeenAckMsgIds.remove(oldest)
+            }
+        }
+        val targetPeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+        bleTransport.sendMessageSeenAck(targetPeerId, batch)
+    }
+
+    private fun advanceOutgoingMessageDeliveryStatus(
+        msgIds: Collection<String>,
+        newStatus: MessageDeliveryStatus,
+        eventTimestampMillis: Long = System.currentTimeMillis()
+    ) {
+        if (msgIds.isEmpty()) return
+        _uiState.update { state ->
+            val (updatedMap, modified) = applyMessageDeliveryStatusUpdate(
+                chatMessages = state.chatMessages,
+                msgIds = msgIds,
+                newStatus = newStatus,
+                eventTimestampMillis = eventTimestampMillis
+            )
+            if (modified) {
+                persistChatHistory(updatedMap)
+                state.copy(chatMessages = updatedMap)
+            } else {
+                state
+            }
         }
     }
 
@@ -496,10 +822,37 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     fun updateUiState(newState: LayoverUiState) {
         val oldState = _uiState.value
         val oldProfile = oldState.userProfile
+        var resolvedFullResPath = newState.userProfile.fullResAvatarFilePath
+        var resolvedFullResSha = newState.userProfile.fullResAvatarSha256
+        newState.userProfile.pendingFullResAvatarBytes?.let { pendingBytes ->
+            val saved = peerDpCacheStore.saveOwnFullResAvatar(pendingBytes)
+            if (saved != null) {
+                resolvedFullResPath = saved.first.absolutePath
+                resolvedFullResSha = saved.second
+                LayoverFileLogger.log(
+                    "Saved own full-res avatar to disk: bytes=${pendingBytes.size}, sha256=${saved.second.take(12)}, path=${saved.first.absolutePath}"
+                )
+            } else {
+                LayoverFileLogger.logError("Failed to save own full-res avatar (bytes=${pendingBytes.size})")
+            }
+        }
         val sanitizedProfile = newState.userProfile.copy(
-            displayName = newState.userProfile.displayName.trim().take(LayoverBleConstants.MAX_NAME_BYTE_LENGTH)
+            displayName = newState.userProfile.displayName.trim().take(LayoverBleConstants.MAX_NAME_BYTE_LENGTH),
+            fullResAvatarFilePath = resolvedFullResPath,
+            fullResAvatarSha256 = resolvedFullResSha,
+            pendingFullResAvatarBytes = null
         )
-        val sanitizedState = newState.copy(userProfile = sanitizedProfile)
+        val sanitizedBlocked = newState.blockedPeerIds
+            .filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+            .toSet()
+        val sanitizedBlockedBy = newState.blockedByPeerIds
+            .filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
+            .toSet()
+        val sanitizedState = newState.copy(
+            userProfile = sanitizedProfile,
+            blockedPeerIds = sanitizedBlocked,
+            blockedByPeerIds = sanitizedBlockedBy
+        )
         bleTransport.updateProfile(sanitizedProfile)
         bleTransport.updateSafetySettings(
             blocked = sanitizedState.blockedPeerIds,
@@ -550,8 +903,15 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             sanitizedProfile.croppedResolutionLabel?.let {
                 editor.putString("cropped_resolution", it)
             }
+            sanitizedProfile.fullResAvatarFilePath?.let {
+                editor.putString("full_res_avatar_path", it)
+            }
+            sanitizedProfile.fullResAvatarSha256?.let {
+                editor.putString("full_res_avatar_sha256", it)
+            }
             val avatarChanged = !oldProfile.compactTransferAvatarBytes.contentEquals(sanitizedProfile.compactTransferAvatarBytes) ||
-                !oldProfile.avatarBytes.contentEquals(sanitizedProfile.avatarBytes)
+                !oldProfile.avatarBytes.contentEquals(sanitizedProfile.avatarBytes) ||
+                oldProfile.fullResAvatarSha256 != sanitizedProfile.fullResAvatarSha256
             if (avatarChanged) {
                 LayoverFileLogger.log("Avatar bytes changed; updating avatar_updated_at timestamp.")
                 editor.putLong("avatar_updated_at", System.currentTimeMillis())
@@ -729,6 +1089,98 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         }
     }
 
+    /**
+     * WhatsApp-style message deletion:
+     * - [deleteForEveryone] == false ("Delete for me"): removes locally from state & persisted
+     *   history, cancels any active transfer, and deletes unreferenced local media.
+     * - [deleteForEveryone] == true ("Delete for everyone"): performs local removal + cleanup
+     *   AND sends an encrypted `DELETE_MESSAGE(msgId)` BLE control frame to the peer.
+     */
+    fun deleteMessage(peerId: String, msgId: String, deleteForEveryone: Boolean) {
+        if (msgId.isBlank()) return
+        val matchedPeer = findMatchingPeer(_uiState.value.nearbyPeers, peerId)
+        val targetPeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+        val peerAliases = buildSet {
+            addAll(notificationEvaluator.expandIdentifiers(listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)))
+            listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)
+                .filter { it.isNotBlank() }
+                .forEach { add(it.trim()) }
+        }
+
+        val deletionResult = applyMessageDeletionToState(msgId = msgId, peerAliases = peerAliases)
+        LayoverFileLogger.log(
+            "Local message delete (deleteForEveryone=$deleteForEveryone): peerId=$targetPeerId, msgId=$msgId, " +
+                "removed=${deletionResult.removedMessages.size}, orphanedFiles=${deletionResult.orphanedPhotoFilePaths.size}"
+        )
+
+        if (deleteForEveryone && targetPeerId.isNotBlank()) {
+            bleTransport.sendDeleteMessage(targetPeerId, msgId)
+        }
+    }
+
+    private fun handleIncomingRemoteMessageDeletion(peerId: String, msgId: String) {
+        if (msgId.isBlank()) return
+        val matchedPeer = findMatchingPeer(_uiState.value.nearbyPeers, peerId)
+        val peerAliases = buildSet {
+            addAll(notificationEvaluator.expandIdentifiers(listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)))
+            listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle, matchedPeer?.displayName)
+                .filter { it.isNotBlank() }
+                .forEach { add(it.trim()) }
+        }
+        val deletionResult = applyMessageDeletionToState(msgId = msgId, peerAliases = peerAliases)
+        LayoverFileLogger.log(
+            "Applied remote DELETE_MESSAGE from peerId=$peerId: msgId=$msgId, " +
+                "removed=${deletionResult.removedMessages.size}, orphanedFiles=${deletionResult.orphanedPhotoFilePaths.size}"
+        )
+    }
+
+    private fun applyMessageDeletionToState(
+        msgId: String,
+        peerAliases: Set<String>
+    ): MessageDeletionResult {
+        var result = MessageDeletionResult(_uiState.value.chatMessages, emptyList(), emptySet())
+        _uiState.update { state ->
+            val computed = removeMessageFromHistory(
+                chatMessages = state.chatMessages,
+                msgId = msgId,
+                peerAliases = peerAliases
+            )
+            result = computed
+            if (computed.removedMessages.isNotEmpty()) {
+                persistChatHistory(computed.updatedChatMessages)
+                state.copy(chatMessages = computed.updatedChatMessages)
+            } else {
+                state
+            }
+        }
+
+        // Cancel any active/queued photo transfer tied to the deleted message
+        result.removedMessages
+            .mapNotNull { it.photoAttachment?.transferId }
+            .distinct()
+            .forEach { transferId ->
+                wifiPhotoTransferManager.cancelTransfer(transferId)
+            }
+
+        // Delete unreferenced photo files inside our private layover_photos cache directory
+        val allowedPhotosDir = runCatching { File(appContext.filesDir, "layover_photos").canonicalFile }.getOrNull()
+        result.orphanedPhotoFilePaths.forEach { path ->
+            runCatching {
+                val targetFile = File(path).canonicalFile
+                val insideAppPhotosDir = allowedPhotosDir != null &&
+                    targetFile.path.startsWith(allowedPhotosDir.path + File.separator)
+                if (insideAppPhotosDir && targetFile.exists()) {
+                    val deleted = targetFile.delete()
+                    LayoverFileLogger.log("Cleaned up orphaned photo file for deleted message $msgId: deleted=$deleted, path=$path")
+                }
+            }.onFailure { err ->
+                LayoverFileLogger.logError("Failed to delete orphaned photo file $path", err)
+            }
+        }
+
+        return result
+    }
+
     private fun setPhotoErrorForPeer(peerId: String, message: String) {
         _uiState.update { state ->
             val updated = state.photoErrorsByPeerId.toMutableMap()
@@ -811,6 +1263,18 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
 
         if (isIncoming) {
             val currentState = _uiState.value
+            val routePeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+            val stableIds = PeerAliasRegistry.resolveStableIdentifiers(
+                listOfNotNull(peerId, matchedPeer?.id, matchedPeer?.handle)
+            )
+            val notBlocked = !PeerAliasRegistry.matchesBlocklist(stableIds, currentState.blockedPeerIds) &&
+                !PeerAliasRegistry.matchesBlocklist(stableIds, currentState.blockedByPeerIds)
+            if (notBlocked) {
+                bleTransport.sendMessageDeliveredAck(routePeerId, listOf(message.id))
+                if (isPeerCurrentlyViewedInChat(peerId, matchedPeer) && sentSeenAckMsgIds.add(message.id)) {
+                    bleTransport.sendMessageSeenAck(routePeerId, listOf(message.id))
+                }
+            }
             val senderCandidates = listOfNotNull(
                 peerId,
                 message.senderId,
@@ -878,6 +1342,118 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 persistChatHistory(updatedMap)
             }
             if (modified) state.copy(chatMessages = updatedMap) else state
+        }
+    }
+
+    private fun hydrateCroppedFullResAvatar(
+        avatar: PeerAvatar,
+        peerIds: Collection<String?>,
+        downloadsByKey: Map<String, PeerDpDownloadState>
+    ): PeerAvatar {
+        val currentDigest = PeerDpCacheStore.computeAvatarDigest(avatar.avatarBase64OrBytes)
+        if (currentDigest.isNullOrBlank()) {
+            return if (avatar.croppedFullResPath != null || avatar.croppedFullResDigest != null) {
+                avatar.copy(croppedFullResPath = null, croppedFullResDigest = null)
+            } else {
+                avatar
+            }
+        }
+        val stableSeeds = peerIds.mapNotNull { it?.takeIf { s -> s.isNotBlank() } }
+        val aliases = (PeerAliasRegistry.resolveStableIdentifiers(stableSeeds) + stableSeeds)
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        val statePath = aliases.firstNotNullOfOrNull { alias ->
+            downloadsByKey["${alias.lowercase()}|$currentDigest"]
+                ?.takeIf { it.state == PhotoTransferState.COMPLETED }
+                ?.localFilePath
+        }?.takeIf { PeerDpCacheStore.isCroppedPeerDpPath(it) && java.io.File(it).exists() }
+
+        val existingPath = avatar.croppedFullResPath
+            ?.takeIf {
+                avatar.croppedFullResDigest == currentDigest &&
+                    PeerDpCacheStore.isCroppedPeerDpPath(it) &&
+                    java.io.File(it).exists()
+            }
+
+        val resolvedPath = statePath
+            ?: existingPath
+            ?: peerDpCacheStore.getCachedPeerDpFile(aliases, currentDigest)?.absolutePath
+
+        return if (resolvedPath != null) {
+            if (avatar.croppedFullResPath == resolvedPath && avatar.croppedFullResDigest == currentDigest) {
+                avatar
+            } else {
+                avatar.copy(
+                    croppedFullResPath = resolvedPath,
+                    croppedFullResDigest = currentDigest
+                )
+            }
+        } else if (avatar.croppedFullResPath != null || avatar.croppedFullResDigest != null) {
+            avatar.copy(croppedFullResPath = null, croppedFullResDigest = null)
+        } else {
+            avatar
+        }
+    }
+
+    private fun updatePeerDpDownloadState(
+        peerId: String,
+        avatarDigest: String,
+        dpState: PeerDpDownloadState
+    ) {
+        _uiState.update { state ->
+            val updatedDownloads = state.peerDpDownloadsByKey.toMutableMap()
+            val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId, "")
+            val stableSeeds = buildList {
+                add(peerId)
+                matchedPeers.forEach { peer ->
+                    if (peer.id.isNotBlank()) add(peer.id)
+                    if (peer.handle.isNotBlank()) add(peer.handle)
+                }
+            }.filter { it.isNotBlank() }
+            val aliases = (
+                PeerAliasRegistry.resolveStableIdentifiers(stableSeeds) + stableSeeds
+            ).filter { it.isNotBlank() }.toSet()
+            aliases.forEach { alias ->
+                updatedDownloads["${alias.lowercase()}|$avatarDigest"] = dpState
+            }
+
+            val completedPath = dpState.localFilePath
+                ?.takeIf {
+                    dpState.state == PhotoTransferState.COMPLETED &&
+                        PeerDpCacheStore.isCroppedPeerDpPath(it) &&
+                        java.io.File(it).exists()
+                }
+            val updatedNearbyPeers = if (completedPath != null) {
+                state.nearbyPeers.map { peer ->
+                    val peerMatches = aliases.any { alias ->
+                        peer.id.equals(alias, ignoreCase = true) ||
+                            peer.handle.equals(alias, ignoreCase = true)
+                    }
+                    if (peerMatches) {
+                        val peerDigest = PeerDpCacheStore.computeAvatarDigest(peer.avatar.avatarBase64OrBytes)
+                        if (peerDigest == null || peerDigest == avatarDigest) {
+                            peer.copy(
+                                avatar = peer.avatar.copy(
+                                    croppedFullResPath = completedPath,
+                                    croppedFullResDigest = avatarDigest
+                                )
+                            )
+                        } else {
+                            peer
+                        }
+                    } else {
+                        peer
+                    }
+                }
+            } else {
+                state.nearbyPeers
+            }
+
+            state.copy(
+                peerDpDownloadsByKey = updatedDownloads,
+                nearbyPeers = updatedNearbyPeers
+            )
         }
     }
 
@@ -994,15 +1570,21 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 val matchedIds = matchedPeers.map { it.id }.toSet()
                 val updatedPeers = state.nearbyPeers.map { p ->
                     if (p.id in matchedIds) {
+                        val baseAvatar = if (avatarBytes != null && avatarBytes.isNotEmpty()) {
+                            p.avatar.copy(avatarBase64OrBytes = avatarBytes)
+                        } else {
+                            p.avatar
+                        }
+                        val hydratedAvatar = hydrateCroppedFullResAvatar(
+                            avatar = baseAvatar,
+                            peerIds = listOf(peerId, p.id, p.handle),
+                            downloadsByKey = state.peerDpDownloadsByKey
+                        )
                         p.copy(
                             displayName = displayName?.takeIf { it.isNotBlank() } ?: p.displayName,
                             gender = gender ?: p.gender,
                             age = age ?: p.age,
-                            avatar = if (avatarBytes != null && avatarBytes.isNotEmpty()) {
-                                p.avatar.copy(avatarBase64OrBytes = avatarBytes)
-                            } else {
-                                p.avatar
-                            }
+                            avatar = hydratedAvatar
                         )
                     } else {
                         p
@@ -1044,12 +1626,17 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                             existing?.id,
                             existing?.handle
                         )
-                        val resolvedAvatar = when {
+                        val baseResolvedAvatar = when {
                             discovered.avatar.avatarBase64OrBytes != null -> discovered.avatar
                             existing != null && existing.avatar.avatarBase64OrBytes != null -> existing.avatar
                             cachedMeta?.avatarBytes != null -> discovered.avatar.copy(avatarBase64OrBytes = cachedMeta.avatarBytes)
                             else -> discovered.avatar
                         }
+                        val resolvedAvatar = hydrateCroppedFullResAvatar(
+                            avatar = baseResolvedAvatar,
+                            peerIds = listOf(discovered.id, discovered.handle, existing?.id, existing?.handle),
+                            downloadsByKey = current.peerDpDownloadsByKey
+                        )
                         val resolvedAge = discovered.age ?: existing?.age ?: cachedMeta?.age
                         val resolvedGender = discovered.gender ?: existing?.gender ?: cachedMeta?.gender
                         val existingName = existing?.displayName?.takeIf { it.isNotBlank() }
@@ -1186,6 +1773,19 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 )
 
                 val currentState = _uiState.value
+                val routePeerIdForAck = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                val ackStableIds = PeerAliasRegistry.resolveStableIdentifiers(
+                    listOfNotNull(peerId, message.senderId, matchedPeer?.id, matchedPeer?.handle)
+                )
+                val peerNotBlocked = !PeerAliasRegistry.matchesBlocklist(ackStableIds, currentState.blockedPeerIds) &&
+                    !PeerAliasRegistry.matchesBlocklist(ackStableIds, currentState.blockedByPeerIds)
+                if (!message.isOutgoing && peerNotBlocked &&
+                    isPeerCurrentlyViewedInChat(peerId, matchedPeer) &&
+                    sentSeenAckMsgIds.add(message.id)
+                ) {
+                    bleTransport.sendMessageSeenAck(routePeerIdForAck, listOf(message.id))
+                }
+
                 val senderCandidates = listOfNotNull(
                     peerId,
                     message.senderId,
@@ -1226,6 +1826,13 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                         messageText = message.text
                     )
                 }
+            }
+        }
+
+        scope.launch {
+            bleTransport.incomingMessageDeletesFlow.collect { (peerId, msgId) ->
+                LayoverFileLogger.log("Incoming DELETE_MESSAGE collected in runtime: from=$peerId, msgId=$msgId")
+                handleIncomingRemoteMessageDeletion(peerId = peerId, msgId = msgId)
             }
         }
 
@@ -1371,18 +1978,48 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         }
 
         scope.launch {
+            bleTransport.outgoingMessageSentFlow.collect { msgId ->
+                LayoverFileLogger.log("Outgoing GATT frame confirmed SENT: msgId=$msgId")
+                advanceOutgoingMessageDeliveryStatus(
+                    msgIds = listOf(msgId),
+                    newStatus = MessageDeliveryStatus.SENT
+                )
+            }
+        }
+
+        scope.launch {
+            bleTransport.incomingMessageDeliveredFlow.collect { (peerId, msgIds) ->
+                LayoverFileLogger.log("Incoming MESSAGE_DELIVERED in runtime: peerId=$peerId, msgIds=$msgIds")
+                advanceOutgoingMessageDeliveryStatus(
+                    msgIds = msgIds,
+                    newStatus = MessageDeliveryStatus.DELIVERED
+                )
+            }
+        }
+
+        scope.launch {
+            bleTransport.incomingMessageSeenFlow.collect { (peerId, msgIds) ->
+                LayoverFileLogger.log("Incoming MESSAGE_SEEN in runtime: peerId=$peerId, msgIds=$msgIds")
+                advanceOutgoingMessageDeliveryStatus(
+                    msgIds = msgIds,
+                    newStatus = MessageDeliveryStatus.SEEN
+                )
+            }
+        }
+
+        scope.launch {
             bleTransport.incomingPeerBlockStateFlow.collect { (peerId, isBlockedByPeer) ->
                 LayoverFileLogger.log("Incoming peer block state in runtime: peerId=$peerId, isBlockedByPeer=$isBlockedByPeer")
-                val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId))
                 _uiState.update { state ->
-                    val updatedBlockedBy = state.blockedByPeerIds.toMutableSet()
-                    if (isBlockedByPeer) {
-                        updatedBlockedBy.addAll(aliases)
-                    } else {
-                        updatedBlockedBy.removeAll { existing ->
-                            aliases.any { candidate -> existing.equals(candidate, ignoreCase = true) }
-                        }
-                    }
+                    val matchedPeers = findAllMatchingPeers(state.nearbyPeers, peerId)
+                    val matchedStableIds = matchedPeers.flatMap { listOfNotNull(it.id, it.handle.ifEmpty { null }) }
+                    PeerAliasRegistry.linkAliases((listOf(peerId) + matchedStableIds).filter { PeerAliasRegistry.isStablePeerIdentifier(it) })
+                    val updatedBlockedBy = applyPeerBlockStateUpdate(
+                        currentBlockedByPeerIds = state.blockedByPeerIds,
+                        peerId = peerId,
+                        additionalStableIds = matchedStableIds,
+                        isBlockedByPeer = isBlockedByPeer
+                    )
                     prefs.edit().putStringSet(KEY_BLOCKED_BY_PEER_IDS, updatedBlockedBy).apply()
                     state.copy(blockedByPeerIds = updatedBlockedBy)
                 }

@@ -9,10 +9,12 @@ import androidx.core.graphics.drawable.toDrawable
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Arrangement
@@ -47,11 +49,17 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Done
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -61,6 +69,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -85,6 +94,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -94,9 +104,12 @@ import androidx.compose.ui.window.DialogWindowProvider
 import com.intj.layover.R
 import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.model.ChatMessage
+import com.intj.layover.model.MessageDeliveryStatus
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.PhotoAttachment
 import com.intj.layover.model.PhotoTransferState
+import com.intj.layover.ui.components.ZoomablePhotoViewerDialog
+import com.intj.layover.ui.components.decodeSampledImageBitmap
 import com.intj.layover.ui.theme.LayoverTheme
 import com.intj.layover.wifi.PhotoPreviewGenerator
 import java.io.File
@@ -108,6 +121,15 @@ import kotlin.math.abs
 
 private const val TAG = "LayoverChatTrace"
 private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
+
+internal val SEEN_TICK_GREEN = Color(0xFF4ADE80)
+
+internal fun outgoingDeliveryTickTint(status: MessageDeliveryStatus): Color = when (status) {
+    MessageDeliveryStatus.SENDING -> Color.White.copy(alpha = 0.72f)
+    MessageDeliveryStatus.SENT -> Color.White
+    MessageDeliveryStatus.DELIVERED -> Color.White
+    MessageDeliveryStatus.SEEN -> SEEN_TICK_GREEN
+}
 
 /**
  * Formats a chat bubble arrival/delivery timestamp in the device's local timezone and default locale:
@@ -139,6 +161,13 @@ private fun chatTrace(step: String, detail: String = "") {
     }
 }
 
+private class FullScreenPhotoTarget(
+    val messageId: String,
+    val imageKey: String,
+    val localFilePath: String?,
+    val fallbackBytes: ByteArray?
+)
+
 @Composable
 fun ChatScreen(
     peer: NearbyPeer?,
@@ -156,6 +185,8 @@ fun ChatScreen(
     onSendPhotoUri: (Uri) -> Unit = {},
     onDownloadPhoto: (transferId: String) -> Unit = {},
     onCancelPhotoTransfer: (transferId: String) -> Unit = {},
+    onDeleteMessageForMe: (ChatMessage) -> Unit = {},
+    onDeleteMessageForEveryone: (ChatMessage) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     chatTrace("ChatScreen:ENTRY", "peerId=${peer?.id ?: "null"}, messagesCount=${messages.size}, isBlocked=$isBlocked, isBlockedByPeer=$isBlockedByPeer, isMuted=$isMuted")
@@ -164,11 +195,12 @@ fun ChatScreen(
     chatTrace("ChatScreen:THEME", "isDark=${colors.isDark}")
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
+    var selectedMessageForDelete by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
     var pendingDownloadTransferId by remember { mutableStateOf<String?>(null) }
     var pendingOpenPhotoPicker by remember { mutableStateOf(false) }
-    var fullScreenPhotoPath by remember { mutableStateOf<String?>(null) }
+    var fullScreenPhoto by remember { mutableStateOf<FullScreenPhotoTarget?>(null) }
     val density = LocalDensity.current
     val isInspectionMode = LocalInspectionMode.current
     val imeBottomPx = WindowInsets.ime.getBottom(density)
@@ -268,6 +300,18 @@ fun ChatScreen(
     }
 
     val latestMessageId = messages.lastOrNull()?.id
+    LaunchedEffect(messages) {
+        val currentIds = messages.mapTo(HashSet()) { it.id }
+        if (replyingToMessage != null && replyingToMessage!!.id !in currentIds) {
+            replyingToMessage = null
+        }
+        if (selectedMessageForDelete != null && selectedMessageForDelete!!.id !in currentIds) {
+            selectedMessageForDelete = null
+        }
+        if (fullScreenPhoto != null && fullScreenPhoto!!.messageId !in currentIds) {
+            fullScreenPhoto = null
+        }
+    }
     LaunchedEffect(messages.size, latestMessageId) {
         chatTrace("LaunchedEffect(messages):START", "messagesSize=${messages.size}, latestMessageId=$latestMessageId")
         if (messages.isNotEmpty()) {
@@ -283,13 +327,13 @@ fun ChatScreen(
     val greyDisabledText = Color(0xFF8A94A6)
 
     val statusText = when {
-        isBlockedByPeer -> "You have been blocked"
+        isBlockedByPeer -> "You've been blocked"
         isBlocked -> "Blocked"
         else -> "End-to-End Encrypted"
     }
 
     val inputPlaceholderText = when {
-        isBlockedByPeer -> "You have been blocked"
+        isBlockedByPeer -> "You've been blocked"
         isBlocked -> "Peer is blocked"
         else -> "Type encrypted message..."
     }
@@ -480,9 +524,21 @@ fun ChatScreen(
                                 replyingToMessage = msg
                             }
                         },
+                        onLongPress = {
+                            chatTrace("ChatScreen:MSG_LONG_PRESS", "msgId=${msg.id}, isOutgoing=${msg.isOutgoing}")
+                            selectedMessageForDelete = msg
+                        },
                         onDownloadPhoto = handleDownloadPhotoClick,
                         onCancelPhotoTransfer = onCancelPhotoTransfer,
-                        onOpenFullPhoto = { path -> fullScreenPhotoPath = path }
+                        onOpenFullPhoto = { filePath, fallbackBytes ->
+                            val transferKey = msg.photoAttachment?.transferId ?: msg.id
+                            fullScreenPhoto = FullScreenPhotoTarget(
+                                messageId = msg.id,
+                                imageKey = "${msg.id}_${transferKey}_${filePath.orEmpty()}",
+                                localFilePath = filePath,
+                                fallbackBytes = fallbackBytes
+                            )
+                        }
                     )
                 }
             }
@@ -497,29 +553,30 @@ fun ChatScreen(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(bottom = 8.dp),
-                    color = greyDisabledFill,
-                    shape = RoundedCornerShape(12.dp)
+                        .padding(bottom = 8.dp)
+                        .border(1.dp, Color(0xFFFF5252).copy(alpha = 0.55f), RoundedCornerShape(14.dp)),
+                    color = Color(0xFF2B1C22),
+                    shape = RoundedCornerShape(14.dp)
                 ) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.Block,
-                            contentDescription = null,
-                            tint = greyDisabledText,
-                            modifier = Modifier.size(14.dp)
+                            contentDescription = "Blocked notice",
+                            tint = Color(0xFFFF6E6E),
+                            modifier = Modifier.size(16.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "You have been blocked",
-                            color = greyDisabledText,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium
+                            text = "You've been blocked",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
@@ -743,52 +800,175 @@ fun ChatScreen(
             )
         }
 
-        // Full-screen photo lightbox viewer for crisp downloaded/sent photos
-        fullScreenPhotoPath?.let { path ->
-            val fullBitmap = remember(path) {
-                runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+        // Full-screen interactive zoomable photo viewer for sent & saved/downloaded photos
+        fullScreenPhoto?.let { target ->
+            val fullBitmap = remember(target.imageKey) {
+                target.localFilePath?.takeIf { it.isNotBlank() }?.let { path ->
+                    decodeSampledImageBitmap(path)
+                } ?: target.fallbackBytes?.takeIf { it.isNotEmpty() }?.let { bytes ->
+                    runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
+                }
             }
             if (fullBitmap != null) {
-                Dialog(
-                    onDismissRequest = { fullScreenPhotoPath = null },
-                    properties = DialogProperties(usePlatformDefaultWidth = false)
-                ) {
-                    BackHandler { fullScreenPhotoPath = null }
-                    Box(
+                ZoomablePhotoViewerDialog(
+                    bitmap = fullBitmap,
+                    contentDescription = "Full-screen photo",
+                    imageKey = target.imageKey,
+                    onDismiss = { fullScreenPhoto = null }
+                )
+            } else {
+                fullScreenPhoto = null
+            }
+        }
+
+        // WhatsApp-style message deletion dialog (Delete for me / Delete for everyone)
+        selectedMessageForDelete?.let { targetMsg ->
+            DeleteMessageOptionsDialog(
+                message = targetMsg,
+                peerDisplayName = resolvedName,
+                canDeleteForEveryone = targetMsg.isOutgoing && !isChatLocked,
+                onDismiss = { selectedMessageForDelete = null },
+                onDeleteForMe = {
+                    selectedMessageForDelete = null
+                    onDeleteMessageForMe(targetMsg)
+                },
+                onDeleteForEveryone = {
+                    selectedMessageForDelete = null
+                    onDeleteMessageForEveryone(targetMsg)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun DeleteMessageOptionsDialog(
+    message: ChatMessage,
+    peerDisplayName: String,
+    canDeleteForEveryone: Boolean,
+    onDismiss: () -> Unit,
+    onDeleteForMe: () -> Unit,
+    onDeleteForEveryone: () -> Unit
+) {
+    val colors = LayoverTheme.colors
+    val previewLabel = when {
+        message.text.isNotBlank() -> message.text.trim()
+        message.photoAttachment != null -> "Photo message"
+        else -> "Message"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.cardSurface,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text(
+                text = "Delete message?",
+                color = colors.lightText,
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = previewLabel,
+                    color = colors.mutedText,
+                    fontSize = 13.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                if (canDeleteForEveryone) {
+                    Surface(
+                        color = Color(0xFF3B1D24),
+                        shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.94f))
-                            .clickable { fullScreenPhotoPath = null }
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, Color(0xFFFF5252).copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                            .clickable { onDeleteForEveryone() }
                     ) {
-                        Image(
-                            bitmap = fullBitmap,
-                            contentDescription = "Full-screen photo",
-                            contentScale = ContentScale.Fit,
+                        Row(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp)
-                                .align(Alignment.Center)
-                        )
-                        IconButton(
-                            onClick = { fullScreenPhotoPath = null },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .statusBarsPadding()
-                                .padding(8.dp)
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Close photo",
-                                tint = Color.White
+                                imageVector = Icons.Default.DeleteForever,
+                                contentDescription = "Delete for everyone",
+                                tint = Color(0xFFFF6E6E),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "Delete for everyone",
+                                    color = Color.White,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Removes for you and $peerDisplayName",
+                                    color = Color.White.copy(alpha = 0.72f),
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Surface(
+                    color = colors.darkBackground,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.dp, colors.cyanPrimary.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        .clickable { onDeleteForMe() }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = "Delete for me",
+                            tint = colors.cyanPrimary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text(
+                                text = "Delete for me",
+                                color = colors.lightText,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Removes from this device only",
+                                color = colors.mutedText,
+                                fontSize = 11.sp
                             )
                         }
                     }
                 }
-            } else {
-                fullScreenPhotoPath = null
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(
+                    text = "Cancel",
+                    color = colors.cyanPrimary,
+                    fontWeight = FontWeight.SemiBold
+                )
             }
         }
-    }
+    )
 }
 
 @Composable
@@ -963,13 +1143,15 @@ private fun ChatScreenLightInputBarPreview() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
     onReply: () -> Unit,
+    onLongPress: () -> Unit = {},
     onDownloadPhoto: (transferId: String) -> Unit = {},
     onCancelPhotoTransfer: (transferId: String) -> Unit = {},
-    onOpenFullPhoto: (localFilePath: String) -> Unit = {}
+    onOpenFullPhoto: (localFilePath: String?, fallbackBytes: ByteArray?) -> Unit = { _, _ -> }
 ) {
     chatTrace("ChatMessageBubble:ENTRY", "msgId=${message.id}, isOutgoing=${message.isOutgoing}, hasReply=${message.replyToText != null}, textLen=${message.text.length}")
     val colors = LayoverTheme.colors
@@ -991,8 +1173,12 @@ fun ChatMessageBubble(
             shape = bubbleShape,
             modifier = Modifier
                 .widthIn(min = 72.dp, max = 280.dp)
+                .clip(bubbleShape)
                 .border(1.dp, colors.cyanPrimary, bubbleShape)
-                .clickable { onReply() }
+                .combinedClickable(
+                    onClick = { onReply() },
+                    onLongClick = { onLongPress() }
+                )
         ) {
             Column(
                 modifier = Modifier.padding(10.dp)
@@ -1032,7 +1218,8 @@ fun ChatMessageBubble(
                         isOutgoing = isOutgoing,
                         onDownloadClick = { onDownloadPhoto(photo.transferId) },
                         onCancelClick = { onCancelPhotoTransfer(photo.transferId) },
-                        onOpenFullPhoto = onOpenFullPhoto
+                        onOpenFullPhoto = onOpenFullPhoto,
+                        onLongPress = onLongPress
                     )
                     if (message.text.isNotBlank()) {
                         Spacer(modifier = Modifier.height(6.dp))
@@ -1059,27 +1246,70 @@ fun ChatMessageBubble(
                         color = if (isOutgoing) outgoingTextColor.copy(alpha = 0.75f) else colors.mutedText,
                         fontSize = 10.sp
                     )
+                    if (isOutgoing) {
+                        Spacer(modifier = Modifier.width(4.dp))
+                        val tickTint = outgoingDeliveryTickTint(message.deliveryStatus)
+                        when (message.deliveryStatus) {
+                            MessageDeliveryStatus.SENDING -> {
+                                Icon(
+                                    imageVector = Icons.Default.Schedule,
+                                    contentDescription = "Sending",
+                                    tint = tickTint,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                            }
+                            MessageDeliveryStatus.SENT -> {
+                                Icon(
+                                    imageVector = Icons.Default.Done,
+                                    contentDescription = "Sent",
+                                    tint = tickTint,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                            MessageDeliveryStatus.DELIVERED -> {
+                                Icon(
+                                    imageVector = Icons.Default.DoneAll,
+                                    contentDescription = "Delivered",
+                                    tint = tickTint,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                            MessageDeliveryStatus.SEEN -> {
+                                Icon(
+                                    imageVector = Icons.Default.DoneAll,
+                                    contentDescription = "Seen",
+                                    tint = tickTint,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoBubbleContent(
     photo: PhotoAttachment,
     isOutgoing: Boolean,
     onDownloadClick: () -> Unit,
     onCancelClick: () -> Unit,
-    onOpenFullPhoto: (localFilePath: String) -> Unit
+    onOpenFullPhoto: (localFilePath: String?, fallbackBytes: ByteArray?) -> Unit,
+    onLongPress: () -> Unit = {}
 ) {
     val colors = LayoverTheme.colors
     val fullPath = photo.localFilePath?.takeIf { it.isNotBlank() && File(it).exists() }
+    val hasPreviewBytes = photo.previewBytes?.isNotEmpty() == true
     val isCrispReady = photo.state == PhotoTransferState.COMPLETED && fullPath != null
+    val canOpenZoomViewer = (isOutgoing || photo.state == PhotoTransferState.COMPLETED) &&
+        (fullPath != null || hasPreviewBytes)
 
     val fullBitmap = remember(fullPath, isCrispReady, isOutgoing) {
         if ((isCrispReady || isOutgoing) && fullPath != null) {
-            runCatching { BitmapFactory.decodeFile(fullPath)?.asImageBitmap() }.getOrNull()
+            decodeSampledImageBitmap(fullPath, maxDim = 960)
         } else {
             null
         }
@@ -1097,9 +1327,14 @@ private fun PhotoBubbleContent(
             .height(200.dp)
             .clip(containerShape)
             .background(Color(0xFF151B24))
-            .clickable(enabled = isCrispReady && fullPath != null) {
-                if (fullPath != null) onOpenFullPhoto(fullPath)
-            },
+            .combinedClickable(
+                onClick = {
+                    if (canOpenZoomViewer) {
+                        onOpenFullPhoto(fullPath, photo.previewBytes)
+                    }
+                },
+                onLongClick = { onLongPress() }
+            ),
         contentAlignment = Alignment.Center
     ) {
         when {
@@ -1118,7 +1353,7 @@ private fun PhotoBubbleContent(
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxSize()
-                        .blur(16.dp)
+                        .then(if (canOpenZoomViewer) Modifier else Modifier.blur(16.dp))
                 )
             }
         }

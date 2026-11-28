@@ -79,22 +79,19 @@ class BleDiscoveryManager(
     }
 
     private fun isPeerProtected(peer: NearbyPeer): Boolean {
-        val candidates = listOfNotNull(
+        val stableCandidates = listOfNotNull(
             peer.id.takeIf { it.isNotBlank() },
-            peer.handle.takeIf { it.isNotBlank() },
-            peer.displayName.takeIf { it.isNotBlank() }
+            peer.handle.takeIf { it.isNotBlank() }
         )
         val hasActiveStatus = peer.status != ConnectionStatus.NONE
         val isKnownDevId = peer.id.startsWith("dev_", ignoreCase = true) ||
                 peer.handle.startsWith("dev_", ignoreCase = true) ||
-                candidates.any { id -> PeerAliasRegistry.resolveAliases(id).any { it.startsWith("dev_", ignoreCase = true) } }
-        val isProtectedBySafetyOrSession = candidates.any { id ->
-            val expanded = PeerAliasRegistry.resolveAliases(id) + id
-            expanded.any { alias ->
-                protectedIdentifiers.any { it.equals(alias, ignoreCase = true) } ||
-                        activeGattIdentifiers.any { it.equals(alias, ignoreCase = true) }
-            }
-        }
+                stableCandidates.any { id ->
+                    PeerAliasRegistry.resolveStableIdentifiers(id).any { it.startsWith("dev_", ignoreCase = true) }
+                }
+        val isProtectedBySafetyOrSession =
+            PeerAliasRegistry.matchesBlocklist(stableCandidates, protectedIdentifiers) ||
+                PeerAliasRegistry.matchesBlocklist(stableCandidates, activeGattIdentifiers)
         return hasActiveStatus || isKnownDevId || isProtectedBySafetyOrSession
     }
 
@@ -512,9 +509,8 @@ class BleDiscoveryManager(
                 macAddress,
                 previousMac,
                 existingRecord?.peer?.id,
-                existingRecord?.peer?.handle,
-                resolvedName.takeUnless { it.startsWith("Layover Peer (", ignoreCase = true) }
-            )
+                existingRecord?.peer?.handle
+            ).filter { PeerAliasRegistry.isStablePeerIdentifier(it) }
         )
 
         peerMap[mapKey] = DiscoveredPeerRecord(

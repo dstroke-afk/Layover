@@ -5,7 +5,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.Settings
 import android.util.Log
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -29,7 +28,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.AccountCircle
@@ -77,10 +75,15 @@ import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.PeerDpDownloadState
 import com.intj.layover.model.formatPeerNameWithBadge
 import com.intj.layover.navigation.LayoverBackground
 import com.intj.layover.notifications.UnreadMessageTracker
+import com.intj.layover.ui.components.PeerFullResAvatarViewerDialog
+import com.intj.layover.ui.components.decodeSampledImageBitmap
 import com.intj.layover.ui.theme.LayoverTheme
+import com.intj.layover.wifi.PeerDpCacheStore
+import java.io.File
 
 internal fun initialsForName(name: String, fallback: String = "?"): String {
     val computed = name.trim()
@@ -171,6 +174,15 @@ private fun mergeCanonicalPeers(existing: NearbyPeer, incoming: NearbyPeer): Nea
     val bestAge = incoming.age?.takeIf { it > 0 } ?: existing.age?.takeIf { it > 0 }
     val bestAvatarBytes = incoming.avatar.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
         ?: existing.avatar.avatarBase64OrBytes?.takeIf { it.isNotEmpty() }
+    val bestDigest = PeerDpCacheStore.computeAvatarDigest(bestAvatarBytes)
+    val bestCroppedPath = listOfNotNull(
+        incoming.avatar.croppedFullResPath?.takeIf {
+            bestDigest == null || incoming.avatar.croppedFullResDigest == bestDigest
+        },
+        existing.avatar.croppedFullResPath?.takeIf {
+            bestDigest == null || existing.avatar.croppedFullResDigest == bestDigest
+        }
+    ).firstOrNull { PeerDpCacheStore.isCroppedPeerDpPath(it) }
 
     return existing.copy(
         id = bestId,
@@ -182,9 +194,38 @@ private fun mergeCanonicalPeers(existing: NearbyPeer, incoming: NearbyPeer): Nea
         avatar = existing.avatar.copy(
             peerId = bestId,
             initials = initialsForName(bestName, fallback = existing.avatar.initials.ifEmpty { "?" }),
-            avatarBase64OrBytes = bestAvatarBytes
+            avatarBase64OrBytes = bestAvatarBytes,
+            croppedFullResPath = bestCroppedPath,
+            croppedFullResDigest = if (bestCroppedPath != null) bestDigest else null
         )
     )
+}
+
+/**
+ * Resolves the verified cropped full-resolution DP file path for a **People Around** peer row,
+ * matching strictly on the peer's current [avatarDigest] and versioned cropped DP files (`dp_v2_*`).
+ * Returns `null` when no verified cropped full-res DP is cached yet so the row falls back to the
+ * lightweight BLE thumbnail.
+ */
+internal fun resolvePeopleAroundCroppedDpPath(
+    avatarDigest: String?,
+    peerAvatar: com.intj.layover.model.PeerAvatar,
+    dpDownloadState: PeerDpDownloadState?,
+    diskLookup: (String) -> String? = { null },
+    fileExists: (String) -> Boolean = { path -> File(path).exists() }
+): String? {
+    val digest = avatarDigest?.takeIf { it.isNotBlank() } ?: return null
+    val candidates = listOfNotNull(
+        dpDownloadState
+            ?.takeIf { it.avatarDigest == digest && it.state == com.intj.layover.model.PhotoTransferState.COMPLETED }
+            ?.localFilePath,
+        peerAvatar.croppedFullResPath
+            ?.takeIf { peerAvatar.croppedFullResDigest == digest },
+        diskLookup(digest)
+    )
+    return candidates.firstOrNull { path ->
+        path.isNotBlank() && PeerDpCacheStore.isCroppedPeerDpPath(path) && fileExists(path)
+    }
 }
 
 fun canonicalDeduplicatePeers(peers: List<NearbyPeer>): List<NearbyPeer> {
@@ -234,11 +275,17 @@ fun PeopleAroundScreen(
     onOpenChat: (String) -> Unit,
     onToggleBlockPeer: (String) -> Unit,
     onToggleMutePeer: (String) -> Unit,
+    onRequestPeerFullResDp: (peerId: String, avatarDigest: String) -> Unit = { peerId, digest ->
+        if (peerId.isNotBlank() && digest.isNotBlank()) {
+            uiState.transport.downloadPeerProfilePicture(peerId, digest)
+        }
+    },
     onNavigateToProfile: () -> Unit,
     onNavigateBack: () -> Unit,
     onOpenAppSettings: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val dpCacheStore = remember(context) { PeerDpCacheStore(context) }
     val colors = LayoverTheme.colors
     var searchActive by remember { mutableStateOf(initialSearchActive) }
     var searchQuery by remember { mutableStateOf("") }
@@ -302,13 +349,6 @@ fun PeopleAroundScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onNavigateBack) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = colors.lightText
-                        )
-                    }
                     Text(
                         text = "Layover",
                         fontSize = 24.sp,
@@ -452,18 +492,29 @@ fun PeopleAroundScreen(
                 }
 
                 items(filteredPeers, key = { it.id }) { peer ->
+                    val stablePeerIds = listOfNotNull(
+                        peer.id.takeIf { it.isNotBlank() },
+                        peer.handle.takeIf { it.isNotBlank() }
+                    )
+                    val peerStableAliases = remember(peer.id, peer.handle) {
+                        (PeerAliasRegistry.resolveStableIdentifiers(stablePeerIds) + stablePeerIds)
+                            .filter { it.isNotBlank() }
+                            .toSet()
+                    }
                     val peerCandidates = listOfNotNull(
                         peer.id.takeIf { it.isNotBlank() },
                         peer.handle.takeIf { it.isNotBlank() },
                         peer.displayName.takeIf { it.isNotBlank() }
                     )
                     val expandedPeerIds = UnreadMessageTracker.expandIdentifiers(peerCandidates)
-                    val isBlocked = expandedPeerIds.any { candidate ->
-                        uiState.blockedPeerIds.any { blocked ->
-                            blocked.equals(candidate, ignoreCase = true) ||
-                                PeerAliasRegistry.resolveAliases(blocked).any { it.equals(candidate, ignoreCase = true) }
-                        }
-                    }
+                    val isBlocked = PeerAliasRegistry.matchesBlocklist(
+                        candidates = stablePeerIds,
+                        blocklist = uiState.blockedPeerIds
+                    )
+                    val isBlockedByPeer = PeerAliasRegistry.matchesBlocklist(
+                        candidates = stablePeerIds,
+                        blocklist = uiState.blockedByPeerIds
+                    )
                     val isMuted = expandedPeerIds.any { candidate ->
                         uiState.mutedPeerIds.any { muted ->
                             muted.equals(candidate, ignoreCase = true) ||
@@ -474,11 +525,32 @@ fun PeopleAroundScreen(
                         unreadCountsByPeerId = uiState.unreadCountsByPeerId,
                         peerCandidates = peerCandidates
                     )
+                    val avatarDigest = remember(peer.avatar.avatarBase64OrBytes) {
+                        PeerDpCacheStore.computeAvatarDigest(peer.avatar.avatarBase64OrBytes)
+                    }
+                    val dpDownloadState = remember(uiState.peerDpDownloadsByKey, peerStableAliases, avatarDigest) {
+                        if (avatarDigest.isNullOrBlank()) {
+                            null
+                        } else {
+                            peerStableAliases.firstNotNullOfOrNull { alias ->
+                                uiState.peerDpDownloadsByKey["${alias.lowercase()}|$avatarDigest"]
+                            }
+                        }
+                    }
                     PeerListItemCard(
                         peer = peer,
                         isBlocked = isBlocked,
+                        isBlockedByPeer = isBlockedByPeer,
                         isMuted = isMuted,
                         unreadCount = unreadCount,
+                        avatarDigest = avatarDigest,
+                        dpDownloadState = dpDownloadState,
+                        resolveCachedFullResDpPath = { digest ->
+                            dpCacheStore.getCachedPeerDpFile(peerStableAliases, digest)?.absolutePath
+                        },
+                        onRequestFullResDp = { digest ->
+                            onRequestPeerFullResDp(peer.id, digest)
+                        },
                         onConnect = {
                             onConnectPeer(peer.id)
                         },
@@ -548,15 +620,20 @@ fun BlePermissionRecoveryCard(
 fun PeerListItemCard(
     peer: NearbyPeer,
     isBlocked: Boolean,
+    isBlockedByPeer: Boolean = false,
     isMuted: Boolean,
     unreadCount: Int = 0,
+    avatarDigest: String? = null,
+    dpDownloadState: PeerDpDownloadState? = null,
+    resolveCachedFullResDpPath: (avatarDigest: String) -> String? = { null },
+    onRequestFullResDp: (avatarDigest: String) -> Unit = {},
     onConnect: () -> Unit,
     onChat: () -> Unit,
     onToggleBlock: () -> Unit,
     onToggleMute: () -> Unit
 ) {
     val colors = LayoverTheme.colors
-    val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked
+    val isChatAllowed = peer.status == ConnectionStatus.ACCEPTED || isBlocked || isBlockedByPeer
     var showEnlargedAvatar by remember(peer.id) { mutableStateOf(false) }
     val formattedPeerName = remember(peer.displayName, peer.age, peer.gender) {
         formatPeerNameWithBadge(peer.displayName, peer.age, peer.gender)
@@ -565,6 +642,9 @@ fun PeerListItemCard(
         if (peer.displayName.isNotBlank()) initialsForName(peer.displayName) else peer.avatar.initials
     }
     val rawBytes = peer.avatar.avatarBase64OrBytes
+    val effectiveAvatarDigest = remember(avatarDigest, rawBytes) {
+        avatarDigest?.takeIf { it.isNotBlank() } ?: PeerDpCacheStore.computeAvatarDigest(rawBytes)
+    }
     val peerAvatarBitmap = remember(rawBytes) {
         if (rawBytes != null && rawBytes.isNotEmpty()) {
             val decoded = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size)
@@ -577,6 +657,24 @@ fun PeerListItemCard(
             null
         }
     }
+    val resolvedCroppedFullResPath = remember(
+        effectiveAvatarDigest,
+        peer.avatar.croppedFullResPath,
+        peer.avatar.croppedFullResDigest,
+        dpDownloadState?.state,
+        dpDownloadState?.localFilePath
+    ) {
+        resolvePeopleAroundCroppedDpPath(
+            avatarDigest = effectiveAvatarDigest,
+            peerAvatar = peer.avatar,
+            dpDownloadState = dpDownloadState,
+            diskLookup = resolveCachedFullResDpPath
+        )
+    }
+    val rowCroppedBitmap = remember(resolvedCroppedFullResPath) {
+        resolvedCroppedFullResPath?.let { path -> decodeSampledImageBitmap(path, maxDim = 256) }
+    }
+    val rowDisplayBitmap = rowCroppedBitmap ?: peerAvatarBitmap
 
     Card(
         modifier = Modifier
@@ -611,7 +709,7 @@ fun PeerListItemCard(
                             CircleShape
                         )
                         .then(
-                            if (!isBlocked && peerAvatarBitmap != null) {
+                            if (!isBlocked && rowDisplayBitmap != null) {
                                 Modifier.clickable { showEnlargedAvatar = true }
                             } else {
                                 Modifier
@@ -619,9 +717,9 @@ fun PeerListItemCard(
                         ),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (!isBlocked && peerAvatarBitmap != null) {
+                    if (!isBlocked && rowDisplayBitmap != null) {
                         Image(
-                            bitmap = peerAvatarBitmap,
+                            bitmap = rowDisplayBitmap,
                             contentDescription = "${peer.displayName} avatar",
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
@@ -654,6 +752,16 @@ fun PeerListItemCard(
                             Text(
                                 text = "\uD83D\uDEAB Blocked",
                                 color = colors.mutedText,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        isBlockedByPeer -> {
+                            Text(
+                                text = "You've been blocked",
+                                color = Color(0xFFF87171),
                                 fontSize = 13.sp,
                                 maxLines = 1,
                                 softWrap = false,
@@ -736,6 +844,20 @@ fun PeerListItemCard(
                         Text(
                             text = "Unblock",
                             color = colors.lightText,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        )
+                    }
+                } else if (isBlockedByPeer) {
+                    Surface(
+                        modifier = Modifier.clickable { onChat() },
+                        color = Color(0xFFEF4444).copy(alpha = 0.14f),
+                        shape = RoundedCornerShape(20.dp)
+                    ) {
+                        Text(
+                            text = "Blocked",
+                            color = Color(0xFFF87171),
+                            fontWeight = FontWeight.Medium,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                         )
@@ -830,53 +952,22 @@ fun PeerListItemCard(
         }
     }
 
-    if (showEnlargedAvatar && !isBlocked && peerAvatarBitmap != null) {
-        Dialog(
-            onDismissRequest = { showEnlargedAvatar = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            BackHandler { showEnlargedAvatar = false }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.94f))
-                    .clickable { showEnlargedAvatar = false }
-            ) {
-                Image(
-                    bitmap = peerAvatarBitmap,
-                    contentDescription = "$formattedPeerName full-screen photo",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp)
-                )
-
-                Text(
-                    text = formattedPeerName,
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 18.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .statusBarsPadding()
-                        .padding(horizontal = 20.dp, vertical = 16.dp)
-                )
-
-                IconButton(
-                    onClick = { showEnlargedAvatar = false },
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .statusBarsPadding()
-                        .padding(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Close photo",
-                        tint = Color.White
-                    )
-                }
-            }
+    if (showEnlargedAvatar && !isBlocked && rowDisplayBitmap != null) {
+        val viewerFullResBitmap = remember(resolvedCroppedFullResPath) {
+            resolvedCroppedFullResPath?.let { path -> decodeSampledImageBitmap(path, maxDim = 2048) }
         }
+        PeerFullResAvatarViewerDialog(
+            peerId = peer.id,
+            title = formattedPeerName,
+            thumbnailBitmap = peerAvatarBitmap,
+            fullResBitmap = viewerFullResBitmap,
+            avatarDigest = effectiveAvatarDigest,
+            dpDownloadState = dpDownloadState,
+            isBlocked = isBlocked,
+            isBlockedByPeer = isBlockedByPeer,
+            onRequestFullResDp = onRequestFullResDp,
+            onDismiss = { showEnlargedAvatar = false }
+        )
     }
 }
 
