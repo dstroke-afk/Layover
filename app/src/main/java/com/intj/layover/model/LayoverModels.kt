@@ -13,6 +13,9 @@ interface ProximityTransport {
     fun declineConnectionRequest(peerId: String) {}
     fun sendBlockState(peerId: String, blocked: Boolean) {}
     fun sendMessage(peerId: String, text: String)
+    fun sendPhoto(peerId: String, uriString: String) {}
+    fun downloadPhoto(peerId: String, transferId: String) {}
+    fun cancelPhotoTransfer(transferId: String) {}
     fun resetDiagnosticsCounters() {}
 }
 
@@ -109,6 +112,56 @@ fun formatPeerNameWithBadge(
     }
 }
 
+enum class PhotoTransferState {
+    AVAILABLE,
+    QUEUED,
+    CONNECTING_WIFI,
+    DOWNLOADING,
+    COMPLETED,
+    FAILED
+}
+
+data class PhotoAttachment(
+    val transferId: String,
+    val fileSizeBytes: Long,
+    val mimeType: String = "image/jpeg",
+    val previewBytes: ByteArray? = null,
+    val localFilePath: String? = null,
+    val state: PhotoTransferState = PhotoTransferState.AVAILABLE,
+    val progress: Float = 0f,
+    val statusDetail: String? = null
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as PhotoAttachment
+        if (transferId != other.transferId) return false
+        if (fileSizeBytes != other.fileSizeBytes) return false
+        if (mimeType != other.mimeType) return false
+        if (localFilePath != other.localFilePath) return false
+        if (state != other.state) return false
+        if (progress != other.progress) return false
+        if (statusDetail != other.statusDetail) return false
+        if (previewBytes != null) {
+            if (other.previewBytes == null) return false
+            if (!previewBytes.contentEquals(other.previewBytes)) return false
+        } else if (other.previewBytes != null) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = transferId.hashCode()
+        result = 31 * result + fileSizeBytes.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + (previewBytes?.contentHashCode() ?: 0)
+        result = 31 * result + (localFilePath?.hashCode() ?: 0)
+        result = 31 * result + state.hashCode()
+        result = 31 * result + progress.hashCode()
+        result = 31 * result + (statusDetail?.hashCode() ?: 0)
+        return result
+    }
+}
+
 data class ChatMessage(
     val id: String,
     val senderId: String,
@@ -116,7 +169,8 @@ data class ChatMessage(
     val timestampLabel: String = "",
     val isOutgoing: Boolean,
     val replyToText: String? = null,
-    val timestampMillis: Long = System.currentTimeMillis()
+    val timestampMillis: Long = System.currentTimeMillis(),
+    val photoAttachment: PhotoAttachment? = null
 )
 
 data class UserProfile(
@@ -171,6 +225,7 @@ data class LayoverUiState(
     val nearbyPeers: List<NearbyPeer> = emptyList(),
     val chatMessages: Map<String, List<ChatMessage>> = emptyMap(),
     val unreadCountsByPeerId: Map<String, Int> = emptyMap(),
+    val photoErrorsByPeerId: Map<String, String> = emptyMap(),
     val blockedPeerIds: Set<String> = emptySet(),
     val blockedByPeerIds: Set<String> = emptySet(),
     val mutedPeerIds: Set<String> = emptySet(),

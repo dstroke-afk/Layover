@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -16,12 +17,16 @@ import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.model.PeerAvatar
+import com.intj.layover.model.PhotoAttachment
+import com.intj.layover.model.PhotoTransferState
 import com.intj.layover.model.UserProfile
 import com.intj.layover.notifications.LayoverNotificationManager
 import com.intj.layover.notifications.NotificationEligibilityEvaluator
 import com.intj.layover.notifications.UnreadMessageTracker
+import com.intj.layover.p2p.WireFrame
 import com.intj.layover.ui.screens.canonicalDeduplicatePeers
 import com.intj.layover.ui.screens.formatMessageBubbleTimestamp
+import com.intj.layover.wifi.WifiPhotoTransferManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -66,10 +71,18 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                     val ts = if (msg.timestampMillis > 0L) msg.timestampMillis else System.currentTimeMillis()
                     val replyEncoded = msg.replyToText?.let { encode(it) } ?: ""
                     val outgoingFlag = if (msg.isOutgoing) "1" else "0"
-                    lines.add(
-                        "${encode(peerKey)}|${encode(msg.id)}|${encode(msg.senderId)}|" +
-                            "$ts|$outgoingFlag|${encode(msg.text)}|$replyEncoded"
-                    )
+                    val base = "${encode(peerKey)}|${encode(msg.id)}|${encode(msg.senderId)}|" +
+                        "$ts|$outgoingFlag|${encode(msg.text)}|$replyEncoded"
+                    val photo = msg.photoAttachment
+                    if (photo != null) {
+                        val pathEncoded = photo.localFilePath?.let { encode(it) } ?: ""
+                        lines.add(
+                            "$base|${encode(photo.transferId)}|${photo.fileSizeBytes}|" +
+                                "$pathEncoded|${photo.state.name}|${encode(photo.mimeType)}"
+                        )
+                    } else {
+                        lines.add(base)
+                    }
                 }
             }
             return lines.joinToString("\n")
@@ -97,6 +110,34 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                     val isOutgoing = parts[4] == "1"
                     val text = decode(parts[5])
                     val replyTo = parts.getOrNull(6)?.takeIf { it.isNotEmpty() }?.let { decode(it) }
+                    val photoAttachment = if (parts.size >= 12 && parts[7].isNotEmpty()) {
+                        val transferId = decode(parts[7])
+                        val fileSize = parts[8].toLongOrNull() ?: 0L
+                        val localPath = parts[9].takeIf { it.isNotEmpty() }?.let { decode(it) }
+                        val parsedState = runCatching { PhotoTransferState.valueOf(parts[10]) }
+                            .getOrDefault(PhotoTransferState.AVAILABLE)
+                        val mime = parts[11].takeIf { it.isNotEmpty() }?.let { decode(it) } ?: "image/jpeg"
+                        val restoredState = if (parsedState == PhotoTransferState.COMPLETED && localPath != null) {
+                            PhotoTransferState.COMPLETED
+                        } else if (parsedState == PhotoTransferState.DOWNLOADING ||
+                            parsedState == PhotoTransferState.CONNECTING_WIFI ||
+                            parsedState == PhotoTransferState.QUEUED
+                        ) {
+                            PhotoTransferState.AVAILABLE
+                        } else {
+                            parsedState
+                        }
+                        PhotoAttachment(
+                            transferId = transferId,
+                            fileSizeBytes = fileSize,
+                            mimeType = mime,
+                            localFilePath = localPath,
+                            state = restoredState,
+                            progress = if (restoredState == PhotoTransferState.COMPLETED) 1f else 0f
+                        )
+                    } else {
+                        null
+                    }
                     if (peerKey.isNotBlank() && msgId.isNotBlank()) {
                         val list = result.getOrPut(peerKey) { mutableListOf() }
                         if (list.none { it.id == msgId }) {
@@ -108,7 +149,8 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                                     timestampLabel = formatMessageBubbleTimestamp(effectiveTs),
                                     isOutgoing = isOutgoing,
                                     replyToText = replyTo,
-                                    timestampMillis = effectiveTs
+                                    timestampMillis = effectiveTs,
+                                    photoAttachment = photoAttachment
                                 )
                             )
                         }
@@ -138,6 +180,7 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
     val gattSessionManager = GattSessionManager(appContext)
     val bleDiscoveryManager: BleDiscoveryManager
     val bleTransport: BleProximityTransport
+    val wifiPhotoTransferManager: WifiPhotoTransferManager
     val notificationEvaluator = NotificationEligibilityEvaluator()
     val unreadTracker = UnreadMessageTracker()
 
@@ -286,6 +329,60 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             )
         )
         uiState = _uiState.asStateFlow()
+
+        wifiPhotoTransferManager = WifiPhotoTransferManager(
+            context = appContext,
+            localPeerIdProvider = { _uiState.value.userProfile.handle.ifBlank { savedDeviceId } },
+            sendBleFrame = { targetPeerId, rawWireFrame ->
+                bleTransport.sendPhotoWireFrame(targetPeerId, rawWireFrame)
+            },
+            ensureEncryptedChannelReady = { peerId ->
+                bleTransport.ensureEncryptedChannelReady(peerId)
+            },
+            encryptBytesForPeer = { peerId, plaintextBytes ->
+                bleTransport.encryptKeyBytesForPeer(peerId, plaintextBytes)
+            },
+            decryptBytesFromPeer = { peerId, payload ->
+                bleTransport.decryptKeyBytesFromPeer(peerId, payload)
+            },
+            onOutgoingPhotoCreated = { peerId, message ->
+                appendPhotoMessageToState(peerId, message, isIncoming = false)
+            },
+            onIncomingPhotoPreview = { peerId, message ->
+                appendPhotoMessageToState(peerId, message, isIncoming = true)
+            },
+            onPhotoStateUpdated = { transferId, state, progress, localFilePath, statusDetail ->
+                updatePhotoAttachmentState(transferId, state, progress, localFilePath, statusDetail)
+            },
+            onPhotoValidationError = { peerId, errorMessage ->
+                setPhotoErrorForPeer(peerId, errorMessage)
+            },
+            onClearPhotoError = { peerId ->
+                clearPhotoErrorForPeer(peerId)
+            }
+        )
+
+        bleTransport.onSendPhotoRequested = { peerId, uriString ->
+            runCatching { Uri.parse(uriString) }
+                .onSuccess { uri -> wifiPhotoTransferManager.sendPhotoFromUri(peerId, uri) }
+                .onFailure { setPhotoErrorForPeer(peerId, "Unable to read selected photo") }
+        }
+        bleTransport.onDownloadPhotoRequested = { peerId, transferId ->
+            wifiPhotoTransferManager.requestDownload(peerId, transferId)
+        }
+        bleTransport.onCancelPhotoRequested = { transferId ->
+            wifiPhotoTransferManager.cancelTransfer(transferId)
+        }
+        bleTransport.onIncomingPhotoWireFrame = { senderPeerId, frame ->
+            when (frame) {
+                is WireFrame.PhotoPreview -> wifiPhotoTransferManager.handleIncomingPhotoPreview(senderPeerId, frame)
+                is WireFrame.PhotoDownloadRequest -> wifiPhotoTransferManager.handleIncomingPhotoDownloadRequest(senderPeerId, frame)
+                is WireFrame.WifiApReady -> wifiPhotoTransferManager.handleIncomingWifiApReady(senderPeerId, frame)
+                is WireFrame.WifiApFallback -> wifiPhotoTransferManager.handleIncomingWifiApFallback(senderPeerId, frame)
+                is WireFrame.PhotoTransferDone -> wifiPhotoTransferManager.handleIncomingPhotoTransferDone(senderPeerId, frame)
+                else -> Unit
+            }
+        }
 
         LayoverFileLogger.log(
             "LayoverAppRuntime initialized: deviceId=$savedDeviceId, handle=$savedHandle, " +
@@ -629,6 +726,158 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             prefs.edit().putString(KEY_CHAT_HISTORY, encoded).apply()
         }.onFailure { err ->
             LayoverFileLogger.logError("Failed to persist chat history", err)
+        }
+    }
+
+    private fun setPhotoErrorForPeer(peerId: String, message: String) {
+        _uiState.update { state ->
+            val updated = state.photoErrorsByPeerId.toMutableMap()
+            val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId)) + peerId
+            aliases.filter { it.isNotBlank() }.forEach { alias ->
+                updated[alias] = message
+            }
+            state.copy(photoErrorsByPeerId = updated)
+        }
+    }
+
+    private fun clearPhotoErrorForPeer(peerId: String) {
+        _uiState.update { state ->
+            val aliases = notificationEvaluator.expandIdentifiers(listOf(peerId)) + peerId
+            val updated = state.photoErrorsByPeerId.filterKeys { existingKey ->
+                aliases.none { alias -> existingKey.equals(alias, ignoreCase = true) }
+            }
+            state.copy(photoErrorsByPeerId = updated)
+        }
+    }
+
+    private fun appendPhotoMessageToState(peerId: String, message: ChatMessage, isIncoming: Boolean) {
+        var matchedPeer: NearbyPeer? = null
+        _uiState.update { state ->
+            val updatedMap = state.chatMessages.toMutableMap()
+            val targetKeys = LinkedHashSet<String>()
+            fun collectKey(key: String?) {
+                if (!key.isNullOrBlank()) targetKeys.add(key.trim())
+            }
+            collectKey(peerId)
+            PeerAliasRegistry.resolveAliases(peerId).forEach { collectKey(it) }
+            val peer = findMatchingPeer(state.nearbyPeers, peerId)
+            matchedPeer = peer
+            peer?.let { p ->
+                collectKey(p.id)
+                collectKey(p.handle)
+                collectKey(p.displayName)
+                PeerAliasRegistry.resolveAliases(p.id).forEach { collectKey(it) }
+            }
+            updatedMap.keys.filter { existingKey ->
+                targetKeys.any { target -> existingKey.equals(target, ignoreCase = true) }
+            }.forEach { targetKeys.add(it) }
+
+            var changed = false
+            for (key in targetKeys) {
+                val list = updatedMap[key]?.toMutableList() ?: mutableListOf()
+                if (list.none { it.id == message.id }) {
+                    list.add(message)
+                    updatedMap[key] = list
+                    changed = true
+                }
+            }
+            if (changed) {
+                persistChatHistory(updatedMap)
+            }
+
+            val updatedUnread = if (isIncoming) {
+                val unreadCandidates = listOfNotNull(
+                    peerId,
+                    message.senderId,
+                    peer?.id,
+                    peer?.handle,
+                    peer?.displayName
+                )
+                unreadTracker.recordIncomingMessage(
+                    senderCandidates = unreadCandidates,
+                    messageId = message.id,
+                    isAppInForeground = _isAppInForeground.value,
+                    activeChatPeerId = _activeChatPeerId.value
+                )
+            } else {
+                state.unreadCountsByPeerId
+            }
+
+            state.copy(
+                chatMessages = updatedMap,
+                unreadCountsByPeerId = updatedUnread
+            )
+        }
+
+        if (isIncoming) {
+            val currentState = _uiState.value
+            val senderCandidates = listOfNotNull(
+                peerId,
+                message.senderId,
+                matchedPeer?.id,
+                matchedPeer?.handle,
+                matchedPeer?.displayName
+            )
+            val decision = notificationEvaluator.evaluateIncomingMessage(
+                isSetupComplete = _hasSetUsername.value,
+                localDisplayName = currentState.userProfile.displayName,
+                isBluetoothEnabled = isBluetoothEnabled(),
+                hasNotificationPermission = LayoverNotificationManager.hasNotificationPermission(appContext),
+                senderCandidates = senderCandidates,
+                messageId = message.id,
+                peerStatus = matchedPeer?.status,
+                acceptedPeerIds = acceptedPeerIds,
+                blockedPeerIds = currentState.blockedPeerIds,
+                blockedByPeerIds = currentState.blockedByPeerIds,
+                mutedPeerIds = currentState.mutedPeerIds,
+                isAppInForeground = _isAppInForeground.value,
+                activeChatPeerId = _activeChatPeerId.value
+            )
+            if (decision.shouldNotify) {
+                val routePeerId = matchedPeer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                val senderDisplayName = matchedPeer?.displayName?.takeIf { it.isNotBlank() }
+                    ?: if (routePeerId.isNotBlank()) "Peer (${routePeerId.takeLast(4)})" else "Nearby Peer"
+                LayoverNotificationManager.showIncomingMessageNotification(
+                    context = appContext,
+                    peerId = routePeerId,
+                    senderName = senderDisplayName,
+                    messageText = "Sent a photo"
+                )
+            }
+        }
+    }
+
+    private fun updatePhotoAttachmentState(
+        transferId: String,
+        newState: PhotoTransferState,
+        progress: Float,
+        localFilePath: String?,
+        statusDetail: String?
+    ) {
+        _uiState.update { state ->
+            var modified = false
+            val updatedMap = state.chatMessages.mapValues { (_, list) ->
+                list.map { msg ->
+                    val att = msg.photoAttachment
+                    if (att != null && att.transferId == transferId) {
+                        modified = true
+                        msg.copy(
+                            photoAttachment = att.copy(
+                                state = newState,
+                                progress = progress.coerceIn(0f, 1f),
+                                localFilePath = localFilePath ?: att.localFilePath,
+                                statusDetail = statusDetail
+                            )
+                        )
+                    } else {
+                        msg
+                    }
+                }
+            }
+            if (modified && newState == PhotoTransferState.COMPLETED) {
+                persistChatHistory(updatedMap)
+            }
+            if (modified) state.copy(chatMessages = updatedMap) else state
         }
     }
 

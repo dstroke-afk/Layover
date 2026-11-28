@@ -52,6 +52,12 @@ object BlePermissionHelper {
         }
     }
 
+    fun getMissingWifiHotspotPermissions(context: Context): List<String> {
+        return getWifiHotspotPermissions().filter { permission ->
+            ContextCompat.checkSelfPermission(context, permission) != PackageManager.PERMISSION_GRANTED
+        }
+    }
+
     fun hasAllLaunchPermissions(context: Context): Boolean {
         return hasAllRequiredPermissions(context) && hasWifiHotspotPermissions(context)
     }

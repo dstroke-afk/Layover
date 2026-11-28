@@ -78,6 +78,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "LayoverBLE"
         private const val KEY_NOTIFICATION_PERMISSION_REQUESTED = "notification_permission_requested"
+        private const val KEY_WIFI_PERMISSION_REQUESTED = "wifi_hotspot_permission_requested_v1"
     }
 
     private lateinit var runtime: LayoverAppRuntime
@@ -146,12 +147,22 @@ class MainActivity : ComponentActivity() {
             var notificationPromptLaunchedInSession by remember {
                 mutableStateOf(false)
             }
+            var wifiPromptLaunchedInSession by remember {
+                mutableStateOf(false)
+            }
 
             val notificationPermissionLauncher = rememberLauncherForActivityResult(
                 contract = ActivityResultContracts.RequestPermission()
             ) { granted ->
                 LayoverFileLogger.log("POST_NOTIFICATIONS permission result: granted=$granted")
                 Log.d(TAG, "POST_NOTIFICATIONS permission result: granted=$granted")
+            }
+
+            val wifiHotspotPermissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestMultiplePermissions()
+            ) { permsMap ->
+                val grantedNow = BlePermissionHelper.hasWifiHotspotPermissions(context)
+                LayoverFileLogger.log("Wi-Fi hotspot permission result: grantedNow=$grantedNow, details=$permsMap")
             }
 
             val permissionLauncher = rememberLauncherForActivityResult(
@@ -203,20 +214,31 @@ class MainActivity : ComponentActivity() {
                 Log.d(TAG, "Transport reported missing BLE permissions; avoiding automatic popup loop.")
             }
 
-            // Request POST_NOTIFICATIONS on Android 13+ once initial BLE permission flow and username setup are complete
-            LaunchedEffect(hasCompletedInitialPermissionFlow, hasSetUsername, isBlePermissionPromptVisible) {
+            // Request POST_NOTIFICATIONS and NEARBY_WIFI_DEVICES (for existing installs upgraded to Wi-Fi photo transfer)
+            // once initial BLE permission flow and username setup are complete.
+            LaunchedEffect(hasCompletedInitialPermissionFlow, hasSetUsername, isBlePermissionPromptVisible, hasBlePermissions) {
                 if (hasCompletedInitialPermissionFlow && hasSetUsername && !isBlePermissionPromptVisible) {
                     val notifPerm = BlePermissionHelper.getNotificationPermissionOrNull()
-                    val alreadyRequested = prefs.getBoolean(KEY_NOTIFICATION_PERMISSION_REQUESTED, false)
+                    val alreadyRequestedNotif = prefs.getBoolean(KEY_NOTIFICATION_PERMISSION_REQUESTED, false)
                     if (notifPerm != null &&
                         !BlePermissionHelper.hasNotificationPermission(context) &&
-                        !alreadyRequested &&
+                        !alreadyRequestedNotif &&
                         !notificationPromptLaunchedInSession
                     ) {
                         notificationPromptLaunchedInSession = true
                         prefs.edit().putBoolean(KEY_NOTIFICATION_PERMISSION_REQUESTED, true).apply()
                         LayoverFileLogger.log("Requesting POST_NOTIFICATIONS runtime permission on Android 13+.")
                         notificationPermissionLauncher.launch(notifPerm)
+                    } else if (hasBlePermissions &&
+                        !BlePermissionHelper.hasWifiHotspotPermissions(context) &&
+                        !prefs.getBoolean(KEY_WIFI_PERMISSION_REQUESTED, false) &&
+                        !wifiPromptLaunchedInSession
+                    ) {
+                        wifiPromptLaunchedInSession = true
+                        prefs.edit().putBoolean(KEY_WIFI_PERMISSION_REQUESTED, true).apply()
+                        val wifiPerms = BlePermissionHelper.getWifiHotspotPermissions()
+                        LayoverFileLogger.log("Requesting Wi-Fi hotspot permission once for photo transfers (${wifiPerms.joinToString()}).")
+                        wifiHotspotPermissionLauncher.launch(wifiPerms)
                     }
                 }
             }
@@ -284,11 +306,14 @@ class MainActivity : ComponentActivity() {
                             if (!hasCompletedInitialPermissionFlow && !blePromptLaunchedInSession) {
                                 blePromptLaunchedInSession = true
                                 isBlePermissionPromptVisible = true
-                                val blePerms = BlePermissionHelper.getRequiredPermissions()
-                                prefs.edit().putBoolean("ble_permission_prompt_open", true).apply()
-                                LayoverFileLogger.log("Starting first-launch BLE permission prompt (${blePerms.joinToString()})")
-                                Log.d(TAG, "Lifecycle $event: Launching first-launch BLE permission prompt once.")
-                                permissionLauncher.launch(blePerms)
+                                val launchPerms = BlePermissionHelper.getAllLaunchPermissions()
+                                prefs.edit()
+                                    .putBoolean("ble_permission_prompt_open", true)
+                                    .putBoolean(KEY_WIFI_PERMISSION_REQUESTED, true)
+                                    .apply()
+                                LayoverFileLogger.log("Starting first-launch Nearby Devices permission prompt (${launchPerms.joinToString()})")
+                                Log.d(TAG, "Lifecycle $event: Launching first-launch Nearby Devices permission prompt once.")
+                                permissionLauncher.launch(launchPerms)
                             } else if (bleGrantedNow) {
                                 BleProximityService.syncServiceState(context)
                                 runtime.startDiscoveryIfEligible()

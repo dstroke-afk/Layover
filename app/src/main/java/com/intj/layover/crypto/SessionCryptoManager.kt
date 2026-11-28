@@ -533,7 +533,7 @@ class SessionCryptoManager(
         return a.size.compareTo(b.size)
     }
 
-    fun encryptText(plaintext: String, peerCandidates: Collection<String> = emptyList()): EncryptedPayload? {
+    fun encryptBytes(plaintext: ByteArray, peerCandidates: Collection<String> = emptyList()): EncryptedPayload? {
         val key = synchronized(lock) {
             val normalized = normalizeAliases(null, peerCandidates)
             findSessionLocked(normalized, allowSingleSessionFallback = true)?.secretKey
@@ -547,15 +547,15 @@ class SessionCryptoManager(
             val spec = GCMParameterSpec(128, iv)
             cipher.init(Cipher.ENCRYPT_MODE, key, spec)
 
-            val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+            val ciphertext = cipher.doFinal(plaintext)
             EncryptedPayload(iv = iv, ciphertext = ciphertext)
         } catch (e: Exception) {
-            logError("AES-GCM Encryption failed", e)
+            logError("AES-GCM Byte Encryption failed", e)
             null
         }
     }
 
-    fun decryptText(payload: EncryptedPayload, peerCandidates: Collection<String> = emptyList()): String? {
+    fun decryptBytes(payload: EncryptedPayload, peerCandidates: Collection<String> = emptyList()): ByteArray? {
         val key = synchronized(lock) {
             val normalized = normalizeAliases(null, peerCandidates)
             findSessionLocked(normalized, allowSingleSessionFallback = true)?.secretKey
@@ -566,12 +566,20 @@ class SessionCryptoManager(
             val spec = GCMParameterSpec(128, payload.iv)
             cipher.init(Cipher.DECRYPT_MODE, key, spec)
 
-            val plaintextBytes = cipher.doFinal(payload.ciphertext)
-            String(plaintextBytes, Charsets.UTF_8)
+            cipher.doFinal(payload.ciphertext)
         } catch (e: Exception) {
-            logError("AES-GCM Decryption failed", e)
+            logError("AES-GCM Byte Decryption failed", e)
             null
         }
+    }
+
+    fun encryptText(plaintext: String, peerCandidates: Collection<String> = emptyList()): EncryptedPayload? {
+        return encryptBytes(plaintext.toByteArray(Charsets.UTF_8), peerCandidates)
+    }
+
+    fun decryptText(payload: EncryptedPayload, peerCandidates: Collection<String> = emptyList()): String? {
+        val plaintextBytes = decryptBytes(payload, peerCandidates) ?: return null
+        return String(plaintextBytes, Charsets.UTF_8)
     }
 
     private fun clearSessionLocked() {

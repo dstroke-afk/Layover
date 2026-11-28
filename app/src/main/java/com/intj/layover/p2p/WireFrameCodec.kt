@@ -48,9 +48,64 @@ sealed class WireFrame {
         val ivBase64: String,
         val ciphertextBase64: String
     ) : WireFrame()
+
+    data class PhotoPreview(
+        val transferId: String,
+        val senderId: String,
+        val ivBase64: String,
+        val ciphertextBase64: String
+    ) : WireFrame()
+
+    data class PhotoDownloadRequest(
+        val transferId: String,
+        val senderId: String
+    ) : WireFrame()
+
+    data class WifiApReady(
+        val transferId: String,
+        val senderId: String,
+        val ssid: String,
+        val passphrase: String,
+        val port: Int,
+        val hostIp: String = "",
+        val isReceiverFallbackHost: Boolean = false
+    ) : WireFrame()
+
+    data class WifiApFallback(
+        val transferId: String,
+        val senderId: String,
+        val reason: String
+    ) : WireFrame()
+
+    data class PhotoTransferDone(
+        val transferId: String,
+        val senderId: String,
+        val success: Boolean
+    ) : WireFrame()
 }
 
 object WireFrameCodec {
+
+    val VALID_FRAME_PREFIXES: Set<String> = setOf(
+        "KEY_EXCHANGE",
+        "CONNECTION_REQUEST",
+        "CONNECTION_ACCEPT",
+        "CONNECTION_DECLINE",
+        "PROFILE_SYNC",
+        "PEER_BLOCK_STATE",
+        "CHAT_ENCRYPTED",
+        "PHOTO_PREVIEW",
+        "PHOTO_DOWNLOAD_REQUEST",
+        "WIFI_AP_READY",
+        "WIFI_AP_FALLBACK",
+        "PHOTO_TRANSFER_DONE"
+    )
+
+    fun isValidOutboundFrame(text: String): Boolean {
+        val frameType = text.substringBefore("|")
+        if (frameType !in VALID_FRAME_PREFIXES) return false
+        return decodeFrame(text) != null
+    }
 
     fun encodeKeyExchange(
         senderId: String,
@@ -118,6 +173,57 @@ object WireFrameCodec {
         val ivB64 = Base64.getEncoder().encodeToString(payload.iv)
         val cipherB64 = Base64.getEncoder().encodeToString(payload.ciphertext)
         return "CHAT_ENCRYPTED|$msgId|$senderId|$timestamp|$ivB64|$cipherB64"
+    }
+
+    fun encodePhotoPreview(
+        transferId: String,
+        senderId: String,
+        encryptedPreviewBundle: EncryptedPayload
+    ): String {
+        val ivB64 = Base64.getEncoder().encodeToString(encryptedPreviewBundle.iv)
+        val cipherB64 = Base64.getEncoder().encodeToString(encryptedPreviewBundle.ciphertext)
+        return "PHOTO_PREVIEW|$transferId|$senderId|$ivB64|$cipherB64"
+    }
+
+    fun encodePhotoDownloadRequest(
+        transferId: String,
+        senderId: String
+    ): String {
+        return "PHOTO_DOWNLOAD_REQUEST|$transferId|$senderId"
+    }
+
+    fun encodeWifiApReady(
+        transferId: String,
+        senderId: String,
+        ssid: String,
+        passphrase: String,
+        port: Int,
+        hostIp: String = "",
+        isReceiverFallbackHost: Boolean = false
+    ): String {
+        val ssidB64 = Base64.getEncoder().encodeToString(ssid.toByteArray(Charsets.UTF_8))
+        val passB64 = Base64.getEncoder().encodeToString(passphrase.toByteArray(Charsets.UTF_8))
+        val safeIp = hostIp.replace("|", "")
+        val fallbackFlag = if (isReceiverFallbackHost) "1" else "0"
+        return "WIFI_AP_READY|$transferId|$senderId|$ssidB64|$passB64|$port|$safeIp|$fallbackFlag"
+    }
+
+    fun encodeWifiApFallback(
+        transferId: String,
+        senderId: String,
+        reason: String
+    ): String {
+        val safeReason = reason.replace("|", " ").take(80)
+        return "WIFI_AP_FALLBACK|$transferId|$senderId|$safeReason"
+    }
+
+    fun encodePhotoTransferDone(
+        transferId: String,
+        senderId: String,
+        success: Boolean
+    ): String {
+        val flag = if (success) "1" else "0"
+        return "PHOTO_TRANSFER_DONE|$transferId|$senderId|$flag"
     }
 
     fun decodeFrame(text: String): WireFrame? {
@@ -203,6 +309,70 @@ object WireFrameCodec {
                         timestamp = parts[3].toLongOrNull() ?: System.currentTimeMillis(),
                         ivBase64 = parts[4],
                         ciphertextBase64 = parts[5]
+                    )
+                } else null
+            }
+
+            "PHOTO_PREVIEW" -> {
+                if (parts.size >= 5) {
+                    WireFrame.PhotoPreview(
+                        transferId = parts[1],
+                        senderId = parts[2],
+                        ivBase64 = parts[3],
+                        ciphertextBase64 = parts[4]
+                    )
+                } else null
+            }
+
+            "PHOTO_DOWNLOAD_REQUEST" -> {
+                if (parts.size >= 3) {
+                    WireFrame.PhotoDownloadRequest(
+                        transferId = parts[1],
+                        senderId = parts[2]
+                    )
+                } else null
+            }
+
+            "WIFI_AP_READY" -> {
+                if (parts.size >= 6) {
+                    val ssid = runCatching {
+                        String(Base64.getDecoder().decode(parts[3]), Charsets.UTF_8)
+                    }.getOrNull() ?: return null
+                    val pass = runCatching {
+                        String(Base64.getDecoder().decode(parts[4]), Charsets.UTF_8)
+                    }.getOrNull() ?: return null
+                    val port = parts[5].toIntOrNull() ?: return null
+                    val hostIp = parts.getOrNull(6) ?: ""
+                    val isFallback = parts.getOrNull(7)?.let { it == "1" || it.equals("true", ignoreCase = true) } ?: false
+                    WireFrame.WifiApReady(
+                        transferId = parts[1],
+                        senderId = parts[2],
+                        ssid = ssid,
+                        passphrase = pass,
+                        port = port,
+                        hostIp = hostIp,
+                        isReceiverFallbackHost = isFallback
+                    )
+                } else null
+            }
+
+            "WIFI_AP_FALLBACK" -> {
+                if (parts.size >= 3) {
+                    WireFrame.WifiApFallback(
+                        transferId = parts[1],
+                        senderId = parts[2],
+                        reason = parts.getOrNull(3) ?: ""
+                    )
+                } else null
+            }
+
+            "PHOTO_TRANSFER_DONE" -> {
+                if (parts.size >= 4) {
+                    val success = parts[3] == "1" || parts[3].equals("true", ignoreCase = true)
+                    WireFrame.PhotoTransferDone(
+                        transferId = parts[1],
+                        senderId = parts[2],
+                        success = success
                     )
                 } else null
             }

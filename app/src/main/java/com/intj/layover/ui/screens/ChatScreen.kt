@@ -47,8 +47,12 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -67,12 +71,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -86,9 +92,14 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
 import com.intj.layover.R
+import com.intj.layover.ble.BlePermissionHelper
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.NearbyPeer
+import com.intj.layover.model.PhotoAttachment
+import com.intj.layover.model.PhotoTransferState
 import com.intj.layover.ui.theme.LayoverTheme
+import com.intj.layover.wifi.PhotoPreviewGenerator
+import java.io.File
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -135,21 +146,29 @@ fun ChatScreen(
     isBlocked: Boolean = false,
     isBlockedByPeer: Boolean = false,
     isMuted: Boolean = false,
+    photoErrorMessage: String? = null,
+    onDismissPhotoError: () -> Unit = {},
     onSendMessage: (text: String, replyToText: String?) -> Unit,
     fallbackAvatarBytes: ByteArray? = null,
     onToggleBlockPeer: (String) -> Unit,
     onToggleMutePeer: (String) -> Unit,
     onOpenPeerProfile: (String) -> Unit = {},
     onSendPhotoUri: (Uri) -> Unit = {},
+    onDownloadPhoto: (transferId: String) -> Unit = {},
+    onCancelPhotoTransfer: (transferId: String) -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     chatTrace("ChatScreen:ENTRY", "peerId=${peer?.id ?: "null"}, messagesCount=${messages.size}, isBlocked=$isBlocked, isBlockedByPeer=$isBlockedByPeer, isMuted=$isMuted")
     val colors = LayoverTheme.colors
+    val context = LocalContext.current
     chatTrace("ChatScreen:THEME", "isDark=${colors.isDark}")
     var inputText by remember { mutableStateOf("") }
     var replyingToMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var showChatMenu by remember { mutableStateOf(false) }
     var showAttachmentSheet by remember { mutableStateOf(false) }
+    var pendingDownloadTransferId by remember { mutableStateOf<String?>(null) }
+    var pendingOpenPhotoPicker by remember { mutableStateOf(false) }
+    var fullScreenPhotoPath by remember { mutableStateOf<String?>(null) }
     val density = LocalDensity.current
     val isInspectionMode = LocalInspectionMode.current
     val imeBottomPx = WindowInsets.ime.getBottom(density)
@@ -160,6 +179,38 @@ fun ChatScreen(
         showAttachmentSheet = false
         if (uri != null) {
             onSendPhotoUri(uri)
+        }
+    }
+    val wifiPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        val shouldOpenPicker = pendingOpenPhotoPicker
+        pendingOpenPhotoPicker = false
+        if (shouldOpenPicker) {
+            photoPickerLauncher.launch(arrayOf("image/*"))
+        }
+        val pendingId = pendingDownloadTransferId
+        pendingDownloadTransferId = null
+        if (pendingId != null) {
+            onDownloadPhoto(pendingId)
+        }
+    }
+
+    val handleAddPhotosClick: () -> Unit = {
+        if (isInspectionMode || BlePermissionHelper.hasWifiHotspotPermissions(context)) {
+            photoPickerLauncher.launch(arrayOf("image/*"))
+        } else {
+            pendingOpenPhotoPicker = true
+            wifiPermissionLauncher.launch(BlePermissionHelper.getWifiHotspotPermissions())
+        }
+    }
+
+    val handleDownloadPhotoClick: (String) -> Unit = { transferId ->
+        if (isInspectionMode || BlePermissionHelper.hasWifiHotspotPermissions(context)) {
+            onDownloadPhoto(transferId)
+        } else {
+            pendingDownloadTransferId = transferId
+            wifiPermissionLauncher.launch(BlePermissionHelper.getWifiHotspotPermissions())
         }
     }
 
@@ -425,10 +476,13 @@ fun ChatScreen(
                         message = msg,
                         onReply = {
                             chatTrace("ChatScreen:MSG_REPLY_CLICK", "msgId=${msg.id}, locked=$isChatLocked")
-                            if (!isChatLocked) {
+                            if (!isChatLocked && msg.text.isNotBlank()) {
                                 replyingToMessage = msg
                             }
-                        }
+                        },
+                        onDownloadPhoto = handleDownloadPhotoClick,
+                        onCancelPhotoTransfer = onCancelPhotoTransfer,
+                        onOpenFullPhoto = { path -> fullScreenPhotoPath = path }
                     )
                 }
             }
@@ -467,6 +521,51 @@ fun ChatScreen(
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium
                         )
+                    }
+                }
+            }
+
+            // Inline photo validation error banner (e.g., "Photo exceeds 3 MB limit")
+            if (!photoErrorMessage.isNullOrBlank()) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    color = Color(0xFF3B1D24),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, Color(0xFFFF5252).copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ErrorOutline,
+                            contentDescription = null,
+                            tint = Color(0xFFFF6E6E),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = photoErrorMessage,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = onDismissPhotoError,
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss photo error",
+                                tint = Color.White.copy(alpha = 0.8f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -625,7 +724,7 @@ fun ChatScreen(
             // Inline bottom overflow panel when the software keyboard is not currently visible
             if (showAttachmentSheet && !isChatLocked && (imeBottomPx == 0 || isInspectionMode)) {
                 ClippyPhotoOverflowCard(
-                    onAddPhotosClick = { photoPickerLauncher.launch(arrayOf("image/*")) },
+                    onAddPhotosClick = handleAddPhotosClick,
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 6.dp, bottom = 4.dp)
@@ -640,8 +739,54 @@ fun ChatScreen(
             KeyboardPhotoOverflowWindow(
                 imeHeightPx = imeBottomPx,
                 onDismissRequest = { showAttachmentSheet = false },
-                onAddPhotosClick = { photoPickerLauncher.launch(arrayOf("image/*")) }
+                onAddPhotosClick = handleAddPhotosClick
             )
+        }
+
+        // Full-screen photo lightbox viewer for crisp downloaded/sent photos
+        fullScreenPhotoPath?.let { path ->
+            val fullBitmap = remember(path) {
+                runCatching { BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+            if (fullBitmap != null) {
+                Dialog(
+                    onDismissRequest = { fullScreenPhotoPath = null },
+                    properties = DialogProperties(usePlatformDefaultWidth = false)
+                ) {
+                    BackHandler { fullScreenPhotoPath = null }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.94f))
+                            .clickable { fullScreenPhotoPath = null }
+                    ) {
+                        Image(
+                            bitmap = fullBitmap,
+                            contentDescription = "Full-screen photo",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp)
+                                .align(Alignment.Center)
+                        )
+                        IconButton(
+                            onClick = { fullScreenPhotoPath = null },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .statusBarsPadding()
+                                .padding(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Close photo",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
+            } else {
+                fullScreenPhotoPath = null
+            }
         }
     }
 }
@@ -821,7 +966,10 @@ private fun ChatScreenLightInputBarPreview() {
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
-    onReply: () -> Unit
+    onReply: () -> Unit,
+    onDownloadPhoto: (transferId: String) -> Unit = {},
+    onCancelPhotoTransfer: (transferId: String) -> Unit = {},
+    onOpenFullPhoto: (localFilePath: String) -> Unit = {}
 ) {
     chatTrace("ChatMessageBubble:ENTRY", "msgId=${message.id}, isOutgoing=${message.isOutgoing}, hasReply=${message.replyToText != null}, textLen=${message.text.length}")
     val colors = LayoverTheme.colors
@@ -847,7 +995,7 @@ fun ChatMessageBubble(
                 .clickable { onReply() }
         ) {
             Column(
-                modifier = Modifier.padding(12.dp)
+                modifier = Modifier.padding(10.dp)
             ) {
                 if (message.replyToText != null) {
                     Surface(
@@ -878,11 +1026,26 @@ fun ChatMessageBubble(
                     }
                 }
 
-                Text(
-                    text = message.text,
-                    color = if (isOutgoing) outgoingTextColor else colors.lightText,
-                    fontSize = 15.sp
-                )
+                message.photoAttachment?.let { photo ->
+                    PhotoBubbleContent(
+                        photo = photo,
+                        isOutgoing = isOutgoing,
+                        onDownloadClick = { onDownloadPhoto(photo.transferId) },
+                        onCancelClick = { onCancelPhotoTransfer(photo.transferId) },
+                        onOpenFullPhoto = onOpenFullPhoto
+                    )
+                    if (message.text.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
+                }
+
+                if (message.text.isNotBlank()) {
+                    Text(
+                        text = message.text,
+                        color = if (isOutgoing) outgoingTextColor else colors.lightText,
+                        fontSize = 15.sp
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
@@ -897,6 +1060,246 @@ fun ChatMessageBubble(
                         fontSize = 10.sp
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhotoBubbleContent(
+    photo: PhotoAttachment,
+    isOutgoing: Boolean,
+    onDownloadClick: () -> Unit,
+    onCancelClick: () -> Unit,
+    onOpenFullPhoto: (localFilePath: String) -> Unit
+) {
+    val colors = LayoverTheme.colors
+    val fullPath = photo.localFilePath?.takeIf { it.isNotBlank() && File(it).exists() }
+    val isCrispReady = photo.state == PhotoTransferState.COMPLETED && fullPath != null
+
+    val fullBitmap = remember(fullPath, isCrispReady, isOutgoing) {
+        if ((isCrispReady || isOutgoing) && fullPath != null) {
+            runCatching { BitmapFactory.decodeFile(fullPath)?.asImageBitmap() }.getOrNull()
+        } else {
+            null
+        }
+    }
+    val previewBitmap = remember(photo.previewBytes) {
+        photo.previewBytes?.takeIf { it.isNotEmpty() }?.let { bytes ->
+            runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
+        }
+    }
+
+    val containerShape = RoundedCornerShape(12.dp)
+    Box(
+        modifier = Modifier
+            .width(220.dp)
+            .height(200.dp)
+            .clip(containerShape)
+            .background(Color(0xFF151B24))
+            .clickable(enabled = isCrispReady && fullPath != null) {
+                if (fullPath != null) onOpenFullPhoto(fullPath)
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            fullBitmap != null -> {
+                Image(
+                    bitmap = fullBitmap,
+                    contentDescription = "Photo attachment",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            previewBitmap != null -> {
+                Image(
+                    bitmap = previewBitmap,
+                    contentDescription = "Photo preview",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blur(16.dp)
+                )
+            }
+        }
+
+        if (!isCrispReady) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.42f))
+            )
+
+            when (photo.state) {
+                PhotoTransferState.AVAILABLE -> {
+                    Surface(
+                        color = colors.cardSurface.copy(alpha = 0.92f),
+                        shape = RoundedCornerShape(24.dp),
+                        modifier = Modifier
+                            .border(1.dp, colors.cyanPrimary, RoundedCornerShape(24.dp))
+                            .clickable { onDownloadClick() }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Download,
+                                contentDescription = "Download photo",
+                                tint = colors.cyanPrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = "Download",
+                                    color = colors.lightText,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = PhotoPreviewGenerator.formatByteSize(photo.fileSizeBytes),
+                                    color = colors.mutedText,
+                                    fontSize = 10.sp
+                                )
+                            }
+                        }
+                    }
+                }
+
+                PhotoTransferState.QUEUED -> {
+                    Surface(
+                        color = colors.cardSurface.copy(alpha = 0.90f),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .padding(horizontal = 10.dp)
+                            .border(1.dp, colors.cyanPrimary.copy(alpha = 0.65f), RoundedCornerShape(18.dp))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(start = 12.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = photo.statusDetail ?: "Waiting for current download...",
+                                color = colors.lightText,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            IconButton(
+                                onClick = onCancelClick,
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Cancel queued download",
+                                    tint = colors.mutedText,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                PhotoTransferState.CONNECTING_WIFI,
+                PhotoTransferState.DOWNLOADING -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            if (photo.state == PhotoTransferState.DOWNLOADING && photo.progress > 0f) {
+                                CircularProgressIndicator(
+                                    progress = { photo.progress.coerceIn(0f, 1f) },
+                                    color = colors.cyanPrimary,
+                                    trackColor = Color.White.copy(alpha = 0.25f),
+                                    modifier = Modifier.size(46.dp),
+                                    strokeWidth = 3.dp
+                                )
+                            } else {
+                                CircularProgressIndicator(
+                                    color = colors.cyanPrimary,
+                                    trackColor = Color.White.copy(alpha = 0.25f),
+                                    modifier = Modifier.size(46.dp),
+                                    strokeWidth = 3.dp
+                                )
+                            }
+                            IconButton(
+                                onClick = onCancelClick,
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Cancel photo download",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val label = photo.statusDetail ?: if (photo.state == PhotoTransferState.DOWNLOADING) {
+                            "Downloading ${(photo.progress * 100).toInt()}%"
+                        } else {
+                            "Connecting Wi-Fi..."
+                        }
+                        Text(
+                            text = label,
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                PhotoTransferState.FAILED -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                        modifier = Modifier.padding(horizontal = 10.dp)
+                    ) {
+                        Surface(
+                            color = Color(0xFF3B1D24).copy(alpha = 0.92f),
+                            shape = RoundedCornerShape(24.dp),
+                            modifier = Modifier
+                                .border(1.dp, Color(0xFFFF6E6E), RoundedCornerShape(24.dp))
+                                .clickable { onDownloadClick() }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = if (isOutgoing) "Retry send" else "Retry download",
+                                    tint = Color(0xFFFF8A80),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isOutgoing) "Send failed · Retry" else "Retry download",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                        val detail = photo.statusDetail?.takeIf {
+                            it.isNotBlank() && it != "Send failed" && it != "Download failed"
+                        }
+                        if (detail != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = detail,
+                                color = Color.White.copy(alpha = 0.88f),
+                                fontSize = 10.sp,
+                                maxLines = 2
+                            )
+                        }
+                    }
+                }
+
+                PhotoTransferState.COMPLETED -> Unit
             }
         }
     }

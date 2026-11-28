@@ -75,7 +75,24 @@ internal fun resolveChatMessagesForPeer(
         val matches = cleanAliases.any { alias -> key.equals(alias, ignoreCase = true) }
         if (matches) {
             for (msg in list) {
-                mergedById.putIfAbsent(msg.id, msg)
+                val existing = mergedById[msg.id]
+                if (existing == null) {
+                    mergedById[msg.id] = msg
+                } else {
+                    val existingAtt = existing.photoAttachment
+                    val newAtt = msg.photoAttachment
+                    val newWins = newAtt != null && (
+                        existingAtt == null ||
+                            (newAtt.state == com.intj.layover.model.PhotoTransferState.COMPLETED &&
+                                existingAtt.state != com.intj.layover.model.PhotoTransferState.COMPLETED) ||
+                            (newAtt.localFilePath != null && existingAtt.localFilePath == null) ||
+                            (newAtt.progress > existingAtt.progress &&
+                                existingAtt.state != com.intj.layover.model.PhotoTransferState.COMPLETED)
+                        )
+                    if (newWins) {
+                        mergedById[msg.id] = msg
+                    }
+                }
             }
         }
     }
@@ -397,13 +414,24 @@ fun LayoverNavGraph(
                 expanded.any { exp -> uiState.mutedPeerIds.any { it.equals(exp, ignoreCase = true) } }
             }
 
+            val photoErrorMessage = uiState.photoErrorsByPeerId.entries
+                .firstOrNull { (key, _) ->
+                    chatAliases.any { alias -> key.equals(alias, ignoreCase = true) }
+                }?.value
+
             ChatScreen(
                 peer = peer,
                 messages = messages,
                 isBlocked = isBlocked,
                 isBlockedByPeer = isBlockedByPeer,
                 isMuted = isMuted,
-                fallbackAvatarBytes = resolvedAvatarBytes,
+                photoErrorMessage = photoErrorMessage,
+                onDismissPhotoError = {
+                    val updatedErrors = uiState.photoErrorsByPeerId.filterKeys { key ->
+                        chatAliases.none { alias -> key.equals(alias, ignoreCase = true) }
+                    }
+                    onUpdateUiState(uiState.copy(photoErrorsByPeerId = updatedErrors))
+                },
                 onSendMessage = { text, replyTo ->
                     uiState.transport.sendMessage(peerId, text)
                     val sentAtMillis = System.currentTimeMillis()
@@ -437,6 +465,7 @@ fun LayoverNavGraph(
                     }
                     onUpdateUiState(uiState.copy(chatMessages = updatedMap))
                 },
+                fallbackAvatarBytes = resolvedAvatarBytes,
                 onToggleBlockPeer = toggleBlockPeer,
                 onToggleMutePeer = toggleMutePeer,
                 onOpenPeerProfile = { targetPeerId ->
@@ -444,6 +473,17 @@ fun LayoverNavGraph(
                     if (routeTarget.isNotBlank()) {
                         navController.navigate(LayoverRoute.PeerProfile.createRoute(routeTarget))
                     }
+                },
+                onSendPhotoUri = { uri ->
+                    val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                    uiState.transport.sendPhoto(targetPeerId, uri.toString())
+                },
+                onDownloadPhoto = { transferId ->
+                    val targetPeerId = peer?.id?.takeIf { it.isNotBlank() } ?: peerId
+                    uiState.transport.downloadPhoto(targetPeerId, transferId)
+                },
+                onCancelPhotoTransfer = { transferId ->
+                    uiState.transport.cancelPhotoTransfer(transferId)
                 },
                 onNavigateBack = {
                     navController.popBackStack()

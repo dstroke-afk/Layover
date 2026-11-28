@@ -15,6 +15,7 @@ import android.os.Build
 import com.intj.layover.diagnostics.LayoverFileLogger
 import com.intj.layover.p2p.P2PMessageFrame
 import com.intj.layover.p2p.RfcommConnectionState
+import com.intj.layover.p2p.WireFrameCodec
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -75,6 +76,10 @@ class GattSessionManager(
         const val MIN_SAFE_GATT_CHUNK_BYTES = 20
         const val MAX_SAFE_GATT_CHUNK_BYTES = 480
         const val MAX_OUTBOUND_FRAME_BYTES = 65_536
+
+        fun isAllowedOutboundFrame(text: String): Boolean {
+            return WireFrameCodec.isValidOutboundFrame(text)
+        }
 
         fun computeSafeChunkSize(negotiatedMtu: Int): Int {
             val mtuPayload = negotiatedMtu - ATT_HEADER_OVERHEAD
@@ -1575,15 +1580,7 @@ class GattSessionManager(
     @SuppressLint("MissingPermission")
     fun sendFrame(text: String, targetAliases: Set<String> = emptySet()): Boolean {
         val frameType = text.substringBefore("|")
-        val isValidPrefix = frameType == "KEY_EXCHANGE" ||
-                frameType == "CONNECTION_REQUEST" ||
-                frameType == "CONNECTION_ACCEPT" ||
-                frameType == "CONNECTION_DECLINE" ||
-                frameType == "PROFILE_SYNC" ||
-                frameType == "PEER_BLOCK_STATE" ||
-                frameType == "CHAT_ENCRYPTED"
-
-        if (!isValidPrefix) {
+        if (!isAllowedOutboundFrame(text)) {
             LayoverFileLogger.logError("Dropping malformed/unframed outbound payload: ${text.take(30)}")
             return false
         }

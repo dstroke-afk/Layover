@@ -31,6 +31,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 object PeerAliasRegistry {
     private val aliasGroups = CopyOnWriteArraySet<MutableSet<String>>()
@@ -189,6 +191,156 @@ class BleProximityTransport(
         age: Int?,
         avatarBytes: ByteArray?
     ) -> Unit)? = null
+
+    var onIncomingPhotoWireFrame: ((senderPeerId: String, frame: WireFrame) -> Unit)? = null
+    var onSendPhotoRequested: ((peerId: String, uriString: String) -> Unit)? = null
+    var onDownloadPhotoRequested: ((peerId: String, transferId: String) -> Unit)? = null
+    var onCancelPhotoRequested: ((transferId: String) -> Unit)? = null
+
+    private val _e2eeSessionReadyFlow = MutableSharedFlow<String>(extraBufferCapacity = 16)
+
+    fun isEncryptedChannelReadyForPeer(peerId: String): Boolean {
+        val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        if (!channelReady) return false
+        return sessionCryptoManager.hasSessionForPeer(peerAliases) &&
+            !sessionCryptoManager.needsReconnectConfirmation(peerAliases)
+    }
+
+    /**
+     * Ensures both the GATT transport link and E2EE key exchange are established for [peerId]
+     * before encrypting/sending photo frames, initiating connection and handshake automatically
+     * instead of requiring a manual text message first.
+     */
+    suspend fun ensureEncryptedChannelReady(
+        peerId: String,
+        timeoutMs: Long = 12_000L
+    ): Boolean {
+        if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return false
+        }
+        if (peerId.isNotBlank()) {
+            activePeerId = peerId
+            linkOutboundPeerAliases(peerId)
+        }
+        if (isEncryptedChannelReadyForPeer(peerId)) {
+            return true
+        }
+
+        val initialAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        val initialChannelReady = gattSessionManager.isReadyForPeer(initialAliases) || gattSessionManager.hasReadyChannel()
+        val initialHasSession = sessionCryptoManager.hasSessionForPeer(initialAliases)
+        val initialNeedsConfirm = sessionCryptoManager.needsReconnectConfirmation(initialAliases)
+
+        LayoverFileLogger.log(
+            "ensureEncryptedChannelReady: establishing GATT/E2EE for peerId=$peerId " +
+                "(channelReady=$initialChannelReady, hasSession=$initialHasSession, needsConfirm=$initialNeedsConfirm, " +
+                "clientConnecting=${gattSessionManager.isClientConnecting()})"
+        )
+
+        if (!initialChannelReady && !gattSessionManager.isClientConnecting() && peerId.isNotBlank()) {
+            connectGattDevice(peerId)
+        } else if (initialChannelReady) {
+            if (!initialHasSession) {
+                synchronized(handshakeLock) { hasSentKeyExchange = false }
+            }
+            initiateE2eeHandshake(isReset = false)
+        }
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var lastConnectAttemptMs = System.currentTimeMillis()
+        while (System.currentTimeMillis() < deadline) {
+            if (isEncryptedChannelReadyForPeer(peerId)) {
+                LayoverFileLogger.log("ensureEncryptedChannelReady: GATT & E2EE ready for peerId=$peerId")
+                return true
+            }
+
+            val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+            val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+            if (channelReady) {
+                if (!sessionCryptoManager.hasSessionForPeer(peerAliases) ||
+                    sessionCryptoManager.needsReconnectConfirmation(peerAliases)
+                ) {
+                    initiateE2eeHandshake(isReset = false)
+                }
+            } else if (!gattSessionManager.isClientConnecting() &&
+                peerId.isNotBlank() &&
+                System.currentTimeMillis() - lastConnectAttemptMs >= 2_500L
+            ) {
+                lastConnectAttemptMs = System.currentTimeMillis()
+                connectGattDevice(peerId)
+            }
+
+            val remaining = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+            withTimeoutOrNull(minOf(250L, remaining)) {
+                _e2eeSessionReadyFlow.first()
+            }
+        }
+
+        val ready = isEncryptedChannelReadyForPeer(peerId)
+        if (!ready) {
+            LayoverFileLogger.logError(
+                "ensureEncryptedChannelReady: timed out after ${timeoutMs}ms for peerId=$peerId " +
+                    "(channelReady=${gattSessionManager.hasReadyChannel()}, e2eeEstablished=$isE2eeEstablished)"
+            )
+        }
+        return ready
+    }
+
+    fun encryptKeyBytesForPeer(peerId: String, keyBytes: ByteArray): EncryptedPayload? {
+        if (peerId.isNotBlank()) {
+            linkOutboundPeerAliases(peerId)
+        }
+        val aliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        return sessionCryptoManager.encryptBytes(keyBytes, aliases)
+    }
+
+    fun decryptKeyBytesFromPeer(peerId: String, payload: EncryptedPayload): ByteArray? {
+        if (peerId.isNotBlank()) {
+            linkOutboundPeerAliases(peerId)
+        }
+        val aliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
+        return sessionCryptoManager.decryptBytes(payload, aliases)
+    }
+
+    fun sendPhotoWireFrame(targetPeerId: String, rawWireFrame: String): Boolean {
+        if (isPeerIdentifierBlocked(targetPeerId, activePeerId, lastGattMac)) {
+            diagnosticsTracker.incrementBlockedDrops()
+            return false
+        }
+        if (targetPeerId.isNotBlank()) {
+            activePeerId = targetPeerId
+            linkOutboundPeerAliases(targetPeerId)
+        }
+        val peerAliases = collectPeerAliases(targetPeerId, activePeerId, lastGattMac)
+        val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        if (!channelReady && !gattSessionManager.isClientConnecting() && targetPeerId.isNotBlank()) {
+            connectGattDevice(targetPeerId)
+        }
+        val sent = gattSessionManager.sendFrame(rawWireFrame, targetAliases = peerAliases)
+        if (sent) {
+            diagnosticsTracker.incrementMessagesSent()
+            diagnosticsTracker.updateLastErrorMessage(null)
+        } else {
+            val frameType = rawWireFrame.substringBefore("|")
+            LayoverFileLogger.logError("sendPhotoWireFrame failed to enqueue/send frame: type=$frameType, targetPeerId=$targetPeerId")
+            diagnosticsTracker.updateLastErrorMessage("Failed to send $frameType frame")
+        }
+        return sent
+    }
+
+    override fun sendPhoto(peerId: String, uriString: String) {
+        onSendPhotoRequested?.invoke(peerId, uriString)
+    }
+
+    override fun downloadPhoto(peerId: String, transferId: String) {
+        onDownloadPhotoRequested?.invoke(peerId, transferId)
+    }
+
+    override fun cancelPhotoTransfer(transferId: String) {
+        onCancelPhotoRequested?.invoke(transferId)
+    }
 
     fun sendProfileSync(targetPeerId: String? = null) {
         val localId = currentUserProfile.handle.ifEmpty { "user" }
@@ -350,6 +502,11 @@ class BleProximityTransport(
                     is WireFrame.ProfileSync -> frame.senderId
                     is WireFrame.PeerBlockState -> frame.senderId
                     is WireFrame.ChatEncrypted -> frame.senderId
+                    is WireFrame.PhotoPreview -> frame.senderId
+                    is WireFrame.PhotoDownloadRequest -> frame.senderId
+                    is WireFrame.WifiApReady -> frame.senderId
+                    is WireFrame.WifiApFallback -> frame.senderId
+                    is WireFrame.PhotoTransferDone -> frame.senderId
                 }
 
                 val frameDisplayName = when (frame) {
@@ -412,7 +569,11 @@ class BleProximityTransport(
                         frame is WireFrame.ConnectionAccept ||
                         frame is WireFrame.ConnectionDecline ||
                         frame is WireFrame.ProfileSync ||
-                        frame is WireFrame.PeerBlockState
+                        frame is WireFrame.PeerBlockState ||
+                        frame is WireFrame.PhotoDownloadRequest ||
+                        frame is WireFrame.WifiApReady ||
+                        frame is WireFrame.WifiApFallback ||
+                        frame is WireFrame.PhotoTransferDone
 
                 if (!isControlFrame && !rateLimiter.allowMessage(effectivePeerId)) {
                     LayoverFileLogger.log("Dropping rate-limited frame from peer: $effectivePeerId")
@@ -544,6 +705,17 @@ class BleProximityTransport(
                             triggerDecryptRecoveryRehandshake(effectivePeerId, peerAliases)
                         }
                     }
+
+                    is WireFrame.PhotoPreview,
+                    is WireFrame.PhotoDownloadRequest,
+                    is WireFrame.WifiApReady,
+                    is WireFrame.WifiApFallback,
+                    is WireFrame.PhotoTransferDone -> {
+                        if (effectivePeerId.isNotEmpty() && frame is WireFrame.PhotoPreview) {
+                            activePeerId = effectivePeerId
+                        }
+                        onIncomingPhotoWireFrame?.invoke(effectivePeerId, frame)
+                    }
                 }
             }
         }
@@ -582,6 +754,7 @@ class BleProximityTransport(
                 diagnosticsTracker.updateKeyHandshakeComplete(true)
                 diagnosticsTracker.updateSessionFingerprint(outcome.fingerprint)
                 diagnosticsTracker.updateLastErrorMessage(null)
+                _e2eeSessionReadyFlow.tryEmit(effectivePeerId)
                 flushPendingRetries()
             } else {
                 LayoverFileLogger.log(
@@ -656,6 +829,7 @@ class BleProximityTransport(
                         "Confirmed existing E2EE session with $effectivePeerId (fingerprint=${outcome.fingerprint}); ignoring duplicate response."
                     )
                 }
+                _e2eeSessionReadyFlow.tryEmit(effectivePeerId)
                 flushPendingRetries()
                 return
             }
@@ -694,6 +868,7 @@ class BleProximityTransport(
                         isReset = frame.isReset
                     )
                 }
+                _e2eeSessionReadyFlow.tryEmit(effectivePeerId)
                 flushPendingRetries()
                 return
             }
