@@ -10,6 +10,7 @@ import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.intj.layover.diagnostics.LayoverFileLogger
+import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.ConnectionStatus
 import com.intj.layover.model.GenderOption
 import com.intj.layover.model.LayoverUiState
@@ -20,6 +21,7 @@ import com.intj.layover.notifications.LayoverNotificationManager
 import com.intj.layover.notifications.NotificationEligibilityEvaluator
 import com.intj.layover.notifications.UnreadMessageTracker
 import com.intj.layover.ui.screens.canonicalDeduplicatePeers
+import com.intj.layover.ui.screens.formatMessageBubbleTimestamp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,6 +47,76 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         private const val KEY_BLOCKED_BY_PEER_IDS = "blocked_by_peer_ids"
         private const val KEY_MUTED_PEER_IDS = "muted_peer_ids"
         private const val KEY_ACCEPTED_PEER_IDS = "accepted_peer_ids"
+        private const val KEY_CHAT_HISTORY = "chat_history_v1"
+        private const val MAX_PERSISTED_MESSAGES_PER_PEER = 200
+
+        internal fun serializeChatHistory(chatMessages: Map<String, List<ChatMessage>>): String {
+            val encoder = java.util.Base64.getEncoder()
+            fun encode(value: String): String = encoder.encodeToString(value.toByteArray(Charsets.UTF_8))
+
+            val lines = ArrayList<String>()
+            for ((peerKey, messages) in chatMessages) {
+                if (peerKey.isBlank() || messages.isEmpty()) continue
+                val trimmed = if (messages.size > MAX_PERSISTED_MESSAGES_PER_PEER) {
+                    messages.takeLast(MAX_PERSISTED_MESSAGES_PER_PEER)
+                } else {
+                    messages
+                }
+                for (msg in trimmed) {
+                    val ts = if (msg.timestampMillis > 0L) msg.timestampMillis else System.currentTimeMillis()
+                    val replyEncoded = msg.replyToText?.let { encode(it) } ?: ""
+                    val outgoingFlag = if (msg.isOutgoing) "1" else "0"
+                    lines.add(
+                        "${encode(peerKey)}|${encode(msg.id)}|${encode(msg.senderId)}|" +
+                            "$ts|$outgoingFlag|${encode(msg.text)}|$replyEncoded"
+                    )
+                }
+            }
+            return lines.joinToString("\n")
+        }
+
+        internal fun deserializeChatHistory(
+            serialized: String?,
+            fallbackNowMillis: Long = System.currentTimeMillis()
+        ): Map<String, List<ChatMessage>> {
+            if (serialized.isNullOrBlank()) return emptyMap()
+            val decoder = java.util.Base64.getDecoder()
+            fun decode(value: String): String = String(decoder.decode(value), Charsets.UTF_8)
+
+            val result = LinkedHashMap<String, MutableList<ChatMessage>>()
+            for (line in serialized.lineSequence()) {
+                if (line.isBlank()) continue
+                val parts = line.split("|")
+                if (parts.size < 6) continue
+                runCatching {
+                    val peerKey = decode(parts[0])
+                    val msgId = decode(parts[1])
+                    val senderId = decode(parts[2])
+                    val parsedTs = parts[3].toLongOrNull() ?: 0L
+                    val effectiveTs = if (parsedTs > 0L) parsedTs else fallbackNowMillis
+                    val isOutgoing = parts[4] == "1"
+                    val text = decode(parts[5])
+                    val replyTo = parts.getOrNull(6)?.takeIf { it.isNotEmpty() }?.let { decode(it) }
+                    if (peerKey.isNotBlank() && msgId.isNotBlank()) {
+                        val list = result.getOrPut(peerKey) { mutableListOf() }
+                        if (list.none { it.id == msgId }) {
+                            list.add(
+                                ChatMessage(
+                                    id = msgId,
+                                    senderId = senderId,
+                                    text = text,
+                                    timestampLabel = formatMessageBubbleTimestamp(effectiveTs),
+                                    isOutgoing = isOutgoing,
+                                    replyToText = replyTo,
+                                    timestampMillis = effectiveTs
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            return result
+        }
 
         @Volatile
         private var instance: LayoverAppRuntime? = null
@@ -179,6 +251,9 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             onRequestAvatarFetch = { device, mapKey, onLoaded ->
                 LayoverFileLogger.log("onRequestAvatarFetch invoked: mapKey=$mapKey, transportReady=${transportRef != null}")
                 transportRef?.requestAvatarFetch(device, mapKey, onLoaded)
+            },
+            isChatSessionActiveOrConnecting = { device, mapKey ->
+                gattSessionManager.isSessionActiveOrConnectingFor(device.address, mapKey)
             }
         )
         bleTransport = BleProximityTransport(
@@ -195,10 +270,13 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
         _hasSetUsername = MutableStateFlow(usernameAlreadySet)
         hasSetUsername = _hasSetUsername.asStateFlow()
 
+        val savedChatHistory = deserializeChatHistory(prefs.getString(KEY_CHAT_HISTORY, null))
+
         _uiState = MutableStateFlow(
             LayoverUiState(
                 userProfile = initialProfile,
                 nearbyPeers = emptyList(),
+                chatMessages = savedChatHistory,
                 blockedPeerIds = savedBlocked,
                 blockedByPeerIds = savedBlockedBy,
                 mutedPeerIds = savedMuted,
@@ -401,8 +479,27 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
             }
         }
 
+        val sanitizedChatMessages = sanitizedState.chatMessages.mapValues { (_, list) ->
+            list.map { msg ->
+                if (msg.timestampMillis <= 0L) {
+                    val safeTs = System.currentTimeMillis()
+                    msg.copy(
+                        timestampMillis = safeTs,
+                        timestampLabel = formatMessageBubbleTimestamp(safeTs)
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+
+        if (sanitizedChatMessages != oldState.chatMessages) {
+            persistChatHistory(sanitizedChatMessages)
+        }
+
         _uiState.value = sanitizedState.copy(
             nearbyPeers = canonicalDeduplicatePeers(updatedNearbyPeers),
+            chatMessages = sanitizedChatMessages,
             unreadCountsByPeerId = unreadTracker.snapshot(),
             transport = bleTransport,
             diagnostics = bleTransport.diagnosticsTracker.diagnosticsState.value
@@ -524,6 +621,15 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
 
     fun clearAcceptedRequestDialog() {
         _acceptedRequestPeer.value = null
+    }
+
+    private fun persistChatHistory(chatMessages: Map<String, List<ChatMessage>>) {
+        runCatching {
+            val encoded = serializeChatHistory(chatMessages)
+            prefs.edit().putString(KEY_CHAT_HISTORY, encoded).apply()
+        }.onFailure { err ->
+            LayoverFileLogger.logError("Failed to persist chat history", err)
+        }
     }
 
     fun surfacePendingConnectionRequestFromNotification(peerId: String, displayName: String) {
@@ -754,25 +860,52 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                 LayoverFileLogger.log("Incoming message collected in runtime: from=$peerId, msgId=${message.id}")
 
                 var matchedPeer: NearbyPeer? = null
+                var updatedKeysCount = 0
                 _uiState.update { state ->
                     val updatedMap = state.chatMessages.toMutableMap()
-                    fun addMsgToKey(key: String) {
-                        if (key.isBlank()) return
-                        val list = updatedMap[key]?.toMutableList() ?: mutableListOf()
-                        if (!list.any { it.id == message.id }) {
-                            list.add(message)
-                            updatedMap[key] = list
-                        }
+                    val targetKeys = LinkedHashSet<String>()
+                    fun collectKey(key: String?) {
+                        if (!key.isNullOrBlank()) targetKeys.add(key.trim())
                     }
 
-                    addMsgToKey(peerId)
-                    PeerAliasRegistry.resolveAliases(peerId).forEach { addMsgToKey(it) }
+                    collectKey(peerId)
+                    PeerAliasRegistry.resolveAliases(peerId).forEach { collectKey(it) }
                     val peer = findMatchingPeer(state.nearbyPeers, peerId)
                     matchedPeer = peer
                     peer?.let { p ->
-                        addMsgToKey(p.id)
-                        if (p.handle.isNotEmpty()) addMsgToKey(p.handle)
-                        if (p.displayName.isNotEmpty()) addMsgToKey(p.displayName)
+                        collectKey(p.id)
+                        collectKey(p.handle)
+                        collectKey(p.displayName)
+                        PeerAliasRegistry.resolveAliases(p.id).forEach { collectKey(it) }
+                    }
+
+                    // Also include any existing map keys that match case-insensitively across aliases
+                    val existingMatchingKeys = updatedMap.keys.filter { existingKey ->
+                        targetKeys.any { target -> existingKey.equals(target, ignoreCase = true) }
+                    }
+                    targetKeys.addAll(existingMatchingKeys)
+
+                    val safeMessage = if (message.timestampMillis <= 0L) {
+                        val safeTs = System.currentTimeMillis()
+                        message.copy(
+                            timestampMillis = safeTs,
+                            timestampLabel = formatMessageBubbleTimestamp(safeTs)
+                        )
+                    } else {
+                        message
+                    }
+
+                    for (key in targetKeys) {
+                        val list = updatedMap[key]?.toMutableList() ?: mutableListOf()
+                        if (!list.any { it.id == safeMessage.id }) {
+                            list.add(safeMessage)
+                            updatedMap[key] = list
+                            updatedKeysCount++
+                        }
+                    }
+
+                    if (updatedKeysCount > 0) {
+                        persistChatHistory(updatedMap)
                     }
 
                     val unreadCandidates = listOfNotNull(
@@ -797,6 +930,11 @@ class LayoverAppRuntime private constructor(private val appContext: Context) {
                         unreadCountsByPeerId = updatedUnread
                     )
                 }
+
+                LayoverFileLogger.log(
+                    "Runtime UI state updated for incoming CHAT_ENCRYPTED: from=$peerId, " +
+                        "matchedPeerId=${matchedPeer?.id}, msgId=${message.id}, keysUpdated=$updatedKeysCount"
+                )
 
                 val currentState = _uiState.value
                 val senderCandidates = listOfNotNull(

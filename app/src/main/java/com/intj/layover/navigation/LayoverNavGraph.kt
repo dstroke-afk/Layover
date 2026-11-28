@@ -39,6 +39,7 @@ import com.intj.layover.ui.screens.PeopleAroundScreen
 import com.intj.layover.ui.screens.ProfileScreen
 import com.intj.layover.ui.screens.ScanScreen
 import com.intj.layover.ui.screens.canonicalDeduplicatePeers
+import com.intj.layover.ui.screens.formatMessageBubbleTimestamp
 import com.intj.layover.ui.theme.LayoverTheme
 
 sealed class LayoverRoute(val route: String) {
@@ -58,6 +59,27 @@ sealed class LayoverRoute(val route: String) {
             fun createRoute(peerId: String) = "chat/$peerId"
         }
     }
+}
+
+internal fun resolveChatMessagesForPeer(
+    chatMessages: Map<String, List<ChatMessage>>,
+    candidateAliases: Collection<String?>
+): List<ChatMessage> {
+    val cleanAliases = candidateAliases
+        .mapNotNull { it?.trim()?.takeIf { s -> s.isNotEmpty() } }
+        .toSet()
+    if (cleanAliases.isEmpty() || chatMessages.isEmpty()) return emptyList()
+
+    val mergedById = LinkedHashMap<String, ChatMessage>()
+    for ((key, list) in chatMessages) {
+        val matches = cleanAliases.any { alias -> key.equals(alias, ignoreCase = true) }
+        if (matches) {
+            for (msg in list) {
+                mergedById.putIfAbsent(msg.id, msg)
+            }
+        }
+    }
+    return mergedById.values.toList()
 }
 
 @Composable
@@ -340,9 +362,23 @@ fun LayoverNavGraph(
             val resolvedAvatarBytes = matchingPeers
                 .firstNotNullOfOrNull { it.avatar.avatarBase64OrBytes?.takeIf { b -> b.isNotEmpty() } }
 
-            val messages = uiState.chatMessages[peerId]
-                ?: peer?.let { uiState.chatMessages[it.id] ?: uiState.chatMessages[it.handle] }
-                ?: emptyList()
+            val chatAliases = LinkedHashSet<String>().apply {
+                addAll(queryAliases)
+                peer?.id?.takeIf { it.isNotBlank() }?.let {
+                    add(it)
+                    addAll(PeerAliasRegistry.resolveAliases(it))
+                }
+                peer?.handle?.takeIf { it.isNotBlank() }?.let {
+                    add(it)
+                    addAll(PeerAliasRegistry.resolveAliases(it))
+                }
+                peer?.displayName?.takeIf { it.isNotBlank() }?.let { add(it) }
+            }
+
+            val messages = resolveChatMessagesForPeer(
+                chatMessages = uiState.chatMessages,
+                candidateAliases = chatAliases
+            )
 
             val isBlocked = (uiState.transport as? com.intj.layover.ble.BleProximityTransport)
                 ?.isPeerIdentifierBlocked(peerId, peer?.id, peer?.handle, peer?.displayName)
@@ -370,20 +406,34 @@ fun LayoverNavGraph(
                 fallbackAvatarBytes = resolvedAvatarBytes,
                 onSendMessage = { text, replyTo ->
                     uiState.transport.sendMessage(peerId, text)
+                    val sentAtMillis = System.currentTimeMillis()
                     val newMsg = ChatMessage(
-                        id = "msg_${System.currentTimeMillis()}",
+                        id = "msg_$sentAtMillis",
                         senderId = "user",
                         text = text,
-                        timestampLabel = "Just now",
+                        timestampLabel = formatMessageBubbleTimestamp(sentAtMillis),
                         isOutgoing = true,
-                        replyToText = replyTo
+                        replyToText = replyTo,
+                        timestampMillis = sentAtMillis
                     )
                     val updatedMap = uiState.chatMessages.toMutableMap()
-                    val currentList = updatedMap[peerId]?.toMutableList() ?: mutableListOf()
-                    currentList.add(newMsg)
-                    updatedMap[peerId] = currentList
-                    if (peer != null) {
-                        updatedMap[peer.id] = currentList
+                    val baseMessages = resolveChatMessagesForPeer(updatedMap, chatAliases).toMutableList()
+                    if (!baseMessages.any { it.id == newMsg.id }) {
+                        baseMessages.add(newMsg)
+                    }
+                    val writeKeys = LinkedHashSet<String>().apply {
+                        add(peerId)
+                        peer?.id?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        peer?.handle?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        addAll(chatAliases)
+                        updatedMap.keys.filter { existingKey ->
+                            chatAliases.any { alias -> existingKey.equals(alias, ignoreCase = true) }
+                        }.forEach { add(it) }
+                    }
+                    writeKeys.forEach { key ->
+                        if (key.isNotBlank()) {
+                            updatedMap[key] = baseMessages
+                        }
                     }
                     onUpdateUiState(uiState.copy(chatMessages = updatedMap))
                 },

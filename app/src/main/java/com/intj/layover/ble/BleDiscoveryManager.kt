@@ -127,14 +127,18 @@ class BleDiscoveryManager(
 
     fun getDiscoveredDevice(peerId: String): BluetoothDevice? {
         val aliases = PeerAliasRegistry.resolveAliases(peerId) + peerId
-        val record = aliases.firstNotNullOfOrNull { key ->
-            peerMap[key] ?: peerMap.values.find {
-                it.peer.id.equals(key, ignoreCase = true) ||
-                        it.peer.handle.equals(key, ignoreCase = true) ||
-                        it.device.address.equals(key, ignoreCase = true)
+        val matchingRecords = peerMap.entries.filter { (mapKey, record) ->
+            aliases.any { key ->
+                mapKey.equals(key, ignoreCase = true) ||
+                    record.peer.id.equals(key, ignoreCase = true) ||
+                    record.peer.handle.equals(key, ignoreCase = true) ||
+                    record.device.address.equals(key, ignoreCase = true) ||
+                    (record.peer.displayName.isNotBlank() &&
+                        !record.peer.displayName.startsWith("Layover Peer (", ignoreCase = true) &&
+                        record.peer.displayName.equals(key, ignoreCase = true))
             }
-        }
-        return record?.device
+        }.map { it.value }
+        return matchingRecords.maxByOrNull { it.lastSeenTimestamp }?.device
     }
 
     fun findDiscoveredPeer(peerId: String): NearbyPeer? {
@@ -494,11 +498,19 @@ class BleDiscoveryManager(
             )
         )
 
+        val previousMac = existingRecord?.device?.address
+        if (previousMac != null && !previousMac.equals(macAddress, ignoreCase = true)) {
+            LayoverFileLogger.log(
+                "BLE RPA MAC rotation detected for Key=$mapKey ($resolvedName): $previousMac -> $macAddress"
+            )
+        }
+
         PeerAliasRegistry.linkAliases(
             listOfNotNull(
                 mapKey,
                 payload?.instanceIdHex,
                 macAddress,
+                previousMac,
                 existingRecord?.peer?.id,
                 existingRecord?.peer?.handle,
                 resolvedName.takeUnless { it.startsWith("Layover Peer (", ignoreCase = true) }

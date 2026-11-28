@@ -89,8 +89,36 @@ import com.intj.layover.R
 import com.intj.layover.model.ChatMessage
 import com.intj.layover.model.NearbyPeer
 import com.intj.layover.ui.theme.LayoverTheme
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import kotlin.math.abs
 
 private const val TAG = "LayoverChatTrace"
+private const val ONE_DAY_MILLIS = 24L * 60L * 60L * 1000L
+
+/**
+ * Formats a chat bubble arrival/delivery timestamp in the device's local timezone and default locale:
+ * - Same local calendar day and within 24 hours: `h:mm a` (e.g., `1:35 PM`)
+ * - Previous calendar day or older than 24 hours: `d MMM, h:mm a` (e.g., `27 Nov, 1:35 PM`)
+ * - Invalid/unset (`<= 0L`) timestamps fall back to [nowMillis] instead of `"Just now"`.
+ */
+fun formatMessageBubbleTimestamp(
+    timestampMillis: Long,
+    nowMillis: Long = System.currentTimeMillis(),
+    zoneId: ZoneId = ZoneId.systemDefault(),
+    locale: Locale = Locale.getDefault()
+): String {
+    val safeNowMillis = if (nowMillis > 0L) nowMillis else System.currentTimeMillis()
+    val effectiveMillis = if (timestampMillis > 0L) timestampMillis else safeNowMillis
+    val msgDateTime = Instant.ofEpochMilli(effectiveMillis).atZone(zoneId)
+    val nowDateTime = Instant.ofEpochMilli(safeNowMillis).atZone(zoneId)
+    val isSameLocalDay = msgDateTime.toLocalDate() == nowDateTime.toLocalDate()
+    val isTodayAndWithin24Hours = isSameLocalDay && abs(safeNowMillis - effectiveMillis) < ONE_DAY_MILLIS
+    val pattern = if (isTodayAndWithin24Hours) "h:mm a" else "d MMM, h:mm a"
+    return DateTimeFormatter.ofPattern(pattern, locale).format(msgDateTime)
+}
 
 private fun chatTrace(step: String, detail: String = "") {
     if (detail.isEmpty()) {
@@ -862,8 +890,9 @@ fun ChatMessageBubble(
                     modifier = Modifier.align(Alignment.End),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    val formattedTime = formatMessageBubbleTimestamp(message.timestampMillis)
                     Text(
-                        text = message.timestampLabel,
+                        text = formattedTime,
                         color = if (isOutgoing) outgoingTextColor.copy(alpha = 0.75f) else colors.mutedText,
                         fontSize = 10.sp
                     )

@@ -19,6 +19,7 @@ import com.intj.layover.p2p.RfcommConnectionState
 import com.intj.layover.p2p.WireFrame
 import com.intj.layover.p2p.WireFrameCodec
 import com.intj.layover.safety.PeerRateLimiter
+import com.intj.layover.ui.screens.formatMessageBubbleTimestamp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,8 +30,11 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 
+import kotlinx.coroutines.delay
+
 object PeerAliasRegistry {
     private val aliasGroups = CopyOnWriteArraySet<MutableSet<String>>()
+    private val macRegex = Regex("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
     private fun isValidAlias(value: String?): Boolean {
         if (value == null) return false
@@ -55,6 +59,19 @@ object PeerAliasRegistry {
         return out
     }
 
+    private fun extractDevIds(values: Collection<String>): Set<String> {
+        return values.filter { it.startsWith("dev_", ignoreCase = true) }
+            .map { it.lowercase() }
+            .toSet()
+    }
+
+    private fun hasConflictingDevIds(a: Collection<String>, b: Collection<String>): Boolean {
+        val devA = extractDevIds(a)
+        val devB = extractDevIds(b)
+        return devA.isNotEmpty() && devB.isNotEmpty() && devA.intersect(devB).isEmpty()
+    }
+
+    @Synchronized
     fun linkAliases(rawAliases: Collection<String?>) {
         val clean = linkedSetOf<String>()
         for (raw in rawAliases) {
@@ -64,7 +81,8 @@ object PeerAliasRegistry {
         if (clean.isEmpty()) return
 
         val overlapping = aliasGroups.filter { group ->
-            group.any { existing -> clean.any { candidate -> existing.equals(candidate, ignoreCase = true) } }
+            !hasConflictingDevIds(group, clean) &&
+                group.any { existing -> clean.any { candidate -> existing.equals(candidate, ignoreCase = true) } }
         }
 
         val merged = linkedSetOf<String>().apply {
@@ -76,18 +94,42 @@ object PeerAliasRegistry {
         aliasGroups.add(merged)
     }
 
+    @Synchronized
     fun resolveAliases(identifier: String?): Set<String> {
         if (!isValidAlias(identifier)) return emptySet()
         val seeds = expandSeedWithDerivedInstanceId(identifier!!.trim())
         val result = linkedSetOf<String>().apply { addAll(seeds) }
 
         aliasGroups.filter { group ->
-            group.any { existing -> seeds.any { seed -> existing.equals(seed, ignoreCase = true) } }
+            !hasConflictingDevIds(group, seeds) &&
+                group.any { existing -> seeds.any { seed -> existing.equals(seed, ignoreCase = true) } }
         }.forEach { group ->
             result.addAll(group)
         }
 
         return result
+    }
+
+    @Synchronized
+    fun resolveMacAddresses(identifier: String?): Set<String> {
+        return resolveAliases(identifier)
+            .filter { macRegex.matches(it) }
+            .toSet()
+    }
+
+    @Synchronized
+    fun areSamePeer(first: String?, second: String?): Boolean {
+        if (!isValidAlias(first) || !isValidAlias(second)) return false
+        if (first!!.trim().equals(second!!.trim(), ignoreCase = true)) return true
+        val firstAliases = resolveAliases(first)
+        val secondAliases = resolveAliases(second)
+        if (hasConflictingDevIds(firstAliases, secondAliases)) return false
+        return firstAliases.any { a -> secondAliases.any { b -> a.equals(b, ignoreCase = true) } }
+    }
+
+    @Synchronized
+    fun clear() {
+        aliasGroups.clear()
     }
 }
 
@@ -162,7 +204,8 @@ class BleProximityTransport(
         if (targetPeerId != null && targetPeerId.isNotBlank()) {
             activePeerId = targetPeerId
         }
-        val sent = gattSessionManager.sendFrame(frame)
+        val targetAliases = collectPeerAliases(targetPeerId, activePeerId, lastGattMac)
+        val sent = gattSessionManager.sendFrame(frame, targetAliases)
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
         }
@@ -250,6 +293,14 @@ class BleProximityTransport(
 
         gattSessionManager.onGattReady = {
             initiateE2eeHandshake(isReset = false)
+            scope.launch {
+                delay(500)
+                resumeScanningIfEligible()
+            }
+        }
+
+        gattSessionManager.onReconnectRequested = { failedMac, reason ->
+            handleGattReconnectRequest(failedMac, reason)
         }
 
         scope.launch {
@@ -270,6 +321,7 @@ class BleProximityTransport(
                     if (state == RfcommConnectionState.FAILED) {
                         diagnosticsTracker.updateLastErrorMessage("GATT connection failed")
                     }
+                    resumeScanningIfEligible()
                 }
             }
         }
@@ -311,6 +363,8 @@ class BleProximityTransport(
                     ?: discoveryManager.findDiscoveredPeer(rawSenderMac)
                     ?: frameDisplayName.takeIf { it.isNotBlank() }?.let { discoveryManager.findDiscoveredPeer(it) }
                     ?: activePeerId?.takeIf { activeMatchesSender }?.let { discoveryManager.findDiscoveredPeer(it) }
+                val latestDiscoveredMac = discoveryManager.getDiscoveredDevice(frameSenderId)?.address
+                    ?: matchedDiscovered?.id?.let { discoveryManager.getDiscoveredDevice(it)?.address }
 
                 if (BluetoothAdapter.checkBluetoothAddress(rawSenderMac)) {
                     lastGattMac = rawSenderMac
@@ -320,6 +374,7 @@ class BleProximityTransport(
                     add(rawSenderMac)
                     add(frameSenderId)
                     if (frameDisplayName.isNotEmpty()) add(frameDisplayName)
+                    latestDiscoveredMac?.let { add(it) }
                     matchedDiscovered?.id?.let { add(it) }
                     matchedDiscovered?.handle?.takeIf { it.isNotEmpty() }?.let { add(it) }
                     matchedDiscovered?.displayName?.takeIf { it.isNotEmpty() }?.let { add(it) }
@@ -461,14 +516,19 @@ class BleProximityTransport(
 
                         if (decryptedText != null) {
                             consecutiveDecryptRecoveries.remove(canonicalRecoveryKey(effectivePeerId))
-                            LayoverFileLogger.log("Successfully decrypted chat message from $effectivePeerId (msgId=${frame.msgId})")
+                            LayoverFileLogger.log(
+                                "DISPATCH CHAT_ENCRYPTED -> UI/flow: msgId=${frame.msgId}, effectivePeerId=$effectivePeerId, " +
+                                    "frameSenderId=${frame.senderId}, rawSenderMac=$rawSenderMac, aliases=$peerAliases"
+                            )
                             diagnosticsTracker.updateLastErrorMessage(null)
+                            val arrivalMillis = System.currentTimeMillis()
                             val newMsg = ChatMessage(
                                 id = frame.msgId,
                                 senderId = effectivePeerId,
                                 text = decryptedText,
-                                timestampLabel = "Just now",
-                                isOutgoing = false
+                                timestampLabel = formatMessageBubbleTimestamp(arrivalMillis),
+                                isOutgoing = false,
+                                timestampMillis = arrivalMillis
                             )
                             _incomingMessagesFlow.emit(Pair(effectivePeerId, newMsg))
                         } else {
@@ -681,7 +741,7 @@ class BleProximityTransport(
             isReset = isReset
         )
         LayoverFileLogger.log("Sending KeyExchange response to peer=$peerId (algo=$algo, isReset=$isReset)")
-        gattSessionManager.sendFrame(responsePayload)
+        gattSessionManager.sendFrame(responsePayload, collectPeerAliases(peerId, activePeerId, lastGattMac))
     }
 
     private fun triggerDecryptRecoveryRehandshake(peerId: String, peerAliases: Set<String>) {
@@ -749,7 +809,7 @@ class BleProximityTransport(
             senderId = localId,
             blocked = blocked
         )
-        val sent = gattSessionManager.sendFrame(frame)
+        val sent = gattSessionManager.sendFrame(frame, collectPeerAliases(peerId, activePeerId, lastGattMac))
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
         }
@@ -806,7 +866,7 @@ class BleProximityTransport(
             isResponse = false,
             isReset = isReset
         )
-        val sent = gattSessionManager.sendFrame(keyExchangePayload)
+        val sent = gattSessionManager.sendFrame(keyExchangePayload, activeAliases)
         if (sent) {
             diagnosticsTracker.incrementMessagesSent()
             if (!isReset) {
@@ -927,7 +987,7 @@ class BleProximityTransport(
             gender = currentUserProfile.gender,
             age = currentUserProfile.age
         )
-        gattSessionManager.sendFrame(reqFrame)
+        gattSessionManager.sendFrame(reqFrame, peerAliases)
         sendProfileSync(peerId)
     }
 
@@ -954,7 +1014,7 @@ class BleProximityTransport(
         val acceptFrame = WireFrameCodec.encodeConnectionAccept(
             senderId = currentUserProfile.handle.ifEmpty { "user" }
         )
-        gattSessionManager.sendFrame(acceptFrame)
+        gattSessionManager.sendFrame(acceptFrame, peerAliases)
         sendProfileSync(peerId)
     }
 
@@ -964,7 +1024,50 @@ class BleProximityTransport(
         val declineFrame = WireFrameCodec.encodeConnectionDecline(
             senderId = currentUserProfile.handle.ifEmpty { "user" }
         )
-        gattSessionManager.sendFrame(declineFrame)
+        gattSessionManager.sendFrame(declineFrame, collectPeerAliases(peerId, activePeerId, lastGattMac))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun resumeScanningIfEligible() {
+        if (!BlePermissionHelper.hasAllRequiredPermissions(context)) return
+        if (bluetoothAdapter?.isEnabled != true) return
+        if (!bleStateController.statusState.value.isScanning) {
+            LayoverFileLogger.log("Resuming BLE scanning to track peer RPA MAC rotations.")
+            discoveryManager.startScanning()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleGattReconnectRequest(failedMac: String?, reason: String): Boolean {
+        val targetPeerId = activePeerId ?: failedMac
+        LayoverFileLogger.log(
+            "GATT reconnect/fallback requested: targetPeerId=$targetPeerId, failedMac=$failedMac, reason=$reason"
+        )
+        if (targetPeerId.isNullOrBlank()) {
+            resumeScanningIfEligible()
+            return false
+        }
+        if (!BlePermissionHelper.hasAllRequiredPermissions(context) || bluetoothAdapter?.isEnabled != true) {
+            return false
+        }
+
+        val freshDevice = discoveryManager.getDiscoveredDevice(targetPeerId)
+        if (freshDevice != null) {
+            val rotated = failedMac != null && !freshDevice.address.equals(failedMac, ignoreCase = true)
+            LayoverFileLogger.log(
+                "GATT reconnect resolved peer device: targetPeerId=$targetPeerId, mac=${freshDevice.address}, " +
+                    "rotatedFromFailedMac=$rotated (failedMac=$failedMac)"
+            )
+            lastGattMac = freshDevice.address
+            PeerAliasRegistry.linkAliases(listOfNotNull(targetPeerId, failedMac, freshDevice.address))
+            discoveryManager.stopScanning()
+            gattSessionManager.connectToDevice(freshDevice)
+            return true
+        }
+
+        LayoverFileLogger.log("GATT reconnect: no cached BluetoothDevice for $targetPeerId; resuming BLE scan for fresh RPA MAC.")
+        resumeScanningIfEligible()
+        return false
     }
 
     @SuppressLint("MissingPermission")
@@ -985,25 +1088,29 @@ class BleProximityTransport(
             return
         }
 
-        val isMacAddress = BluetoothAdapter.checkBluetoothAddress(peerId)
-        if (isMacAddress) {
-            lastGattMac = peerId
-            PeerAliasRegistry.linkAliases(listOf(peerId))
+        val resolvedMac = PeerAliasRegistry.resolveMacAddresses(peerId).lastOrNull()
+            ?: peerId.takeIf { BluetoothAdapter.checkBluetoothAddress(it) }
+        if (resolvedMac != null) {
+            lastGattMac = resolvedMac
+            PeerAliasRegistry.linkAliases(listOf(peerId, resolvedMac))
             val device = try {
-                adapter.getRemoteDevice(peerId)
+                adapter.getRemoteDevice(resolvedMac)
             } catch (e: Exception) {
-                LayoverFileLogger.logError("Failed to get remote device for MAC=$peerId", e)
+                LayoverFileLogger.logError("Failed to get remote device for MAC=$resolvedMac", e)
                 null
             }
 
             if (device != null) {
+                LayoverFileLogger.log("Connecting GATT client to resolved alias MAC=$resolvedMac for peerId=$peerId")
                 discoveryManager.stopScanning()
                 gattSessionManager.connectToDevice(device)
             } else {
+                resumeScanningIfEligible()
                 gattSessionManager.startServer()
             }
         } else {
-            LayoverFileLogger.log("PeerId $peerId is not a Bluetooth MAC address. Ensuring GATT server is listening.")
+            LayoverFileLogger.log("PeerId $peerId has no known Bluetooth MAC yet. Resuming scan & ensuring GATT server is listening.")
+            resumeScanningIfEligible()
             gattSessionManager.startServer()
         }
     }
@@ -1028,7 +1135,6 @@ class BleProximityTransport(
     }
 
     override fun sendMessage(peerId: String, text: String) {
-        LayoverFileLogger.log("sendMessage to peerId=$peerId")
         if (isPeerIdentifierBlocked(peerId, activePeerId, lastGattMac)) {
             diagnosticsTracker.incrementBlockedDrops()
             return
@@ -1038,8 +1144,16 @@ class BleProximityTransport(
         }
         linkOutboundPeerAliases(peerId)
         val peerAliases = collectPeerAliases(peerId, activePeerId, lastGattMac)
-        val channelReady = gattSessionManager.isReadyForPeer(peerAliases) || gattSessionManager.hasReadyChannel()
+        val readyForPeer = gattSessionManager.isReadyForPeer(peerAliases)
+        val channelReady = readyForPeer || gattSessionManager.hasReadyChannel()
         val needsConfirm = sessionCryptoManager.needsReconnectConfirmation(peerAliases)
+        val routePlan = gattSessionManager.inspectOutboundRoutePlan(peerAliases)
+
+        LayoverFileLogger.log(
+            "sendMessage routing for peerId=$peerId: primary=${routePlan.primary}, fallback=${routePlan.fallback}, " +
+                "channelReady=$channelReady, readyForPeer=$readyForPeer, needsConfirm=$needsConfirm, " +
+                "clientConnecting=${gattSessionManager.isClientConnecting()}, aliases=$peerAliases"
+        )
 
         if (!channelReady || needsConfirm) {
             LayoverFileLogger.log(
@@ -1047,10 +1161,7 @@ class BleProximityTransport(
                     "(channelReady=$channelReady, needsConfirm=$needsConfirm)."
             )
             pendingEncryptedRetries.add(peerId to text)
-            if (!channelReady &&
-                (gattSessionManager.connectionState.value == RfcommConnectionState.DISCONNECTED ||
-                    gattSessionManager.connectionState.value == RfcommConnectionState.FAILED)
-            ) {
+            if (!channelReady && !gattSessionManager.isClientConnecting()) {
                 connectGattDevice(peerId)
             } else if (channelReady) {
                 initiateE2eeHandshake(isReset = false)
@@ -1069,7 +1180,7 @@ class BleProximityTransport(
                 timestamp = System.currentTimeMillis(),
                 payload = encryptedPayload
             )
-            val sent = gattSessionManager.sendFrame(wirePayload)
+            val sent = gattSessionManager.sendFrame(wirePayload, targetAliases = peerAliases)
             if (sent) {
                 diagnosticsTracker.incrementMessagesSent()
                 diagnosticsTracker.updateLastErrorMessage(null)
@@ -1082,9 +1193,7 @@ class BleProximityTransport(
             if (gattSessionManager.hasReadyChannel()) {
                 synchronized(handshakeLock) { hasSentKeyExchange = false }
                 initiateE2eeHandshake(isReset = false)
-            } else if (gattSessionManager.connectionState.value == RfcommConnectionState.DISCONNECTED ||
-                gattSessionManager.connectionState.value == RfcommConnectionState.FAILED
-            ) {
+            } else if (!gattSessionManager.isClientConnecting()) {
                 connectGattDevice(peerId)
             }
             diagnosticsTracker.updateLastErrorMessage("E2EE key session missing - re-initiating handshake")

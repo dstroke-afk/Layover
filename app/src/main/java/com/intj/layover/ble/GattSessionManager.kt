@@ -36,6 +36,17 @@ import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
+enum class GattOutboundRoute {
+    CLIENT_WRITE,
+    SERVER_NOTIFY,
+    NONE
+}
+
+data class GattOutboundRoutePlan(
+    val primary: GattOutboundRoute,
+    val fallback: GattOutboundRoute = GattOutboundRoute.NONE
+)
+
 data class GattReadinessSnapshot(
     val hasActiveClient: Boolean,
     val clientConnected: Boolean,
@@ -87,27 +98,100 @@ class GattSessionManager(
             return chunks
         }
 
+        fun isClientReadyForOutbound(snapshot: GattReadinessSnapshot): Boolean {
+            return snapshot.hasActiveClient &&
+                snapshot.connectionState == RfcommConnectionState.CONNECTED &&
+                snapshot.clientConnected &&
+                snapshot.clientServicesDiscovered &&
+                snapshot.clientRxAvailable &&
+                !snapshot.clientDescriptorWriteInFlight &&
+                snapshot.clientNotificationsReady
+        }
+
+        fun isServerReadyForOutbound(snapshot: GattReadinessSnapshot): Boolean {
+            return snapshot.hasActiveServer &&
+                snapshot.connectionState == RfcommConnectionState.CONNECTED &&
+                snapshot.serverHasSubscribedClient
+        }
+
+        /**
+         * Selects primary and fallback outbound GATT delivery routes:
+         * - When a GATT client is connected and actively discovering services/subscribing, holds flush
+         *   until client setup completes (preventing premature races during initial handshake).
+         * - When both GATT client and GATT server are ready, enables automatic fallback to the
+         *   opposite GATT direction if the primary direction fails.
+         * - When no client is active (or a client hasn't connected yet) and GATT server has a
+         *   subscribed peer, routes via GATT Server notify.
+         */
+        fun selectOutboundRoutePlan(
+            snapshot: GattReadinessSnapshot,
+            preferServer: Boolean = false
+        ): GattOutboundRoutePlan {
+            val clientReady = isClientReadyForOutbound(snapshot)
+            val serverReady = isServerReadyForOutbound(snapshot)
+            return when {
+                clientReady && serverReady -> {
+                    if (preferServer) {
+                        GattOutboundRoutePlan(
+                            primary = GattOutboundRoute.SERVER_NOTIFY,
+                            fallback = GattOutboundRoute.CLIENT_WRITE
+                        )
+                    } else {
+                        GattOutboundRoutePlan(
+                            primary = GattOutboundRoute.CLIENT_WRITE,
+                            fallback = GattOutboundRoute.SERVER_NOTIFY
+                        )
+                    }
+                }
+                clientReady -> GattOutboundRoutePlan(
+                    primary = GattOutboundRoute.CLIENT_WRITE,
+                    fallback = GattOutboundRoute.NONE
+                )
+                (!snapshot.hasActiveClient || !snapshot.clientConnected) && serverReady -> GattOutboundRoutePlan(
+                    primary = GattOutboundRoute.SERVER_NOTIFY,
+                    fallback = GattOutboundRoute.NONE
+                )
+                else -> GattOutboundRoutePlan(
+                    primary = GattOutboundRoute.NONE,
+                    fallback = GattOutboundRoute.NONE
+                )
+            }
+        }
+
         /**
          * Strict readiness gate:
-         * - When a GATT client connection is active/in-progress, NEVER flush (and never fall back to
-         *   server readiness) until the client is connected, Layover service & RX characteristic are
-         *   discovered, no descriptor write is in flight, and notification subscription completed.
-         * - When operating solely as a GATT server, ONLY flush once a peer client has subscribed to
-         *   CCCD (0x2902) notifications.
+         * - When a GATT client connection is connected and mid-discovery/subscription, waits before
+         *   flushing.
+         * - Otherwise allows flushing whenever either a ready GATT client or a subscribed GATT
+         *   server channel is available.
          */
         fun canFlushOutboundQueue(snapshot: GattReadinessSnapshot): Boolean {
-            return if (snapshot.hasActiveClient) {
-                snapshot.connectionState == RfcommConnectionState.CONNECTED &&
-                    snapshot.clientConnected &&
-                    snapshot.clientServicesDiscovered &&
-                    snapshot.clientRxAvailable &&
-                    !snapshot.clientDescriptorWriteInFlight &&
-                    snapshot.clientNotificationsReady
-            } else {
-                snapshot.hasActiveServer &&
-                    snapshot.connectionState == RfcommConnectionState.CONNECTED &&
-                    snapshot.serverHasSubscribedClient
+            return selectOutboundRoutePlan(snapshot).primary != GattOutboundRoute.NONE
+        }
+
+        /**
+         * Orders subscribed GATT Server client addresses so addresses matching the target peer's
+         * known aliases/MACs are notified first (newest subscription first), followed by any other
+         * active subscribed clients as a resilience fallback across unlinked RPA MAC rotations.
+         */
+        fun selectServerNotificationTargets(
+            subscribedAddresses: List<String>,
+            preferredAliases: Set<String>
+        ): List<String> {
+            if (subscribedAddresses.isEmpty()) return emptyList()
+            val dedupedNewestFirst = LinkedHashMap<String, String>()
+            for (addr in subscribedAddresses.asReversed()) {
+                val clean = addr.trim()
+                if (clean.isNotEmpty()) {
+                    dedupedNewestFirst.putIfAbsent(clean.lowercase(), clean)
+                }
             }
+            val ordered = dedupedNewestFirst.values.toList()
+            if (preferredAliases.isEmpty()) return ordered
+            val normalizedAliases = preferredAliases.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
+            val matching = ordered.filter { it.lowercase() in normalizedAliases }
+            val others = ordered.filterNot { it.lowercase() in normalizedAliases }
+            return matching + others
         }
 
         /**
@@ -140,6 +224,7 @@ class GattSessionManager(
     val incomingMessages: SharedFlow<P2PMessageFrame> = _incomingMessages.asSharedFlow()
 
     var onGattReady: (() -> Unit)? = null
+    var onReconnectRequested: ((failedMac: String?, reason: String) -> Boolean)? = null
     var compactAvatarBytesProvider: (() -> ByteArray?)? = null
 
     private var gattServer: BluetoothGattServer? = null
@@ -150,8 +235,9 @@ class GattSessionManager(
 
     private val incomingBuffers = ConcurrentHashMap<String, MutableList<Byte>>()
     private val pendingOutboundFrames = ConcurrentLinkedDeque<String>()
+    private val frameTargetAliases = ConcurrentHashMap<String, Set<String>>()
     private val isFlushingQueue = AtomicBoolean(false)
-    private val subscribedClients = mutableSetOf<BluetoothDevice>()
+    private val subscribedClients = mutableListOf<BluetoothDevice>()
     private val avatarReadBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
     private val avatarReadOffsets = ConcurrentHashMap<String, Int>()
     private val serverClientMtuByAddress = ConcurrentHashMap<String, Int>()
@@ -161,6 +247,21 @@ class GattSessionManager(
 
     @Volatile
     private var writeCompletion: CompletableDeferred<Boolean>? = null
+
+    @Volatile
+    private var notificationSentCompletion: CompletableDeferred<Boolean>? = null
+
+    @Volatile
+    private var clientConnectStartedMs: Long = 0L
+
+    @Volatile
+    private var lastServerInboundMs: Long = 0L
+
+    @Volatile
+    private var lastServerInboundMac: String? = null
+
+    @Volatile
+    private var lastClientOutboundSuccessMs: Long = 0L
 
     @Volatile
     private var isClientConnected: Boolean = false
@@ -197,7 +298,51 @@ class GattSessionManager(
         )
     }
 
+    private fun shouldPreferServerFor(targetAliases: Set<String>): Boolean {
+        val snapshot = currentReadinessSnapshot()
+        if (!isServerReadyForOutbound(snapshot)) return false
+        if (!isClientReadyForOutbound(snapshot)) return true
+        val serverMac = lastServerInboundMac
+        val targetMatchesServer = serverMac != null &&
+            (targetAliases.isEmpty() || targetAliases.any { it.equals(serverMac, ignoreCase = true) })
+        return targetMatchesServer && lastServerInboundMs > lastClientOutboundSuccessMs
+    }
+
+    fun inspectOutboundRoutePlan(targetAliases: Set<String> = emptySet()): GattOutboundRoutePlan {
+        return selectOutboundRoutePlan(
+            snapshot = currentReadinessSnapshot(),
+            preferServer = shouldPreferServerFor(targetAliases)
+        )
+    }
+
     fun hasReadyChannel(): Boolean = canFlushOutboundQueue(currentReadinessSnapshot())
+
+    fun isClientConnecting(): Boolean {
+        val client = activeGattClient ?: return false
+        if (isClientNotificationsReady && isClientRxAvailable) return false
+        val elapsed = System.currentTimeMillis() - clientConnectStartedMs
+        if (elapsed > 8_000L && !isClientConnected) {
+            LayoverFileLogger.log("GATT Client connect to ${client.device?.address} appears stalled (${elapsed}ms); allowing reconnect.")
+            return false
+        }
+        return true
+    }
+
+    fun isSessionActiveOrConnectingFor(macAddress: String, peerKey: String): Boolean {
+        val expanded = PeerAliasRegistry.resolveAliases(macAddress) +
+            PeerAliasRegistry.resolveAliases(peerKey) +
+            setOf(macAddress, peerKey)
+        val activeAddresses = buildSet {
+            activeGattClient?.device?.address?.let { add(it) }
+            connectedDevice?.address?.let { add(it) }
+            synchronized(subscribedClients) {
+                subscribedClients.forEach { add(it.address) }
+            }
+        }
+        return activeAddresses.any { active ->
+            expanded.any { cand -> active.equals(cand, ignoreCase = true) }
+        }
+    }
 
     fun isReadyForPeer(candidateAliasesOrMacs: Set<String> = emptySet()): Boolean {
         if (!hasReadyChannel()) return false
@@ -278,15 +423,27 @@ class GattSessionManager(
                     }
 
                     LayoverFileLogger.log("GATT Server: Subscribed client disconnected: $addr (remainingSubscribed=$remainingSubscribed)")
+                    notificationSentCompletion?.complete(false)
                     if (connectedDevice?.address.equals(addr, ignoreCase = true)) {
                         connectedDevice = synchronized(subscribedClients) { subscribedClients.lastOrNull() }
                             ?: activeGattClient?.device
                     }
-                    if (activeGattClient == null && !remainingSubscribed) {
-                        setConnectionState(RfcommConnectionState.DISCONNECTED)
-                        _isGattReady.value = false
+                    if (!remainingSubscribed) {
+                        val clientReady = isClientReadyForOutbound(currentReadinessSnapshot())
+                        if (!clientReady && activeGattClient == null) {
+                            setConnectionState(RfcommConnectionState.DISCONNECTED)
+                            _isGattReady.value = false
+                        }
                     }
                 }
+            }
+
+            override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
+                val success = status == BluetoothGatt.GATT_SUCCESS
+                if (!success) {
+                    LayoverFileLogger.logError("GATT Server onNotificationSent FAILED: device=${device?.address}, status=$status")
+                }
+                notificationSentCompletion?.complete(success)
             }
 
             override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
@@ -357,6 +514,10 @@ class GattSessionManager(
                     if (responseNeeded) {
                         device?.let { gattServer?.sendResponse(it, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
                     }
+                    if (device != null) {
+                        lastServerInboundMs = System.currentTimeMillis()
+                        lastServerInboundMac = device.address
+                    }
                     parseIncomingBytes(value, device?.address ?: "remote_peer")
                 } else {
                     if (responseNeeded) {
@@ -393,9 +554,8 @@ class GattSessionManager(
                     val newlySubscribed = if (device != null) {
                         synchronized(subscribedClients) {
                             val alreadyPresent = subscribedClients.any { it.address.equals(device.address, ignoreCase = true) }
-                            if (!alreadyPresent) {
-                                subscribedClients.add(device)
-                            }
+                            subscribedClients.removeAll { it.address.equals(device.address, ignoreCase = true) }
+                            subscribedClients.add(device)
                             !alreadyPresent
                         }
                     } else {
@@ -403,20 +563,47 @@ class GattSessionManager(
                     }
                     if (device != null) {
                         connectedDevice = device
+                        lastServerInboundMs = System.currentTimeMillis()
+                        lastServerInboundMac = device.address
                     }
                     serverHasSubscribedClient = synchronized(subscribedClients) { subscribedClients.isNotEmpty() }
 
-                    LayoverFileLogger.log("GATT Server: Client ${device?.address} subscribed to 0x2902 notifications (newlySubscribed=$newlySubscribed).")
+                    LayoverFileLogger.log(
+                        "GATT Server: Client ${device?.address} subscribed to 0x2902 notifications " +
+                            "(newlySubscribed=$newlySubscribed, activeClient=${activeGattClient != null}, clientConnected=$isClientConnected)."
+                    )
+
+                    // If an outbound GATT client was stalled unconnected (e.g., stale rotated RPA MAC),
+                    // close it so the live subscribed GATT Server channel takes over cleanly.
+                    val stalledClient = activeGattClient
+                    if (stalledClient != null && !isClientConnected) {
+                        LayoverFileLogger.log(
+                            "Closing stalled unconnected GATT client (${stalledClient.device?.address}) " +
+                                "in favor of live subscribed GATT Server peer ${device?.address}."
+                        )
+                        activeGattClient = null
+                        resetClientReadinessFlags()
+                        writeCompletion?.complete(false)
+                        writeCompletion = null
+                        try {
+                            stalledClient.disconnect()
+                            stalledClient.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+
                     if (activeGattClient == null) {
                         setConnectionState(RfcommConnectionState.CONNECTED)
                         _isGattReady.value = true
                         scope.launch {
                             delay(60)
-                            if (newlySubscribed && activeGattClient == null && serverHasSubscribedClient) {
+                            if (newlySubscribed && serverHasSubscribedClient) {
                                 onGattReady?.invoke()
                             }
                             flushQueue()
                         }
+                    } else if (pendingOutboundFrames.isNotEmpty() && hasReadyChannel()) {
+                        flushQueue()
                     }
                 }
             }
@@ -661,7 +848,12 @@ class GattSessionManager(
         } catch (_: Exception) {
         }
 
-        setConnectionState(RfcommConnectionState.CONNECTING, "GATT Client connecting to ${device.address}...")
+        clientConnectStartedMs = System.currentTimeMillis()
+        if (!serverHasSubscribedClient) {
+            setConnectionState(RfcommConnectionState.CONNECTING, "GATT Client connecting to ${device.address}...")
+        } else {
+            LayoverFileLogger.log("GATT Client connecting to ${device.address} while GATT Server already has subscribed peer(s).")
+        }
         negotiatedClientMtu = DEFAULT_ATT_MTU
         connectedDevice = device
         incomingBuffers.remove(device.address)
@@ -685,9 +877,8 @@ class GattSessionManager(
                         }
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    LayoverFileLogger.log("GATT Client disconnected from ${device.address} (status=$status)")
+                    LayoverFileLogger.log("GATT Client disconnected from ${device.address} (status=$status, serverHasSubscribed=$serverHasSubscribedClient)")
                     resetClientReadinessFlags()
-                    _isGattReady.value = false
                     writeCompletion?.complete(false)
                     incomingBuffers.remove(device.address)
                     activeGattClient = null
@@ -695,13 +886,19 @@ class GattSessionManager(
                         gatt.close()
                     } catch (_: Exception) {
                     }
-                    if (!serverHasSubscribedClient) {
+                    if (serverHasSubscribedClient && gattServer != null) {
+                        LayoverFileLogger.log("GATT Client disconnected; falling back to active GATT Server with subscribed client(s).")
+                        connectedDevice = synchronized(subscribedClients) { subscribedClients.lastOrNull() }
+                        setConnectionState(RfcommConnectionState.CONNECTED, "Fallback to active GATT Server")
+                        _isGattReady.value = true
+                        flushQueue()
+                    } else {
+                        _isGattReady.value = false
                         setConnectionState(RfcommConnectionState.DISCONNECTED)
                     }
                 } else if (status != BluetoothGatt.GATT_SUCCESS) {
-                    LayoverFileLogger.logError("GATT Client connection error status: $status")
+                    LayoverFileLogger.logError("GATT Client connection error status: $status (serverHasSubscribed=$serverHasSubscribedClient)")
                     resetClientReadinessFlags()
-                    _isGattReady.value = false
                     writeCompletion?.complete(false)
                     incomingBuffers.remove(device.address)
                     activeGattClient = null
@@ -710,7 +907,14 @@ class GattSessionManager(
                         gatt.close()
                     } catch (_: Exception) {
                     }
-                    if (!serverHasSubscribedClient) {
+                    if (serverHasSubscribedClient && gattServer != null) {
+                        LayoverFileLogger.log("GATT Client failed (status=$status); falling back to active GATT Server with subscribed client(s).")
+                        connectedDevice = synchronized(subscribedClients) { subscribedClients.lastOrNull() }
+                        setConnectionState(RfcommConnectionState.CONNECTED, "Fallback to active GATT Server")
+                        _isGattReady.value = true
+                        flushQueue()
+                    } else {
+                        _isGattReady.value = false
                         setConnectionState(RfcommConnectionState.FAILED, "GATT status $status")
                     }
                 }
@@ -811,14 +1015,14 @@ class GattSessionManager(
                     isClientNotificationsReady = true
                     markClientReadyAndFlush(gatt)
                 } else if (status != BluetoothGatt.GATT_SUCCESS &&
-                    descriptorFailureRetryCount < 1 &&
+                    descriptorFailureRetryCount < 2 &&
                     isClientConnected &&
                     rxChar != null
                 ) {
                     descriptorFailureRetryCount++
-                    LayoverFileLogger.logError("GATT Client onDescriptorWrite failed (status=$status); retrying enableNotifications in 200ms...")
+                    LayoverFileLogger.logError("GATT Client onDescriptorWrite failed (status=$status, retry $descriptorFailureRetryCount/2); retrying enableNotifications in 250ms...")
                     scope.launch {
-                        delay(200)
+                        delay(250)
                         if (activeGattClient === gatt && isClientConnected) {
                             enableNotifications(gatt, attempt = 1)
                         }
@@ -1037,33 +1241,53 @@ class GattSessionManager(
                     }
 
                     val frame = pendingOutboundFrames.peekFirst() ?: break
-                    val success = sendFrameSuspended(frame)
+                    val targetAliases = frameTargetAliases[frame].orEmpty()
+                    val success = sendFrameSuspended(frame, targetAliases)
                     if (success) {
                         pendingOutboundFrames.removeFirstOccurrence(frame)
+                        frameTargetAliases.remove(frame)
                         retryCounts.remove(frame)
                         delay(60)
                     } else {
                         if (!hasReadyChannel()) {
-                            LayoverFileLogger.log("flushQueue: channel became unready during write; pausing queue until reconnect.")
+                            LayoverFileLogger.log("flushQueue: channel became unready during send; attempting reconnect/pause.")
+                            val failedMac = activeGattClient?.device?.address ?: connectedDevice?.address
+                            onReconnectRequested?.invoke(failedMac, "channel_unready_during_send")
                             break
                         }
                         val attempts = (retryCounts[frame] ?: 0) + 1
                         retryCounts[frame] = attempts
-                        if (attempts == 4 && activeGattClient != null && connectedDevice != null) {
-                            val dev = connectedDevice
-                            LayoverFileLogger.logError("GATT write failing repeatedly after 4 attempts; reconnecting GATT client to ${dev?.address}...")
-                            if (dev != null) {
-                                connectToDevice(dev)
+                        if (attempts == 2 || attempts == 4) {
+                            val failedMac = activeGattClient?.device?.address ?: connectedDevice?.address
+                            val frameType = frame.substringBefore("|")
+                            LayoverFileLogger.logError(
+                                "GATT outbound delivery failing (attempt $attempts/$maxRetriesPerFrame, type=$frameType, mac=$failedMac); " +
+                                    "requesting fresh GATT reconnect/fallback..."
+                            )
+                            val reconnectedByTransport = onReconnectRequested?.invoke(
+                                failedMac,
+                                "outbound_delivery_failed_attempt_$attempts"
+                            ) == true
+                            if (reconnectedByTransport) {
                                 break
+                            }
+                            if (attempts == 4 && activeGattClient != null && connectedDevice != null) {
+                                val dev = connectedDevice
+                                LayoverFileLogger.logError("Fallback reconnect directly to cached GATT device ${dev?.address}...")
+                                if (dev != null) {
+                                    connectToDevice(dev)
+                                    break
+                                }
                             }
                         }
                         if (attempts >= maxRetriesPerFrame) {
-                            LayoverFileLogger.logError("GATT write exhausted $maxRetriesPerFrame retries for frame type=${frame.substringBefore("|")}. Dropping frame.")
+                            LayoverFileLogger.logError("GATT outbound exhausted $maxRetriesPerFrame retries for frame type=${frame.substringBefore("|")}. Dropping frame.")
                             pendingOutboundFrames.removeFirstOccurrence(frame)
+                            frameTargetAliases.remove(frame)
                             retryCounts.remove(frame)
                         } else {
                             val backoffMs = (250L * attempts).coerceAtMost(1500L)
-                            LayoverFileLogger.logError("GATT write deferred/failed (attempt $attempts/$maxRetriesPerFrame) for type=${frame.substringBefore("|")}. Retrying in ${backoffMs}ms...")
+                            LayoverFileLogger.logError("GATT outbound deferred/failed (attempt $attempts/$maxRetriesPerFrame) for type=${frame.substringBefore("|")}. Retrying in ${backoffMs}ms...")
                             delay(backoffMs)
                         }
                     }
@@ -1078,172 +1302,278 @@ class GattSessionManager(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun sendFrameSuspended(text: String): Boolean {
+    private suspend fun sendFrameSuspended(text: String, targetAliases: Set<String> = emptySet()): Boolean {
         val payload = text.toByteArray(Charsets.UTF_8)
         val fullPacket = ByteBuffer.allocate(4 + payload.size).putInt(payload.size).put(payload).array()
         val frameType = text.substringBefore("|")
-        val remoteMac = connectedDevice?.address ?: activeGattClient?.device?.address ?: "unknown_mac"
+        val plan = inspectOutboundRoutePlan(targetAliases)
 
-        val client = activeGattClient
-        if (client != null) {
-            if (!canFlushOutboundQueue(currentReadinessSnapshot())) {
-                LayoverFileLogger.log("GATT Client not ready for writeCharacteristic (type=$frameType); keeping frame queued.")
-                return false
-            }
-            val rxChar = resolveClientRxCharacteristic(client)
-            if (rxChar == null) {
-                isClientRxAvailable = false
-                _isGattReady.value = false
-                LayoverFileLogger.logError("GATT RX characteristic null on client; keeping frame in queue until discovery finishes.")
-                return false
-            }
+        LayoverFileLogger.log(
+            "GATT outbound route selected: type=$frameType, primary=${plan.primary}, fallback=${plan.fallback}, " +
+                "clientMac=${activeGattClient?.device?.address}, subscribedCount=${synchronized(subscribedClients) { subscribedClients.size }}"
+        )
 
-            val chunkSize = computeSafeChunkSize(negotiatedClientMtu)
-            val chunks = chunkGattPacket(fullPacket, chunkSize)
+        suspend fun executeRoute(route: GattOutboundRoute): Boolean {
+            return when (route) {
+                GattOutboundRoute.CLIENT_WRITE -> sendViaGattClient(fullPacket, payload.size, frameType)
+                GattOutboundRoute.SERVER_NOTIFY -> sendViaGattServer(fullPacket, payload.size, frameType, targetAliases)
+                GattOutboundRoute.NONE -> false
+            }
+        }
+
+        if (plan.primary == GattOutboundRoute.NONE) {
+            LayoverFileLogger.log("GATT outbound skipped (no ready route) for type=$frameType; keeping frame queued.")
+            return false
+        }
+
+        val primarySuccess = executeRoute(plan.primary)
+        if (primarySuccess) return true
+
+        val dynamicFallback = when {
+            plan.fallback != GattOutboundRoute.NONE -> plan.fallback
+            plan.primary == GattOutboundRoute.CLIENT_WRITE && isServerReadyForOutbound(currentReadinessSnapshot()) ->
+                GattOutboundRoute.SERVER_NOTIFY
+            plan.primary == GattOutboundRoute.SERVER_NOTIFY && isClientReadyForOutbound(currentReadinessSnapshot()) ->
+                GattOutboundRoute.CLIENT_WRITE
+            else -> GattOutboundRoute.NONE
+        }
+
+        if (dynamicFallback != GattOutboundRoute.NONE) {
             LayoverFileLogger.log(
-                "GATT Client attempting writeCharacteristic: type=$frameType, size=${payload.size}, " +
-                    "totalBytes=${fullPacket.size}, chunks=${chunks.size}, maxChunk=${chunkSize}B, " +
-                    "targetCharUUID=$LAYOVER_RX_CHAR_UUID, writeType=WRITE_TYPE_DEFAULT, remoteMac=$remoteMac"
+                "GATT primary route ${plan.primary} failed for type=$frameType; triggering fallback to $dynamicFallback."
             )
+            val fallbackSuccess = executeRoute(dynamicFallback)
+            if (fallbackSuccess) {
+                LayoverFileLogger.log("GATT fallback route $dynamicFallback SUCCEEDED for type=$frameType.")
+                return true
+            }
+            LayoverFileLogger.logError("GATT fallback route $dynamicFallback also FAILED for type=$frameType.")
+        }
 
+        return false
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun sendViaGattClient(
+        fullPacket: ByteArray,
+        payloadSize: Int,
+        frameType: String
+    ): Boolean {
+        val client = activeGattClient ?: return false
+        if (!isClientReadyForOutbound(currentReadinessSnapshot())) {
+            LayoverFileLogger.log("GATT Client not ready for writeCharacteristic (type=$frameType); keeping frame queued.")
+            return false
+        }
+        val rxChar = resolveClientRxCharacteristic(client)
+        if (rxChar == null) {
+            isClientRxAvailable = false
+            if (!serverHasSubscribedClient) {
+                _isGattReady.value = false
+            }
+            LayoverFileLogger.logError("GATT RX characteristic null on client; cannot write type=$frameType.")
+            return false
+        }
+
+        val remoteMac = client.device?.address ?: connectedDevice?.address ?: "unknown_mac"
+        val chunkSize = computeSafeChunkSize(negotiatedClientMtu)
+        val chunks = chunkGattPacket(fullPacket, chunkSize)
+        LayoverFileLogger.log(
+            "GATT Client attempting writeCharacteristic: type=$frameType, size=$payloadSize, " +
+                "totalBytes=${fullPacket.size}, chunks=${chunks.size}, maxChunk=${chunkSize}B, " +
+                "targetCharUUID=$LAYOVER_RX_CHAR_UUID, writeType=WRITE_TYPE_DEFAULT, remoteMac=$remoteMac"
+        )
+
+        for ((chunkIndex, chunk) in chunks.withIndex()) {
+            val deferred = CompletableDeferred<Boolean>()
+            writeCompletion = deferred
+            val initiated = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    client.writeCharacteristic(
+                        rxChar,
+                        chunk,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    ) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    rxChar.value = chunk
+                    rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    @Suppress("DEPRECATION")
+                    client.writeCharacteristic(rxChar)
+                }
+            } catch (e: IllegalArgumentException) {
+                if (writeCompletion === deferred) writeCompletion = null
+                LayoverFileLogger.logError(
+                    "GATT Client writeCharacteristic IllegalArgumentException for type=$frameType " +
+                        "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                    e
+                )
+                return false
+            } catch (e: Exception) {
+                if (writeCompletion === deferred) writeCompletion = null
+                LayoverFileLogger.logError(
+                    "GATT Client writeCharacteristic exception for type=$frameType " +
+                        "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
+                    e
+                )
+                return false
+            }
+
+            if (!initiated) {
+                if (writeCompletion === deferred) writeCompletion = null
+                LayoverFileLogger.logError(
+                    "GATT Client failed to initiate writeCharacteristic for type=$frameType " +
+                        "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})"
+                )
+                return false
+            }
+
+            val chunkWritten = try {
+                withTimeout(2500) {
+                    deferred.await()
+                }
+            } catch (e: Exception) {
+                LayoverFileLogger.logError(
+                    "GATT Client writeCharacteristic timeout waiting for onCharacteristicWrite for type=$frameType " +
+                        "(chunk ${chunkIndex + 1}/${chunks.size})",
+                    e
+                )
+                false
+            } finally {
+                if (writeCompletion === deferred) writeCompletion = null
+            }
+
+            if (!chunkWritten) {
+                LayoverFileLogger.logError(
+                    "GATT Client writeCharacteristic chunk ${chunkIndex + 1}/${chunks.size} failed for type=$frameType"
+                )
+                return false
+            }
+        }
+
+        lastClientOutboundSuccessMs = System.currentTimeMillis()
+        LayoverFileLogger.log("GATT Client writeCharacteristic result for type=$frameType: success=true (${chunks.size} chunk(s), remoteMac=$remoteMac)")
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun sendViaGattServer(
+        fullPacket: ByteArray,
+        payloadSize: Int,
+        frameType: String,
+        targetAliases: Set<String>
+    ): Boolean {
+        val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
+        val subscribedSnapshot = synchronized(subscribedClients) { subscribedClients.toList() }
+        if (subscribedSnapshot.isEmpty()) {
+            serverHasSubscribedClient = false
+            LayoverFileLogger.logError("GATT Server has no subscribed client when sending frame; keeping frame queued.")
+            return false
+        }
+        val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
+        val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) }
+            ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
+
+        val prioritizedAddresses = selectServerNotificationTargets(
+            subscribedAddresses = subscribedSnapshot.map { it.address },
+            preferredAliases = targetAliases
+        )
+        val orderedTargets = prioritizedAddresses.mapNotNull { addr ->
+            subscribedSnapshot.lastOrNull { it.address.equals(addr, ignoreCase = true) }
+        }
+        val matchedTargetAddresses = targetAliases
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+
+        var anySuccess = false
+        for (targetDevice in orderedTargets) {
+            val deviceMtu = serverClientMtuByAddress[targetDevice.address] ?: negotiatedClientMtu
+            val chunkSize = computeSafeChunkSize(deviceMtu)
+            val chunks = chunkGattPacket(fullPacket, chunkSize)
+            val isExplicitAliasMatch = targetDevice.address.lowercase() in matchedTargetAddresses
+            LayoverFileLogger.log(
+                "GATT Server attempting notify: type=$frameType, size=$payloadSize, " +
+                    "chunks=${chunks.size}, maxChunk=${chunkSize}B, targetCharUUID=$LAYOVER_RX_CHAR_UUID, " +
+                    "remoteMac=${targetDevice.address}, aliasMatch=$isExplicitAliasMatch"
+            )
+            var allChunksSent = true
             for ((chunkIndex, chunk) in chunks.withIndex()) {
-                val deferred = CompletableDeferred<Boolean>()
-                writeCompletion = deferred
+                val sentDeferred = CompletableDeferred<Boolean>()
+                notificationSentCompletion = sentDeferred
                 val initiated = try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        client.writeCharacteristic(
-                            rxChar,
-                            chunk,
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        ) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+                        server.notifyCharacteristicChanged(targetDevice, rxChar, false, chunk) == android.bluetooth.BluetoothStatusCodes.SUCCESS
                     } else {
                         @Suppress("DEPRECATION")
                         rxChar.value = chunk
-                        rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                         @Suppress("DEPRECATION")
-                        client.writeCharacteristic(rxChar)
+                        server.notifyCharacteristicChanged(targetDevice, rxChar, false)
                     }
                 } catch (e: IllegalArgumentException) {
-                    if (writeCompletion === deferred) writeCompletion = null
+                    if (notificationSentCompletion === sentDeferred) notificationSentCompletion = null
                     LayoverFileLogger.logError(
-                        "GATT Client writeCharacteristic IllegalArgumentException for type=$frameType " +
+                        "GATT Server notifyCharacteristicChanged IllegalArgumentException for type=$frameType " +
                             "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
                         e
                     )
-                    return false
+                    false
                 } catch (e: Exception) {
-                    if (writeCompletion === deferred) writeCompletion = null
+                    if (notificationSentCompletion === sentDeferred) notificationSentCompletion = null
                     LayoverFileLogger.logError(
-                        "GATT Client writeCharacteristic exception for type=$frameType " +
+                        "GATT Server notifyCharacteristicChanged exception for type=$frameType " +
                             "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
                         e
                     )
-                    return false
+                    false
                 }
-
                 if (!initiated) {
-                    if (writeCompletion === deferred) writeCompletion = null
+                    if (notificationSentCompletion === sentDeferred) notificationSentCompletion = null
                     LayoverFileLogger.logError(
-                        "GATT Client failed to initiate writeCharacteristic for type=$frameType " +
-                            "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})"
+                        "GATT Server failed to initiate notifyCharacteristicChanged for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size}, remoteMac=${targetDevice.address})"
                     )
-                    return false
+                    allChunksSent = false
+                    break
                 }
 
-                val chunkWritten = try {
-                    withTimeout(2500) {
-                        deferred.await()
+                val chunkConfirmed = try {
+                    withTimeout(1500) {
+                        sentDeferred.await()
                     }
                 } catch (e: Exception) {
                     LayoverFileLogger.logError(
-                        "GATT Client writeCharacteristic timeout waiting for onCharacteristicWrite for type=$frameType " +
-                            "(chunk ${chunkIndex + 1}/${chunks.size})",
+                        "GATT Server timeout waiting for onNotificationSent for type=$frameType " +
+                            "(chunk ${chunkIndex + 1}/${chunks.size}, remoteMac=${targetDevice.address})",
                         e
                     )
                     false
                 } finally {
-                    if (writeCompletion === deferred) writeCompletion = null
+                    if (notificationSentCompletion === sentDeferred) notificationSentCompletion = null
                 }
 
-                if (!chunkWritten) {
-                    LayoverFileLogger.logError(
-                        "GATT Client writeCharacteristic chunk ${chunkIndex + 1}/${chunks.size} failed for type=$frameType"
-                    )
-                    return false
+                if (!chunkConfirmed) {
+                    allChunksSent = false
+                    break
                 }
             }
-
-            LayoverFileLogger.log("GATT Client writeCharacteristic result for type=$frameType: success=true (${chunks.size} chunk(s))")
-            return true
-        } else {
-            val server = gattServer ?: return false.also { LayoverFileLogger.logError("GATT Server is null when sending frame.") }
-            val targetDevices = synchronized(subscribedClients) { subscribedClients.toList() }
-            if (targetDevices.isEmpty()) {
-                serverHasSubscribedClient = false
-                LayoverFileLogger.logError("GATT Server has no subscribed client when sending frame; keeping frame queued.")
-                return false
+            if (allChunksSent) {
+                anySuccess = true
+                // If we matched an explicit alias target and delivered all chunks cleanly, stop here
+                // rather than broadcasting duplicate frames to unrelated subscribed clients.
+                if (isExplicitAliasMatch) break
             }
-            val service = server.getService(LAYOVER_GATT_SERVICE_UUID) ?: server.services?.find { it.uuid.equals(LAYOVER_GATT_SERVICE_UUID) }
-            val rxChar = service?.getCharacteristic(LAYOVER_RX_CHAR_UUID) ?: service?.characteristics?.find { it.uuid.equals(LAYOVER_RX_CHAR_UUID) } ?: return false.also { LayoverFileLogger.logError("GATT RX characteristic null on server.") }
-
-            var anySuccess = false
-            for (targetDevice in targetDevices) {
-                val deviceMtu = serverClientMtuByAddress[targetDevice.address] ?: negotiatedClientMtu
-                val chunkSize = computeSafeChunkSize(deviceMtu)
-                val chunks = chunkGattPacket(fullPacket, chunkSize)
-                LayoverFileLogger.log(
-                    "GATT Server attempting notify: type=$frameType, size=${payload.size}, " +
-                        "chunks=${chunks.size}, maxChunk=${chunkSize}B, targetCharUUID=$LAYOVER_RX_CHAR_UUID, remoteMac=${targetDevice.address}"
-                )
-                var allChunksSent = true
-                for ((chunkIndex, chunk) in chunks.withIndex()) {
-                    val notified = try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            server.notifyCharacteristicChanged(targetDevice, rxChar, false, chunk) == android.bluetooth.BluetoothStatusCodes.SUCCESS
-                        } else {
-                            @Suppress("DEPRECATION")
-                            rxChar.value = chunk
-                            @Suppress("DEPRECATION")
-                            server.notifyCharacteristicChanged(targetDevice, rxChar, false)
-                        }
-                    } catch (e: IllegalArgumentException) {
-                        LayoverFileLogger.logError(
-                            "GATT Server notifyCharacteristicChanged IllegalArgumentException for type=$frameType " +
-                                "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
-                            e
-                        )
-                        false
-                    } catch (e: Exception) {
-                        LayoverFileLogger.logError(
-                            "GATT Server notifyCharacteristicChanged exception for type=$frameType " +
-                                "(chunk ${chunkIndex + 1}/${chunks.size}, chunkLen=${chunk.size})",
-                            e
-                        )
-                        false
-                    }
-                    if (!notified) {
-                        allChunksSent = false
-                        break
-                    }
-                    if (chunks.size > 1 && chunkIndex < chunks.lastIndex) {
-                        delay(15)
-                    }
-                }
-                if (allChunksSent) anySuccess = true
-            }
-            val success = anySuccess
-
-            if (success) {
-                LayoverFileLogger.log("GATT Server notification SUCCESS: type=$frameType, size=${payload.size}")
-            } else {
-                LayoverFileLogger.logError("GATT Server notification FAILED: type=$frameType, size=${payload.size}")
-            }
-            return success
         }
+
+        if (anySuccess) {
+            LayoverFileLogger.log("GATT Server notification SUCCESS: type=$frameType, size=$payloadSize")
+        } else {
+            LayoverFileLogger.logError("GATT Server notification FAILED: type=$frameType, size=$payloadSize")
+        }
+        return anySuccess
     }
 
     @SuppressLint("MissingPermission")
-    fun sendFrame(text: String): Boolean {
+    fun sendFrame(text: String, targetAliases: Set<String> = emptySet()): Boolean {
         val frameType = text.substringBefore("|")
         val isValidPrefix = frameType == "KEY_EXCHANGE" ||
                 frameType == "CONNECTION_REQUEST" ||
@@ -1264,7 +1594,10 @@ class GattSessionManager(
             return false
         }
 
-        LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=$byteSize")
+        if (targetAliases.isNotEmpty()) {
+            frameTargetAliases[text] = targetAliases
+        }
+        LayoverFileLogger.log("GATT sendFrame queued: type=$frameType, size=$byteSize, targetAliasCount=${targetAliases.size}")
         enqueueOutboundFrame(pendingOutboundFrames, text)
         if (hasReadyChannel()) {
             flushQueue()
@@ -1281,6 +1614,8 @@ class GattSessionManager(
         resetClientReadinessFlags()
         writeCompletion?.complete(false)
         writeCompletion = null
+        notificationSentCompletion?.complete(false)
+        notificationSentCompletion = null
         try {
             clientToClose?.disconnect()
             clientToClose?.close()
@@ -1291,6 +1626,7 @@ class GattSessionManager(
         serverClientMtuByAddress.clear()
         incomingBuffers.clear()
         pendingOutboundFrames.clear()
+        frameTargetAliases.clear()
         stopServer()
         _connectionState.value = RfcommConnectionState.DISCONNECTED
     }

@@ -113,9 +113,10 @@ data class ChatMessage(
     val id: String,
     val senderId: String,
     val text: String,
-    val timestampLabel: String,
+    val timestampLabel: String = "",
     val isOutgoing: Boolean,
-    val replyToText: String? = null
+    val replyToText: String? = null,
+    val timestampMillis: Long = System.currentTimeMillis()
 )
 
 data class UserProfile(
